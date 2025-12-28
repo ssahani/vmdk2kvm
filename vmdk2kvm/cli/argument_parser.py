@@ -9,60 +9,383 @@ from .. import __version__
 from ..config.systemd_template import SYSTEMD_UNIT_TEMPLATE
 from ..fixers.fstab_rewriter import FstabMode
 
-YAML_EXAMPLE = r"""# vmdk2kvm config (offline/local mode)
+
+# --------------------------------------------------------------------------------------
+# Rich YAML Examples (shown in --help epilog)
+#   - Keep this string as a raw literal (r"""...""") so it prints cleanly.
+#   - The parser below already supports config merging; these examples show common patterns.
+# --------------------------------------------------------------------------------------
+
+YAML_EXAMPLE = r"""# vmdk2kvm configuration examples (YAML)
+#
 # Run:
-# sudo ./vmdk2kvm.py --config config.yaml local
-# or merge configs:
-# sudo ./vmdk2kvm.py --config base.yaml --config overrides.yaml local
+#   sudo ./vmdk2kvm.py --config example.yaml <command>
 #
-# For multiple VMs:
-# vms:
-# - vmdk: vm1.vmdk
-#   to_output: vm1.qcow2
-# - vmdk: vm2.vmdk
-#   to_output: vm2.qcow2
+# Merge multiple configs (later overrides earlier):
+#   sudo ./vmdk2kvm.py --config base.yaml --config overrides.yaml <command>
 #
-# What it will do:
-# - Open the VMDK offline with libguestfs
-# - Mount root safely (never using /dev/disk/by-path for mounting)
-# - Rewrite /etc/fstab to stable identifiers (UUID preferred; fallback PARTUUID then LABEL/PARTLABEL)
-# - Canonicalize btrfs subvolume entries (removes btrfsvol: pseudo-specs)
-# - Ensure /tmp exists (fixes virt-v2v random seed stage)
-# - Optionally flatten snapshot chain first (recommended if snapshots exist)
-# - Optionally convert to qcow2/raw/vdi output
-command: local
-vmdk: /home/ssahani/by-path/openSUSE_Leap_15.4_VM_LinuxVMImages.COM.vmdk
-output_dir: /home/ssahani/by-path/out
-dry_run: false
-print_fstab: true
-flatten: true
-flatten_format: qcow2
-workdir: /home/ssahani/by-path/out/work # Optional work directory
-to_output: opensuse-leap-15.4-fixed.qcow2
-out_format: qcow2
-compress: true
-compress_level: 6 # Optional: 1-9 compression level
-checksum: true
-fstab_mode: stabilize-all # stabilize-all | bypath-only | noop
-no_backup: false
-grub: true
-regen_initramfs: true
-remove_vmware_tools: true
-enable_recovery: true
-parallel_processing: true
-resize: +10G
-post_v2v: true
-cloud_init_config: /path/to/cloud-init.yaml
-verbose: 2
-# Optional tests:
+# NOTE: Required CLI args can come from YAML because vmdk2kvm uses a 2-phase parse:
+#   Phase 0: reads only --config / logging
+#   Phase 1: loads+merges YAML and applies defaults to argparse
+#   Phase 2: parses full args (so required args can be satisfied by config)
+#
+# --------------------------------------------------------------------------------------
+# 0) Common keys (apply to ALL modes)
+# --------------------------------------------------------------------------------------
+# output_dir: ./out
+# workdir: ./out/work
+# dry_run: false                 # preview changes, don't modify guest/outputs
+# verbose: 0|1|2                 # or CLI: -v/-vv
+# log_file: ./vmdk2kvm.log
+# report: report.md              # relative to output_dir if not absolute
+# checksum: true                 # SHA256 output
+# enable_recovery: true          # checkpoints for long ops
+# parallel_processing: true      # batch mode concurrency
+#
+# Fix policy:
+# fstab_mode: stabilize-all      # stabilize-all | bypath-only | noop
+# print_fstab: true
+# no_backup: false               # keep backups in guest unless explicitly disabled
+# no_grub: false                 # set true to skip grub root=/device.map cleanup
+# regen_initramfs: true          # best-effort initramfs+grub regen
+# remove_vmware_tools: true      # linux guests only
+#
+# Convert policy:
+# flatten: true
+# flatten_format: qcow2          # qcow2|raw
+# to_output: final.qcow2
+# out_format: qcow2              # qcow2|raw|vdi
+# compress: true
+# compress_level: 6              # 1-9
+# resize: +10G                   # enlarge only: +10G or set total: 50G
+#
+# Windows extras:
+# virtio_drivers_dir: /path/to/virtio-win
+#
+# virt-v2v integration:
+# use_v2v: false                 # use virt-v2v primarily
+# post_v2v: true                 # run v2v after internal fixes
+#
+# Tests:
 # libvirt_test: true
-# vm_name: vmdk2kvm-opensuse154
-# memory: 2048
-# vcpus: 2
+# qemu_test: true
+# vm_name: my-test-vm
+# memory: 4096
+# vcpus: 4
 # uefi: true
-# timeout: 60
+# timeout: 90
 # keep_domain: false
 # headless: true
+#
+# --------------------------------------------------------------------------------------
+# 1) LOCAL (offline local VMDK conversion)
+# --------------------------------------------------------------------------------------
+# Basic local mode config: fix + flatten + convert to qcow2 (Linux guest)
+command: local
+vmdk: /path/to/vm.vmdk
+output_dir: ./out
+workdir: ./out/work
+flatten: true
+flatten_format: qcow2
+to_output: vm-fixed.qcow2
+out_format: qcow2
+compress: true
+compress_level: 6
+fstab_mode: stabilize-all
+print_fstab: true
+regen_initramfs: true
+remove_vmware_tools: true
+checksum: true
+report: local-report.md
+verbose: 1
+
+# --- Local: "minimal safe" dry-run preview (no changes performed) ---
+# command: local
+# vmdk: /path/to/vm.vmdk
+# dry_run: true
+# print_fstab: true
+# fstab_mode: stabilize-all
+# regen_initramfs: false
+# flatten: false
+# verbose: 2
+
+# --- Local: Windows virtio injection + BCD scan + convert ---
+# command: local
+# vmdk: /path/to/windows-vm.vmdk
+# virtio_drivers_dir: /path/to/virtio-win
+# # optional flags your orchestrator can map:
+# # enable_virtio_gpu: true
+# # enable_virtio_input: true
+# # enable_virtio_fs: true
+# flatten: true
+# to_output: windows-kvm.qcow2
+# out_format: qcow2
+# compress: true
+# checksum: true
+# report: windows-report.md
+# verbose: 2
+
+# --- Local: disk growth + cloud-init injection (Linux) ---
+# command: local
+# vmdk: /path/to/linux-vm.vmdk
+# resize: +20G
+# cloud_init_config: /path/to/cloud-config.yaml
+# fstab_mode: stabilize-all
+# regen_initramfs: true
+# flatten: true
+# to_output: linux-grown.qcow2
+# out_format: qcow2
+# compress: true
+
+# --- Local: produce RAW image for dd or imaging pipelines ---
+# command: local
+# vmdk: /path/to/vm.vmdk
+# flatten: true
+# flatten_format: raw
+# to_output: vm.raw
+# out_format: raw
+# compress: false
+
+# --- Local: batch multiple VMs (shared defaults + per-VM overrides) ---
+# vms:
+#   - vmdk: /path/to/vm1.vmdk
+#     to_output: vm1.qcow2
+#     resize: +10G
+#   - vmdk: /path/to/vm2.vmdk
+#     to_output: vm2.qcow2
+#     remove_vmware_tools: false
+# flatten: true
+# out_format: qcow2
+# compress: true
+# parallel_processing: true
+# enable_recovery: true
+#
+# Run:
+#   sudo ./vmdk2kvm.py --config batch.yaml local
+#
+# --------------------------------------------------------------------------------------
+# 2) LIVE-FIX (apply fixes to a running VM via SSH)
+# --------------------------------------------------------------------------------------
+# Basic live-fix: rewrite fstab + regen initramfs/grub + optionally remove VMware tools
+# command: live-fix
+# host: 192.168.1.100
+# user: root
+# port: 22
+# sudo: true
+# print_fstab: true
+# fstab_mode: stabilize-all
+# regen_initramfs: true
+# remove_vmware_tools: true
+# no_backup: false
+# verbose: 2
+#
+# --- Live-fix: custom identity and SSH options, skip grub updates ---
+# command: live-fix
+# host: vm.example.com
+# user: admin
+# identity: ~/.ssh/custom_key
+# ssh_opt:
+#   - "-o StrictHostKeyChecking=no"
+#   - "-o ConnectTimeout=30"
+# sudo: true
+# no_grub: true
+# fstab_mode: bypath-only
+# dry_run: true
+# log_file: live-fix.log
+#
+# --- Live-fix: multi-VM sequential list ---
+# vms:
+#   - host: vm1.example.com
+#     user: root
+#     sudo: true
+#     regen_initramfs: true
+#   - host: vm2.example.com
+#     user: admin
+#     identity: ~/.ssh/key
+#     remove_vmware_tools: false
+# print_fstab: true
+# fstab_mode: stabilize-all
+#
+# Run:
+#   sudo ./vmdk2kvm.py --config live-batch.yaml live-fix
+#
+# --------------------------------------------------------------------------------------
+# 3) FETCH-AND-FIX (fetch from ESXi over SSH/SCP and fix offline)
+# --------------------------------------------------------------------------------------
+# Basic fetch-and-fix: fetch descriptor then fix+convert
+# command: fetch-and-fix
+# host: esxi.example.com
+# user: root
+# port: 22
+# remote: /vmfs/volumes/datastore1/vm/vm.vmdk
+# fetch_dir: ./downloads
+# flatten: true
+# to_output: esxi-vm-fixed.qcow2
+# out_format: qcow2
+# compress: true
+# verbose: 1
+#
+# --- Fetch: full snapshot chain (recursive parent descriptors) ---
+# command: fetch-and-fix
+# host: esxi-host
+# identity: ~/.ssh/esxi_key
+# remote: /path/to/snapshot-vm.vmdk
+# fetch_all: true
+# flatten: true
+# resize: 50G
+# regen_initramfs: true
+# libvirt_test: true
+# vm_name: esxi-test-vm
+# uefi: true
+# timeout: 90
+# report: esxi-report.md
+#
+# --- Fetch: multi-VM batch (parallel fetch + fix) ---
+# vms:
+#   - host: esxi1.example.com
+#     remote: /vmfs/volumes/ds1/vm1/vm1.vmdk
+#     fetch_all: true
+#   - host: esxi2.example.com
+#     remote: /vmfs/volumes/ds2/vm2/vm2.vmdk
+#     identity: ~/.ssh/key2
+# flatten: true
+# out_format: qcow2
+# parallel_processing: true
+# enable_recovery: true
+#
+# --------------------------------------------------------------------------------------
+# 4) OVA / OVF (offline extract/parse)
+# --------------------------------------------------------------------------------------
+# OVA:
+# command: ova
+# ova: /path/to/appliance.ova
+# flatten: true
+# to_output: appliance.qcow2
+#
+# OVF (disks in same dir):
+# command: ovf
+# ovf: /path/to/appliance.ovf
+# flatten: true
+# to_output: appliance.qcow2
+#
+# --------------------------------------------------------------------------------------
+# 5) DAEMON (watch directory)
+# --------------------------------------------------------------------------------------
+# CLI:
+#   sudo ./vmdk2kvm.py --daemon --watch-dir /incoming local
+#
+# YAML:
+# command: daemon
+# daemon: true
+# watch_dir: /incoming
+# output_dir: /out
+#
+# --------------------------------------------------------------------------------------
+# 6) vSphere/vCenter (pyvmomi) - discovery, downloads, CBT sync
+# --------------------------------------------------------------------------------------
+# NOTE: This uses the "vsphere" subcommand with nested actions.
+#
+# List VMs:
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: list_vm_names
+# json: true
+#
+# Get VM details:
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: get_vm_by_name
+# name: myVM
+# json: true
+#
+# List VM disks:
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: vm_disks
+# vm_name: myVM
+# json: true
+#
+# Download a datastore file (e.g. descriptor, extent, vmx, nvram):
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# dc_name: ha-datacenter
+# vs_action: download_datastore_file
+# datastore: datastore1
+# ds_path: "[datastore1] myVM/myVM.vmdk"
+# local_path: ./downloads/myVM.vmdk
+# chunk_size: 1048576
+#
+# Download a specific VM disk (choosing disk by index/label):
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: download_vm_disk
+# vm_name: myVM
+# disk: 0
+# local_path: ./downloads/myVM-disk0.vmdk
+#
+# Create a quiesced snapshot for safer reads:
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: create_snapshot
+# vm_name: myVM
+# name: vmdk2kvm-pre-migration
+# quiesce: true
+# memory: false
+#
+# Enable CBT (Changed Block Tracking):
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: enable_cbt
+# vm_name: myVM
+#
+# Query CBT changed disk areas:
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: query_changed_disk_areas
+# vm_name: myVM
+# snapshot_name: vmdk2kvm-cbt
+# disk: 0
+# start_offset: 0
+# change_id: "*"
+# json: true
+#
+# CBT delta sync (working theory / scaffold): download base once, then patch deltas:
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: cbt_sync
+# vm_name: myVM
+# disk: 0
+# local_path: ./downloads/myVM-disk0.vmdk
+# enable_cbt: true
+# snapshot_name: vmdk2kvm-cbt
+# json: true
 """
 
 
@@ -70,24 +393,22 @@ class CLI:
     @staticmethod
     def build_parser() -> argparse.ArgumentParser:
         epilog = (
-            c("YAML example:\n", "cyan", ["bold"])
+            c("YAML examples:\n", "cyan", ["bold"])
             + c(YAML_EXAMPLE, "cyan")
             + "\n"
             + c("Feature summary:\n", "cyan", ["bold"])
-            + c(" • Inputs: local VMDK, remote ESXi fetch, OVA/OVF extract, live SSH fix\n", "cyan")
-            + c(" • Snapshot: flatten convert, recursive parent descriptor fetch\n", "cyan")
+            + c(" • Inputs: local VMDK, remote ESXi fetch, OVA/OVF extract, live SSH fix, vSphere pyvmomi\n", "cyan")
+            + c(" • Snapshot: flatten convert, recursive parent descriptor fetch, vSphere snapshots/CBT hooks\n", "cyan")
             + c(
                 " • Fixes: fstab UUID/PARTUUID/LABEL, btrfs canonicalization, grub root=, crypttab, mdraid checks\n",
                 "cyan",
             )
-            + c(" • Windows: BCD store fixes\n", "cyan")
-            + c(" • Network: Configuration updates for KVM\n", "cyan")
-            + c(" • VMware: Tools removal\n", "cyan")
-            + c(" • Cloud: Cloud-init integration\n", "cyan")
-            + c(" • Outputs: qcow2/raw/vdi, compression with levels, validation, checksum\n", "cyan")
+            + c(" • Windows: virtio injection, registry service + CriticalDeviceDatabase, BCD store scan/backup\n", "cyan")
+            + c(" • Cloud: cloud-init injection\n", "cyan")
+            + c(" • Outputs: qcow2/raw/vdi, compression levels, validation, checksums\n", "cyan")
             + c(" • Tests: libvirt and qemu smoke tests, BIOS/UEFI modes\n", "cyan")
             + c(" • Safety: dry-run, backups, report generation, verbose logs, recovery checkpoints\n", "cyan")
-            + c(" • Performance: Parallel disk processing\n", "cyan")
+            + c(" • Performance: parallel batch processing\n", "cyan")
             + c("\nSystemd Service Example:\n", "cyan", ["bold"])
             + c(SYSTEMD_UNIT_TEMPLATE, "cyan")
         )

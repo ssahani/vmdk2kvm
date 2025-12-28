@@ -49,7 +49,7 @@ These apply across all subcommands.
 - `--vm-name` (default: "converted-vm"): VM name for libvirt test.
 - `--memory` (type: int, default: 2048): Memory in MiB for tests.
 - `--vcpus` (type: int, default: 2): vCPUs for tests.
-- `--uefi` (action: store_true): Use UEFI mode for tests (default: BIOS).
+- `--uefi" (action: store_true): Use UEFI mode for tests (default: BIOS).
 - `--timeout` (type: int, default: 60): Timeout (seconds) for libvirt state checks.
 - `--keep-domain` (action: store_true): Keep libvirt domain after test.
 - `--headless` (action: store_true): Run libvirt domain headless (no graphics).
@@ -286,7 +286,7 @@ Examples assume the tool is run with `sudo` where necessary (e.g., for libguestf
    - **Description**: Run as a service watching for new VMDKs.
    - **Command**:
      ```
-     sudo ./vmdk2kvm.py --daemon --watch-dir /path/to/watch --config config.yaml
+     sudo ./vmdk2kvm.py --daemon --watch-dir /path/to/vmdk-watch --config config.yaml
      ```
    - **Command** (Generate Systemd Unit):
      ```
@@ -339,43 +339,48 @@ Examples assume the tool is run with `sudo` where necessary (e.g., for libguestf
      ```
    - **Use Case**: Auditing or debugging long runs.
 
-### Additional Concise CLI Examples for vmdk2kvm.py
+#### **Enhanced Examples**
 
-Here are more examples, focused on specific scenarios. Each includes a brief one-line description followed by the command. These build on the previous set, using features like vSphere, recovery, Windows support, and batch configs.
+Below are enhanced examples showcasing the usage of the `vmdk2kvm.py` CLI tool for various scenarios:
 
-1. **Force fstab Rewrite with No GRUB Changes**  
-   `sudo ./vmdk2kvm.py local --vmdk /path/to/vm.vmdk --fstab-mode stabilize-all --no-grub --force`
+1. **Basic Conversion**:
+   ```bash
+   python vmdk2kvm.py local --vmdk /path/to/local.vmdk --output-dir ./converted --flatten --out-format qcow2
+   ```
+   - Converts a local VMDK file to a flattened QCOW2 image.
 
-2. **Resize Root and Inject Cloud-Init**  
-   `sudo ./vmdk2kvm.py local --vmdk /path/to/vm.vmdk --resize +20G --cloud-init-config /path/to/config.yaml --to-output resized.qcow2`
+2. **Fetch and Fix from ESXi**:
+   ```bash
+   python vmdk2kvm.py fetch-and-fix --host esxi.example.com --user root --remote /vmfs/volumes/datastore/VM/guest.vmdk --output-dir ./converted --remove-vmware-tools
+   ```
+   - Fetches a VMDK file from an ESXi host and removes VMware tools during the conversion.
 
-3. **Windows VM with Virtio Drivers**  
-   `sudo ./vmdk2kvm.py local --vmdk /path/to/windows.vmdk --virtio-drivers-dir /path/to/virtio-win --remove-vmware-tools --out-format raw`
+3. **OVA Extraction and Fix**:
+   ```bash
+   python vmdk2kvm.py ova --ova /path/to/guest.ova --output-dir ./converted --cloud-init-config ./cloud-init.yaml
+   ```
+   - Extracts and fixes a guest image from an OVA file, injecting a cloud-init configuration.
 
-4. **Post-v2v Conversion After Fixes**  
-   `sudo ./vmdk2kvm.py local --vmdk /path/to/vm.vmdk --post-v2v --use-v2v --parallel-processing`
+4. **OVF Parsing and Fix**:
+   ```bash
+   python vmdk2kvm.py ovf --ovf /path/to/guest.ovf --output-dir ./converted --resize +10G
+   ```
+   - Parses an OVF file, fixes the guest image, and resizes the root filesystem by 10GB.
 
-5. **Enable Recovery Checkpoints**  
-   `sudo ./vmdk2kvm.py local --vmdk /path/to/vm.vmdk --enable-recovery --flatten --report recovery-report.md`
+5. **Daemon Mode**:
+   ```bash
+   python vmdk2kvm.py --daemon --watch-dir /path/to/vmdk-watch --output-dir ./converted
+   ```
+   - Watches a directory for new VMDK files and processes them automatically.
 
-6. **vSphere VM Scan**  
-   `./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user admin --vc-password pass --action scan`
+6. **Testing Converted Images**:
+   ```bash
+   python vmdk2kvm.py local --vmdk /path/to/local.vmdk --output-dir ./converted --libvirt-test --qemu-test
+   ```
+   - Runs Libvirt and QEMU smoke tests on the converted image.
 
-7. **vSphere Download Specific Disk**  
-   `./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user admin --vc-password pass --vm-name myvm --disk 1 --out /path/to/disk.vmdk --action download`
-
-8. **vSphere CBT Sync with Insecure TLS**  
-   `./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user admin --vc-password pass --vm-name myvm --out /local/disk.vmdk --enable-cbt --vc-insecure --action cbt-sync`
-
-9. **Batch Multi-VM via Config**  
-   `sudo ./vmdk2kvm.py --config multi-vms.yaml local`  
-   *(Sample multi-vms.yaml: `vms: [{vmdk: vm1.vmdk, to_output: vm1.qcow2}, {vmdk: vm2.vmdk, to_output: vm2.qcow2}]`)*
-
-10. **Daemon Mode with Watch Dir**  
-    `sudo ./vmdk2kvm.py --daemon --watch-dir /watch/path --config daemon-config.yaml`
-
-11. **Generate Systemd Unit**  
-    `./vmdk2kvm.py generate-systemd --output /etc/systemd/system/vmdk2kvm.service`
-
-12. **Verbose Logging to File**  
-    `sudo ./vmdk2kvm.py -vv --log-file vmdk.log local --vmdk /path/to/vm.vmdk --checksum`
+7. **Advanced Compression**:
+   ```bash
+   python vmdk2kvm.py local --vmdk /path/to/local.vmdk --output-dir ./converted --compress --compress-level 9
+   ```
+   - Converts a VMDK file to a compressed QCOW2 image with maximum compression.
