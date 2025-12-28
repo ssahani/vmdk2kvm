@@ -1,0 +1,6 @@
+rich
+termcolor
+watchdog
+PyYAML
+requests
+pyvmomi
