@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from vmdk2kvm.cli.argument_parser import parse_args_with_config
-from vmdk2kvm.orchestrator.magic_orchestrator import Magic
+from vmdk2kvm.orchestrator.orchestrator import Orchestrator as PipelineOrchestrator
 from vmdk2kvm.core.exceptions import Fatal
 
 def main() -> None:
@@ -12,7 +12,7 @@ def main() -> None:
     args, _conf, logger = parse_args_with_config()
 
     try:
-        rc = Magic(logger, args).run()
+        rc = PipelineOrchestrator(logger, args).run()
     except Fatal as e:
         logger.error(str(e))
         rc = e.code
