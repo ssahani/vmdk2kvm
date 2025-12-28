@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 import asyncio
+import socket
 
 from ..core.exceptions import VMwareError
 
@@ -95,7 +96,15 @@ class VMwareClient:
             else:
                 ctx = ssl.create_default_context()
                 self.logger.debug("Using default SSL context")
-            self.si = SmartConnect(host=self.host, user=self.user, pwd=self.password, port=self.port, sslContext=ctx)
+            if self.timeout is not None:
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(self.timeout)
+                try:
+                    self.si = SmartConnect(host=self.host, user=self.user, pwd=self.password, port=self.port, sslContext=ctx)
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+            else:
+                self.si = SmartConnect(host=self.host, user=self.user, pwd=self.password, port=self.port, sslContext=ctx)
             self.logger.info(f"Connected to vSphere: {self.host}:{self.port}")
         except Exception as e:
             self.logger.error(f"Failed to connect to vSphere: {e}")
@@ -115,7 +124,17 @@ class VMwareClient:
             else:
                 ctx = ssl.create_default_context()
                 self.logger.debug("Using default SSL context")
-            self.si = await asyncio.to_thread(SmartConnect, host=self.host, user=self.user, pwd=self.password, port=self.port, sslContext=ctx)
+            if self.timeout is not None:
+                def timed_smart_connect():
+                    old_timeout = socket.getdefaulttimeout()
+                    socket.setdefaulttimeout(self.timeout)
+                    try:
+                        return SmartConnect(host=self.host, user=self.user, pwd=self.password, port=self.port, sslContext=ctx)
+                    finally:
+                        socket.setdefaulttimeout(old_timeout)
+                self.si = await asyncio.to_thread(timed_smart_connect)
+            else:
+                self.si = await asyncio.to_thread(SmartConnect, host=self.host, user=self.user, pwd=self.password, port=self.port, sslContext=ctx)
             self.logger.info(f"Connected to vSphere: {self.host}:{self.port}")
         except Exception as e:
             self.logger.error(f"Failed to connect to vSphere: {e}")
