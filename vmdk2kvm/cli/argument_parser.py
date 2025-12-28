@@ -169,7 +169,7 @@ class CLI:
         pvs.add_argument("--vc-password-env", dest="vc_password_env", default=None, help="Env var containing vCenter password")
         pvs.add_argument("--vc-port", dest="vc_port", type=int, default=443, help="vCenter HTTPS port (default: 443)")
         pvs.add_argument("--vc-insecure", dest="vc_insecure", action="store_true", help="Disable TLS verification")
-        pvs.add_argument("--dc-name", dest="dc_name", default="ha-datacenter", help="Datacenter name for /folder URL (default: ha-datacenter)")
+        pvs.add_argument("--dc-name", dest="dc_name", default=None, help="Datacenter name for /folder URL (auto-discovered if omitted; fallback: ha-datacenter)")
         pvs.add_argument("--action", dest="vs_action", choices=["scan","download","cbt-sync"], default="scan", help="Action to run")
         pvs.add_argument("--vm-name", dest="vm_name", default=None, help="VM name (required for download/cbt-sync)")
         pvs.add_argument("--disk", dest="disk", default=None, help="Disk index (0..) or label substring (default: first disk)")
