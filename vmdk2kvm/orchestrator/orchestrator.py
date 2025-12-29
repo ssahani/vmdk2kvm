@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from rich.progress import (
     Progress,
@@ -40,7 +41,6 @@ from ..vmware.vsphere_mode import VsphereMode
 class Orchestrator:
     """
     Top-level pipeline runner.
-
     Responsibilities:
     - Determine input disks (local/fetch/ova/ovf/vsphere)
     - Optionally flatten snapshots
@@ -58,26 +58,91 @@ class Orchestrator:
         out_root: Path,
         out_format: str,
         compress: bool,
+        passphrase: Optional[str] = None,
+        passphrase_env: Optional[str] = None,
+        keyfile: Optional[str] = None,
     ) -> List[Path]:
+        """
+        virt-v2v wrapper with:
+          - early input validation (friendlier than virt-v2v spew)
+          - LUKS key handling via passphrase env or keyfile
+          - robust output discovery across multiple formats
+          - temp keyfile cleanup safety
+        """
         if U.which("virt-v2v") is None:
             logger.warning("virt-v2v not found; falling back to internal fixer")
             return []
+
+        # Validate inputs early (virt-v2v errors are noisy)
+        missing = [str(d) for d in disks if not Path(d).exists()]
+        if missing:
+            raise Fatal(2, f"virt-v2v input disk(s) not found: {', '.join(missing)}")
+
+        U.ensure_dir(out_root)
 
         cmd = ["virt-v2v"]
         for d in disks:
             cmd += ["-i", "disk", str(d)]
         cmd += ["-o", "local", "-os", str(out_root), "-of", out_format]
+
         if compress:
             cmd += ["--compressed"]
 
-        U.banner(logger, "Using virt-v2v for conversion")
-        U.run_cmd(logger, cmd, check=True, capture=False)
+        keyfile_path: Optional[str] = None
+        is_temp_keyfile = False
 
-        # NOTE: virt-v2v may output other formats; you requested out_format but
-        # many flows produce qcow2. Keep behavior same as your current code.
-        out_images = list(out_root.glob("*.qcow2"))
-        logger.info("virt-v2v conversion completed.")
-        return out_images
+        try:
+            effective_passphrase = passphrase
+            if passphrase_env:
+                effective_passphrase = os.environ.get(passphrase_env)
+
+            if keyfile:
+                keyfile_path_temp = Path(keyfile).expanduser().resolve()
+                if not keyfile_path_temp.exists():
+                    logger.warning(f"LUKS keyfile not found: {keyfile_path_temp}")
+                else:
+                    keyfile_path = str(keyfile_path_temp)
+            elif effective_passphrase:
+                # virt-v2v expects a file reference for LUKS keys. Ensure newline.
+                with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as keyfile_tmp:
+                    keyfile_tmp.write(effective_passphrase + "\n")
+                    keyfile_path = keyfile_tmp.name
+                    is_temp_keyfile = True
+
+            if keyfile_path:
+                cmd += ["--key", f"ALL:file:{keyfile_path}"]
+
+            U.banner(logger, "Using virt-v2v for conversion")
+            U.run_cmd(logger, cmd, check=True, capture=False)
+
+        finally:
+            if keyfile_path and is_temp_keyfile:
+                try:
+                    os.unlink(keyfile_path)
+                except Exception:
+                    pass
+
+        # virt-v2v output files can vary; capture common ones robustly.
+        # Keep qcow2-first behavior, but don’t silently miss raw/img/vdi etc.
+        patterns = ["*.qcow2", "*.raw", "*.img", "*.vmdk", "*.vdi"]
+        out_images: List[Path] = []
+        for pat in patterns:
+            out_images.extend(sorted(out_root.glob(pat)))
+
+        # De-dup while preserving order
+        seen: set[str] = set()
+        uniq: List[Path] = []
+        for p in out_images:
+            s = str(p)
+            if s not in seen:
+                seen.add(s)
+                uniq.append(p)
+
+        if not uniq:
+            logger.warning("virt-v2v completed but produced no recognizable disk outputs in out_root")
+        else:
+            logger.info(f"virt-v2v conversion completed: produced {len(uniq)} image(s).")
+        return uniq
 
     def __init__(self, logger: logging.Logger, args: argparse.Namespace):
         self.logger = logger
@@ -110,31 +175,103 @@ class Orchestrator:
             if not config_path.exists():
                 self.logger.warning(f"Cloud-init config not found: {config_path}")
                 return None
-
             if config_path.suffix.lower() == ".json":
                 return json.loads(config_path.read_text(encoding="utf-8"))
-
             if YAML_AVAILABLE:
                 return yaml.safe_load(config_path.read_text(encoding="utf-8"))
-
             self.logger.warning("YAML not available, cannot load cloud-init config")
             return None
         except Exception as e:
             self.logger.warning(f"Failed to load cloud-init config: {e}")
             return None
 
+    def _is_luks_enabled(self) -> bool:
+        # If CLI has luks_enable, honor it; else infer from passphrase/key presence.
+        if hasattr(self.args, "luks_enable"):
+            return bool(getattr(self.args, "luks_enable"))
+        return bool(
+            getattr(self.args, "luks_passphrase", None)
+            or getattr(self.args, "luks_passphrase_env", None)
+            or getattr(self.args, "luks_keyfile", None)
+        )
+
+    @staticmethod
+    def _ensure_parent_dir(path: Optional[Path]) -> None:
+        # Enhancement: consistent safe parent creation without exploding on weird paths.
+        if not path:
+            return
+        try:
+            if path.parent:
+                U.ensure_dir(path.parent)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _throttled_progress_logger(logger: logging.Logger, step_pct: int = 5):
+        """
+        Enhancement: drop-in progress callback generator to avoid log spam.
+        Logs every N% and completion.
+        """
+        if step_pct <= 0:
+            step_pct = 5
+        last_bucket = {"b": -1}
+
+        def cb(progress: float) -> None:
+            # bucket count across 0..100 by step_pct
+            b = int((progress * 100.0) // step_pct)
+            if b != last_bucket["b"]:
+                last_bucket["b"] = b
+                if progress < 1.0:
+                    logger.info(f"Conversion progress: {progress:.1%}")
+                else:
+                    logger.info("Conversion complete")
+
+        return cb
+
+    @staticmethod
+    def _normalize_ssh_opts(v) -> Optional[List[str]]:
+        """
+        Enhancement: normalize ssh_opt whether it came in as:
+          - None
+          - string
+          - list[str]
+        """
+        if v is None:
+            return None
+        if isinstance(v, (list, tuple)):
+            out = [str(x) for x in v if x is not None]
+            return out or None
+        return [str(v)]
+
+    @staticmethod
+    def _choose_workdir(args: argparse.Namespace, out_root: Path) -> Path:
+        """
+        Enhancement: consistent workdir selection used by flatten and other steps.
+        """
+        if getattr(args, "workdir", None):
+            return Path(args.workdir).expanduser().resolve()
+        return out_root / "work"
+
+    @staticmethod
+    def _resolve_output_path(to_output: str, out_root: Path, disk_index: int, multi: bool) -> Path:
+        """
+        Enhancement: deterministic per-disk naming when multiple disks exist.
+        Preserves existing behavior but centralizes edge-cases.
+        """
+        base_output = Path(to_output)
+        if multi:
+            base_output = base_output.parent / f"{base_output.stem}_disk{disk_index}{base_output.suffix}"
+        if not base_output.is_absolute():
+            base_output = out_root / base_output
+        return base_output.expanduser().resolve()
+
     def process_single_disk(self, disk: Path, out_root: Path, disk_index: int = 0) -> Path:
         self.log_input_layout(disk)
-
         working = disk
 
         # Flatten first (optional)
         if getattr(self.args, "flatten", False):
-            workdir = (
-                Path(self.args.workdir).expanduser().resolve()
-                if getattr(self.args, "workdir", None)
-                else (out_root / "work")
-            )
+            workdir = self._choose_workdir(self.args, out_root)
             U.ensure_dir(workdir)
             working = Flatten.to_working(
                 self.logger,
@@ -151,6 +288,7 @@ class Orchestrator:
                 report_path = (out_root / f"{rp.stem}_disk{disk_index}{rp.suffix}") if not rp.is_absolute() else rp
             else:
                 report_path = rp if rp.is_absolute() else (out_root / rp)
+            self._ensure_parent_dir(report_path)
 
         cloud_init_data = self._load_cloud_init_config()
 
@@ -169,6 +307,12 @@ class Orchestrator:
             recovery_manager=self.recovery_manager,
             resize=getattr(self.args, "resize", None),
             virtio_drivers_dir=getattr(self.args, "virtio_drivers_dir", None),
+            # LUKS wiring (keep backward compat; don’t assume arg exists)
+            luks_enable=self._is_luks_enabled(),
+            luks_passphrase=getattr(self.args, "luks_passphrase", None),
+            luks_passphrase_env=getattr(self.args, "luks_passphrase_env", None),
+            luks_keyfile=getattr(self.args, "luks_keyfile", None),
+            luks_mapper_prefix=getattr(self.args, "luks_mapper_prefix", "vmdk2kvm-crypt"),
         )
         fixer.run()
 
@@ -176,22 +320,15 @@ class Orchestrator:
 
         # Convert final output (optional)
         if getattr(self.args, "to_output", None) and not getattr(self.args, "dry_run", False):
-            if len(self.disks) > 1:
-                base_output = Path(self.args.to_output)
-                out_image = base_output.parent / f"{base_output.stem}_disk{disk_index}{base_output.suffix}"
-            else:
-                out_image = Path(self.args.to_output)
+            out_image = self._resolve_output_path(
+                str(self.args.to_output),
+                out_root,
+                disk_index=disk_index,
+                multi=(len(self.disks) > 1),
+            )
+            U.ensure_dir(out_image.parent)
 
-            if not out_image.is_absolute():
-                out_image = out_root / out_image
-            out_image = out_image.expanduser().resolve()
-
-            def progress_callback(progress: float) -> None:
-                # keep same behavior, but less spammy callers can override upstream
-                if progress < 1.0:
-                    self.logger.info(f"Conversion progress: {progress:.1%}")
-                else:
-                    self.logger.info("Conversion complete")
+            progress_callback = self._throttled_progress_logger(self.logger, step_pct=5)
 
             Convert.convert_image_with_progress(
                 self.logger,
@@ -202,9 +339,7 @@ class Orchestrator:
                 compress_level=getattr(self.args, "compress_level", None),
                 progress_callback=progress_callback,
             )
-
             Convert.validate(self.logger, out_image)
-
             if getattr(self.args, "checksum", False):
                 cs = U.checksum(out_image)
                 self.logger.info(f"SHA256 checksum: {cs}")
@@ -213,9 +348,19 @@ class Orchestrator:
 
     def process_disks_parallel(self, disks: List[Path], out_root: Path) -> List[Path]:
         self.logger.info(f"Processing {len(disks)} disks in parallel")
-        results: List[Path] = []
 
-        max_workers = min(4, len(disks), (os.cpu_count() or 1))
+        # Enhancement: stable ordering in results (don’t reorder based on completion timing).
+        results: List[Optional[Path]] = [None] * len(disks)
+
+        # Enhancement: cap workers sanely, but allow env override for power users.
+        env_workers = os.environ.get("VMDK2KVM_WORKERS")
+        if env_workers:
+            try:
+                max_workers = max(1, int(env_workers))
+            except Exception:
+                max_workers = min(4, len(disks), (os.cpu_count() or 1))
+        else:
+            max_workers = min(4, len(disks), (os.cpu_count() or 1))
 
         with Progress(
             TextColumn("{task.description}"),
@@ -225,23 +370,25 @@ class Orchestrator:
             TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task("Processing disks", total=len(disks))
-
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(self.process_single_disk, disk, out_root, idx): (idx, disk)
+                    executor.submit(self.process_single_disk, disk, out_root, idx): idx
                     for idx, disk in enumerate(disks)
                 }
                 for future in concurrent.futures.as_completed(futures):
-                    idx, disk = futures[future]
+                    idx = futures[future]
+                    disk = disks[idx]
                     try:
                         result = future.result()
-                        results.append(result)
+                        results[idx] = result
                         self.logger.info(f"Completed processing disk {idx}: {disk.name}")
                     except Exception as e:
+                        # preserve failure but continue
                         self.logger.error(f"Failed processing disk {idx} ({disk.name}): {e}")
                     progress.update(task, advance=1)
 
-        return results
+        # Filter None, keep deterministic ordering
+        return [r for r in results if r is not None]
 
     def _setup_recovery(self, out_root: Path) -> None:
         if getattr(self.args, "enable_recovery", False):
@@ -255,19 +402,15 @@ class Orchestrator:
         Returns temp_dir if created (needs cleanup), else None.
         """
         temp_dir: Optional[Path] = None
-
         cmd = getattr(self.args, "cmd", None)
 
         if cmd == "vsphere":
             if not PYVMOMI_AVAILABLE:
                 raise Fatal(2, "pyvmomi not installed. Install: pip install pyvmomi")
-
-            # Your code used (download,cbt-sync) but your subcommands are snake_case;
-            # keep intent: requests needed for download-ish actions.
+            # requests needed for download-ish actions
             vs_action = getattr(self.args, "vs_action", "")
             if not REQUESTS_AVAILABLE and (vs_action in ("download_datastore_file", "download_vm_disk", "cbt_sync")):
                 raise Fatal(2, "requests not installed. Install: pip install requests")
-
             VsphereMode(self.logger, self.args).run()
             return None  # vsphere handles its own output; stop orchestration
 
@@ -282,7 +425,7 @@ class Orchestrator:
                     user=self.args.user,
                     port=self.args.port,
                     identity=getattr(self.args, "identity", None),
-                    ssh_opt=getattr(self.args, "ssh_opt", None),
+                    ssh_opt=self._normalize_ssh_opts(getattr(self.args, "ssh_opt", None)),
                     sudo=False,
                 ),
             )
@@ -325,7 +468,7 @@ class Orchestrator:
                     user=self.args.user,
                     port=self.args.port,
                     identity=getattr(self.args, "identity", None),
-                    ssh_opt=getattr(self.args, "ssh_opt", None),
+                    ssh_opt=self._normalize_ssh_opts(getattr(self.args, "ssh_opt", None)),
                     sudo=getattr(self.args, "sudo", False),
                 ),
             )
@@ -338,6 +481,9 @@ class Orchestrator:
                 update_grub=not getattr(self.args, "no_grub", False),
                 regen_initramfs=getattr(self.args, "regen_initramfs", True),
                 remove_vmware_tools=getattr(self.args, "remove_vmware_tools", False),
+                luks_passphrase=getattr(self.args, "luks_passphrase", None),
+                luks_passphrase_env=getattr(self.args, "luks_passphrase_env", None),
+                luks_keyfile=getattr(self.args, "luks_keyfile", None),
             ).run()
             self.logger.info("Live fix done.")
             return None
@@ -385,11 +531,11 @@ class Orchestrator:
                 out_root,
                 getattr(self.args, "out_format", "qcow2"),
                 getattr(self.args, "compress", False),
+                getattr(self.args, "luks_passphrase", None),
+                getattr(self.args, "luks_passphrase_env", None),
+                getattr(self.args, "luks_keyfile", None),
             )
-            if v2v_images:
-                fixed_images = v2v_images
-            else:
-                fixed_images = self._internal_process(out_root)
+            fixed_images = v2v_images if v2v_images else self._internal_process(out_root)
         else:
             fixed_images = self._internal_process(out_root)
 
@@ -404,6 +550,9 @@ class Orchestrator:
                 v2v_dir,
                 getattr(self.args, "out_format", "qcow2"),
                 getattr(self.args, "compress", False),
+                getattr(self.args, "luks_passphrase", None),
+                getattr(self.args, "luks_passphrase_env", None),
+                getattr(self.args, "luks_keyfile", None),
             )
             if v2v_images:
                 out_images = v2v_images
@@ -411,7 +560,6 @@ class Orchestrator:
         # Optional tests
         if out_images:
             test_image = out_images[0]
-
             if getattr(self.args, "libvirt_test", False):
                 LibvirtTest.run(
                     self.logger,
@@ -424,7 +572,6 @@ class Orchestrator:
                     keep=getattr(self.args, "keep_domain", False),
                     headless=getattr(self.args, "headless", False),
                 )
-
             if getattr(self.args, "qemu_test", False):
                 QemuTest.run(
                     self.logger,
@@ -437,6 +584,7 @@ class Orchestrator:
         if self.recovery_manager:
             self.recovery_manager.cleanup_old_checkpoints()
 
+        # Cleanup extraction dir only if it was created for ova/ovf flows.
         if temp_dir and temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -449,6 +597,7 @@ class Orchestrator:
 
     def _internal_process(self, out_root: Path) -> List[Path]:
         fixed_images: List[Path] = []
+
         if len(self.disks) > 1 and getattr(self.args, "parallel_processing", False):
             return self.process_disks_parallel(self.disks, out_root)
 
@@ -458,7 +607,3 @@ class Orchestrator:
             fixed_images.append(self.process_single_disk(disk, out_root, idx))
 
         return fixed_images
-
-
-# Backward compatibility: keep old name working across the tree.
-Magic = Orchestrator
