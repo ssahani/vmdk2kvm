@@ -1,0 +1,100 @@
+# =================================================
+# Python bytecode / caches (ALL levels)
+# =================================================
+__pycache__/
+**/__pycache__/
+
+*.pyc
+*.pyo
+*.pyd
+*.cpython-*.pyc
+
+# =================================================
+# Python virtual environments
+# =================================================
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# Poetry / PDM / Pipenv
+.poetry/
+.pdm-python
+.pdm.toml
+Pipfile.lock
+
+# =================================================
+# Python build / packaging artifacts
+# =================================================
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# Setuptools / PyInstaller
+*.spec
+
+# =================================================
+# Python testing / coverage / profiling
+# =================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.prof
+*.lprof
+
+# =================================================
+# Static analysis / type checking
+# =================================================
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+
+# =================================================
+# Logs / runtime artifacts
+# =================================================
+*.log
+*.pid
+
+# =================================================
+# Jupyter / IPython
+# =================================================
+.ipynb_checkpoints/
+.profile_default/
+ipython_config.py
+
+# =================================================
+# VMDK / disk artifacts (project-specific but safe)
+# =================================================
+*.vmdk
+*-flat.vmdk
+*.qcow2
+*.raw
+*.img
+
+# =================================================
+# Archives / generated bundles
+# =================================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# =================================================
+# Editor / OS noise
+# =================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
