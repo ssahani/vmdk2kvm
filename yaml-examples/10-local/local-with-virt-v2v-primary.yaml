@@ -1,0 +1,11 @@
+command: local
+vmdk: /path/to/vm.vmdk
+
+# Prefer virt-v2v for conversion
+use_v2v: true
+
+# Still allow internal fixers to run before/after depending on your orchestration
+post_v2v: false
+
+to_output: vm-v2v.qcow2
+report: local-v2v.md
