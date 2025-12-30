@@ -22,6 +22,7 @@ from ..config.config_loader import YAML_AVAILABLE, yaml
 from ..converters.fetch import Fetch
 from ..converters.flatten import Flatten
 from ..converters.ovf_extractor import OVF
+from ..converters.vhd_extractor import VHD
 from ..converters.qemu_converter import Convert
 from ..core.exceptions import Fatal
 from ..core.recovery_manager import RecoveryManager
@@ -470,7 +471,18 @@ class Orchestrator:
                 Path(self.args.ovf).expanduser().resolve(),
                 temp_dir,
             )
-
+        elif cmd == "vhd":
+            temp_dir = out_root / "extracted"
+            self.disks = VHD.extract_vhd_or_tar(
+                self.logger,
+                Path(self.args.vhd).expanduser().resolve(),
+                temp_dir,
+                convert_to_qcow2=True,
+                convert_outdir=out_root / "qcow2",
+                convert_compress=bool(self.args.compress),
+                convert_compress_level=self.args.compress_level,
+                log_virt_filesystems=True,
+            )       
         elif cmd == "live-fix":
             sshc = SSHClient(
                 self.logger,

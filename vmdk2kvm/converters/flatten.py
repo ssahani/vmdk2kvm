@@ -63,6 +63,14 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
 class Flatten:
     """
     Flatten snapshot chain into a single self-contained image.
+
+    IMPORTANT CHANGE (fix for Photon Azure VHD / any non-VMDK):
+      - We DO NOT hardcode '-f vmdk' anymore.
+      - We detect the real input format via 'qemu-img info --output=json'
+        and use '-f <format>' when known (vpc/vmdk/raw/qcow2/...).
+      - If detection fails, we omit '-f' and let qemu-img autodetect.
+
+    Everything else (fast FLAT path, retry ladder, progress, logging, atomic output) stays.
     """
 
     _RE_PAREN = re.compile(r"\((\d+(?:\.\d+)?)/100%\)")
@@ -91,7 +99,7 @@ class Flatten:
 
         U.ensure_dir(outdir)
 
-        # Fast FLAT descriptor path (byte-copy extent -> raw -> fmt)
+        # 0) VMDK-descriptor-only fast path (harmless for VHD; it will just return None)
         fast = Flatten._fast_path_flat(logger, src, outdir, fmt)
         if fast is not None:
             return fast
@@ -103,10 +111,18 @@ class Flatten:
         U.banner(logger, "Flatten snapshot chain")
         logger.info("Flattening via qemu-img convert (single self-contained image)…")
 
-        virt_size = Flatten._qemu_img_virtual_size(logger, src)
-        policy = _ProgressPolicy()
+        # 1) Detect input format + virtual size once (fixes VHD/VPC vs VMDK)
+        info = Flatten._qemu_img_info(logger, src)
+        in_fmt = (info.get("format") or "").strip() or None
+        virt_size = int(info.get("virtual-size", 0) or 0)
 
-        attempts = Flatten._flatten_cmd_attempts(src=src, tmp_dst=tmp_dst, fmt=fmt)
+        if in_fmt:
+            logger.info(f"Detected input format: {in_fmt}")
+        else:
+            logger.warning("Could not detect input format; will rely on qemu-img autodetect (no -f).")
+
+        policy = _ProgressPolicy()
+        attempts = Flatten._flatten_cmd_attempts(src=src, tmp_dst=tmp_dst, fmt=fmt, in_fmt=in_fmt)
 
         last_err: Optional[subprocess.CalledProcessError] = None
         for i, cmd in enumerate(attempts, start=1):
@@ -139,21 +155,31 @@ class Flatten:
         raise last_err
 
     # -----------------------------
-    # Attempts: DO NOT use --target-is-zero here
+    # Attempts (NO --target-is-zero)
     # -----------------------------
 
     @staticmethod
-    def _flatten_cmd_attempts(*, src: Path, tmp_dst: Path, fmt: str) -> list[list[str]]:
+    def _flatten_cmd_attempts(*, src: Path, tmp_dst: Path, fmt: str, in_fmt: Optional[str]) -> list[list[str]]:
+        """
+        Build retry commands.
+          - Prefer cache-bypass (-t/-T none) first.
+          - Use -f <in_fmt> if known; otherwise omit -f (autodetect).
+        """
+        base_fast = ["qemu-img", "convert", "-p", "-t", "none", "-T", "none"]
+        base_compat = ["qemu-img", "convert", "-p"]
+
+        if in_fmt:
+            base_fast += ["-f", in_fmt]
+            base_compat += ["-f", in_fmt]
+
         return [
-            # Fast + stable on big images: reduce host cache thrash
-            ["qemu-img", "convert", "-p", "-t", "none", "-T", "none", "-f", "vmdk", "-O", fmt, str(src), str(tmp_dst)],
-            # Maximum compatibility
-            ["qemu-img", "convert", "-p", "-f", "vmdk", "-O", fmt, str(src), str(tmp_dst)],
+            base_fast + ["-O", fmt, str(src), str(tmp_dst)],
+            base_compat + ["-O", fmt, str(src), str(tmp_dst)],
         ]
 
     @staticmethod
     def _raw_to_fmt_cmd_attempts(*, raw_src: Path, tmp_dst: Path, fmt: str) -> list[list[str]]:
-        # Also avoid --target-is-zero for the same reason
+        # Avoid --target-is-zero (requires -n and breaks across qemu versions)
         return [
             ["qemu-img", "convert", "-p", "-t", "none", "-T", "none", "-f", "raw", "-O", fmt, str(raw_src), str(tmp_dst)],
             ["qemu-img", "convert", "-p", "-f", "raw", "-O", fmt, str(raw_src), str(tmp_dst)],
@@ -165,6 +191,7 @@ class Flatten:
 
     @staticmethod
     def _fast_path_flat(logger: logging.Logger, src: Path, outdir: Path, fmt: str) -> Optional[Path]:
+        # Only makes sense for tiny VMDK descriptors
         try:
             if src.stat().st_size > 2 * 1024 * 1024:
                 return None
@@ -210,14 +237,13 @@ class Flatten:
             logger.info(f"Fast FLAT output (raw): {raw_dst}")
             return raw_dst
 
-        # raw -> fmt with progress + retries (no --target-is-zero)
+        # raw -> fmt with progress + retries
         final_dst = outdir / f"working-flattened-{U.now_ts()}.{fmt}"
         tmp_dst = _atomic_tmp(final_dst)
         _unlink_quiet(tmp_dst)
 
         virt_size = raw_dst.stat().st_size
         policy = _ProgressPolicy()
-
         attempts = Flatten._raw_to_fmt_cmd_attempts(raw_src=raw_dst, tmp_dst=tmp_dst, fmt=fmt)
 
         last_err: Optional[subprocess.CalledProcessError] = None
@@ -362,7 +388,6 @@ class Flatten:
             task = progress.add_task(task_label, total=total)
 
             while True:
-                # Wait up to io_poll_s for stderr activity; otherwise we still tick via file-size polling
                 events = sel.select(timeout=policy.io_poll_s)
                 for key, _mask in events:
                     line = key.fileobj.readline()
@@ -421,7 +446,32 @@ class Flatten:
     # -----------------------------
 
     @staticmethod
+    def _qemu_img_info(logger: logging.Logger, src: Path) -> dict:
+        """
+        Detect input format + virtual size once.
+        Returns {} on failure (caller can omit -f and keep virt_size=0).
+        """
+        try:
+            cp = subprocess.run(
+                ["qemu-img", "info", "--output=json", str(src)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            info = json.loads(cp.stdout or "{}")
+            if not isinstance(info, dict):
+                return {}
+            fmt = (info.get("format") or "").strip()
+            vsz = info.get("virtual-size", 0)
+            logger.debug(f"qemu-img info: format={fmt or 'unknown'} virtual-size={vsz}")
+            return info
+        except Exception as e:
+            logger.debug(f"Could not determine qemu-img info via qemu-img info: {e}")
+            return {}
+
+    @staticmethod
     def _qemu_img_virtual_size(logger: logging.Logger, src: Path) -> int:
+        # Kept for compatibility: other callers might use it.
         try:
             cp = subprocess.run(
                 ["qemu-img", "info", "--output=json", str(src)],

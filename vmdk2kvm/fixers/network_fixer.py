@@ -3,10 +3,10 @@
 Comprehensive network configuration fixer for VMware to KVM migration.
 
 Handles multiple network configuration formats:
-- RedHat/CentOS: /etc/sysconfig/network-scripts/ifcfg-*
+- RedHat/CentOS/Fedora: /etc/sysconfig/network-scripts/ifcfg-*, /etc/sysconfig/network/ifcfg-*
 - Debian/Ubuntu: /etc/network/interfaces, /etc/netplan/*
 - SUSE/openSUSE: /etc/sysconfig/network/ifcfg-*, /etc/wicked/*
-- Systemd-networkd: /etc/systemd/network/*.network
+- Systemd-networkd: /etc/systemd/network/*.network, *.netdev
 - NetworkManager: /etc/NetworkManager/system-connections/*
 
 Removes VMware-specific configurations and ensures KVM compatibility.
@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import guestfs  # type: ignore
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -38,7 +38,7 @@ class NetworkConfigType(Enum):
     SYSTEMD_NETWORK = "systemd-network"  # systemd-networkd
     SYSTEMD_NETDEV = "systemd-netdev"  # systemd netdev
     NETWORK_MANAGER = "network-manager"  # NetworkManager
-    WICKED = "wicked"  # SUSE wicked
+    WICKED = "wicked"  # SUSE wicked XML / configs
     WICKED_IFCFG = "wicked-ifcfg"  # SUSE ifcfg files
     UNKNOWN = "unknown"
 
@@ -122,34 +122,28 @@ class NetworkFixer:
 
     # Configuration file patterns by OS/distro
     CONFIG_PATTERNS = {
-        # RedHat/CentOS/Fedora
         NetworkConfigType.IFCONFIG_RH: [
             "/etc/sysconfig/network-scripts/ifcfg-*",
             "/etc/sysconfig/network/ifcfg-*",
         ],
-        # Ubuntu/Debian with netplan
         NetworkConfigType.NETPLAN: [
             "/etc/netplan/*.yaml",
             "/etc/netplan/*.yml",
         ],
-        # Debian/Ubuntu classic
         NetworkConfigType.INTERFACES: [
             "/etc/network/interfaces",
             "/etc/network/interfaces.d/*",
         ],
-        # Systemd-networkd (all distros)
         NetworkConfigType.SYSTEMD_NETWORK: [
             "/etc/systemd/network/*.network",
         ],
         NetworkConfigType.SYSTEMD_NETDEV: [
             "/etc/systemd/network/*.netdev",
         ],
-        # NetworkManager (all distros)
         NetworkConfigType.NETWORK_MANAGER: [
             "/etc/NetworkManager/system-connections/*.nmconnection",
             "/etc/NetworkManager/system-connections/*",
         ],
-        # SUSE/openSUSE wicked
         NetworkConfigType.WICKED: [
             "/etc/wicked/ifconfig/*.xml",
             "/etc/wicked/ifconfig/*",
@@ -159,10 +153,64 @@ class NetworkFixer:
         ],
     }
 
-    def __init__(self, logger: logging.Logger, fix_level: FixLevel = FixLevel.MODERATE):
+    def __init__(
+        self,
+        logger: logging.Logger,
+        fix_level: FixLevel = FixLevel.MODERATE,
+        *,
+        dry_run: bool = False,
+        backup_suffix: Optional[str] = None,
+    ):
         self.logger = logger
         self.fix_level = fix_level
-        self.backup_suffix = f".vmdk2kvm_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.dry_run = dry_run
+        self.backup_suffix = backup_suffix or f".vmdk2kvm_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # ---------------------------
+    # IO helpers (atomic write + perms)
+    # ---------------------------
+
+    def _get_mode_safe(self, g: guestfs.GuestFS, path: str) -> Optional[int]:
+        try:
+            st = g.stat(path)
+            mode = int(st.get("mode", 0)) & 0o7777
+            return mode if mode else None
+        except Exception:
+            return None
+
+    def _chmod_safe(self, g: guestfs.GuestFS, path: str, mode: int) -> None:
+        try:
+            g.chmod(mode, path)
+        except Exception as e:
+            self.logger.debug(f"chmod({oct(mode)}) failed for {path}: {e}")
+
+    def _write_atomic(self, g: guestfs.GuestFS, path: str, data: bytes) -> None:
+        """
+        Atomic-ish write: write temp next to file then rename.
+        Works for most filesystems. Fallback to plain write if needed.
+        """
+        tmp = f"{path}.tmp.vmdk2kvm"
+        try:
+            g.write(tmp, data)
+            g.rename(tmp, path)
+        except Exception:
+            try:
+                if g.exists(tmp):
+                    g.rm_f(tmp)
+            except Exception:
+                pass
+            g.write(path, data)
+
+    def _write_with_mode(self, g: guestfs.GuestFS, path: str, content: str, *, prefer_mode: Optional[int] = None) -> None:
+        """
+        Preserve existing file mode when overwriting, or apply prefer_mode if file doesn't exist.
+        """
+        old_mode = self._get_mode_safe(g, path)
+        self._write_atomic(g, path, content.encode("utf-8"))
+        if old_mode is not None:
+            self._chmod_safe(g, path, old_mode)
+        elif prefer_mode is not None:
+            self._chmod_safe(g, path, prefer_mode)
 
     # ---------------------------
     # Detection / IO
@@ -189,25 +237,45 @@ class NetworkFixer:
             return NetworkConfigType.WICKED_IFCFG
         return NetworkConfigType.UNKNOWN
 
+    def _should_skip_path(self, path: str) -> bool:
+        p = path or ""
+        if self.backup_suffix and self.backup_suffix in p:
+            return True
+        if re.search(r"(\.bak|~|\.orig|\.rpmnew|\.rpmsave)$", p):
+            return True
+        base = p.split("/")[-1]
+        if base in ("ifcfg-lo", "ifcfg-bonding_masters"):
+            return True
+        return False
+
     def create_backup(self, g: guestfs.GuestFS, path: str, content: str) -> str:
         """Create a backup of the original file."""
         backup_path = f"{path}{self.backup_suffix}"
         try:
-            # Best-effort: write backup alongside original file
+            if hasattr(g, "cp_a"):
+                try:
+                    g.cp_a(path, backup_path)
+                    self.logger.debug(f"Created backup (cp_a): {backup_path}")
+                    return backup_path
+                except Exception:
+                    pass
+
+            try:
+                g.copy_file_to_file(path, backup_path)
+                self.logger.debug(f"Created backup (copy_file_to_file): {backup_path}")
+                return backup_path
+            except Exception:
+                pass
+
             g.write(backup_path, content.encode("utf-8"))
-            self.logger.debug(f"Created backup: {backup_path}")
+            self.logger.debug(f"Created backup (write): {backup_path}")
             return backup_path
         except Exception as e:
             self.logger.warning(f"Failed to create backup for {path}: {e}")
             return ""
 
     def calculate_hash(self, content: str) -> str:
-        """
-        Stable content hash.
-
-        (Your old hex(abs(hash(content))) is per-process randomized by Python,
-        so the same content can get a different hash between runs.)
-        """
+        """Stable content hash."""
         h = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
         return h[:12]
 
@@ -230,12 +298,14 @@ class NetworkFixer:
         configs: List[NetworkConfig] = []
         seen: Set[str] = set()
 
-        for config_type, patterns in self.CONFIG_PATTERNS.items():
+        for _config_type, patterns in self.CONFIG_PATTERNS.items():
             for pattern in patterns:
                 try:
                     files = guest_ls_glob(g, pattern)
                     for file_path in files:
                         if file_path in seen:
+                            continue
+                        if self._should_skip_path(file_path):
                             continue
                         seen.add(file_path)
                         config = self.read_config_file(g, file_path)
@@ -244,7 +314,6 @@ class NetworkFixer:
                 except Exception as e:
                     self.logger.debug(f"Pattern {pattern} failed: {e}")
 
-        # Also look for any ifcfg-* files in common locations (deduped)
         additional_locations = [
             "/etc/sysconfig/network/ifcfg-*",
             "/etc/ifcfg-*",
@@ -254,6 +323,8 @@ class NetworkFixer:
                 files = guest_ls_glob(g, location)
                 for file_path in files:
                     if file_path in seen:
+                        continue
+                    if self._should_skip_path(file_path):
                         continue
                     seen.add(file_path)
                     config = self.read_config_file(g, file_path)
@@ -272,21 +343,18 @@ class NetworkFixer:
         """
         Check if an interface name needs to be renamed.
 
-        Enhancement: check *problematic VMware patterns first*.
-        Your previous logic short-circuited on ^ens\\d+$ and therefore NEVER renamed ens192/ens224/etc,
-        even though you explicitly list those as VMware-pattern names.
+        - Rename known VMware-ish names first (ens192/ens224/etc, vmnicX...)
+        - Otherwise keep standard predictable names.
         """
         name = (interface_name or "").strip()
 
-        # If it matches a known-problem pattern, rename it (even if it looks "predictable")
         for pattern, _tag in self.INTERFACE_NAME_PATTERNS:
             if re.match(pattern, name, re.IGNORECASE):
                 return True
 
-        # Keep standard names
         standard_patterns = [
             r"^eth\d+$",
-            r"^en[opsx]\w+$",  # Predictable network interface names
+            r"^en[opsx]\w+$",
             r"^ens\d+$",
             r"^eno\d+$",
             r"^enp\d+s\d+$",
@@ -341,17 +409,18 @@ class NetworkFixer:
                         current_name = m.group(1).strip().strip('"\'')
                         if self.needs_interface_rename(current_name):
                             new_name = self.get_safe_interface_name(current_name)
-                            line = f"# {line}  # Renamed by vmdk2kvm\nNAME={new_name}"
+                            new_lines.append(f"# {line}  # Renamed by vmdk2kvm")
+                            new_lines.append(f"NAME={new_name}")
                             fixes_applied.append("renamed-interface")
+                            continue
 
-            # Ensure BOOTPROTO is sane: if it's neither static nor dhcp-ish, normalize to dhcp
+            # Ensure BOOTPROTO is sane
             if re.match(r"^\s*BOOTPROTO\s*=", line, re.IGNORECASE):
                 v = line.split("=", 1)[-1].strip().strip('"\'').lower()
                 if v not in ("dhcp", "static", "none", "bootp"):
                     line = "BOOTPROTO=dhcp"
                     fixes_applied.append("enabled-dhcp")
                 elif v == "none" and self.fix_level == FixLevel.AGGRESSIVE:
-                    # In aggressive mode, prefer DHCP unless explicitly static later
                     line = "BOOTPROTO=dhcp"
                     fixes_applied.append("normalized-bootproto-none-to-dhcp")
 
@@ -385,9 +454,9 @@ class NetworkFixer:
             if isinstance(data, dict) and "network" in data and isinstance(data["network"], dict):
                 network = data["network"]
 
-                # ethernets
                 eths = network.get("ethernets")
                 if isinstance(eths, dict):
+                    renderer = str(network.get("renderer") or "").lower()
                     for _iface_name, iface_config in eths.items():
                         if not isinstance(iface_config, dict):
                             continue
@@ -418,20 +487,20 @@ class NetworkFixer:
                                     fixes_applied.append(f"removed-vmware-driver-{vmware_driver}")
                                     break
 
-                        # Ensure DHCP if no addresses configured
-                        if "addresses" not in iface_config and "dhcp4" not in iface_config:
-                            iface_config["dhcp4"] = True
-                            fixes_applied.append("enabled-dhcp4")
+                        # Ensure DHCP only when safe (no static intent, not NM renderer)
+                        has_static_intent = any(k in iface_config for k in ("addresses", "gateway4", "gateway6", "routes"))
+                        if not has_static_intent and "dhcp4" not in iface_config:
+                            if renderer != "networkmanager":
+                                iface_config["dhcp4"] = True
+                                fixes_applied.append("enabled-dhcp4")
 
                         # Fix interface names
-                        if self.fix_level == FixLevel.AGGRESSIVE:
-                            if "set-name" in iface_config:
-                                current_name = str(iface_config["set-name"])
-                                if self.needs_interface_rename(current_name):
-                                    iface_config["set-name"] = self.get_safe_interface_name(current_name)
-                                    fixes_applied.append("fixed-interface-name")
+                        if self.fix_level == FixLevel.AGGRESSIVE and "set-name" in iface_config:
+                            current_name = str(iface_config["set-name"])
+                            if self.needs_interface_rename(current_name):
+                                iface_config["set-name"] = self.get_safe_interface_name(current_name)
+                                fixes_applied.append("fixed-interface-name")
 
-                # bonds/vlans/bridges
                 for section in ("bonds", "vlans", "bridges"):
                     sec = network.get(section)
                     if isinstance(sec, dict):
@@ -442,7 +511,6 @@ class NetworkFixer:
                                 del iface_config["macaddress"]
                                 fixes_applied.append(f"removed-{section}-mac")
 
-            # Keep key order stable-ish, avoid flow style
             new_content = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
             return FixResult(config=config, new_content=new_content, applied_fixes=fixes_applied)
         except Exception as e:
@@ -479,7 +547,6 @@ class NetworkFixer:
                 in_iface_block = False
                 return
 
-            # If iface is declared static but has no "address", normalize to dhcp (only in moderate+)
             if self.fix_level in (FixLevel.MODERATE, FixLevel.AGGRESSIVE):
                 has_address = self._interfaces_block_has_address(iface_block_lines)
                 for idx, ln in enumerate(iface_block_lines):
@@ -494,7 +561,6 @@ class NetworkFixer:
             in_iface_block = False
 
         for line in lines:
-            # Start of iface stanza
             if line.strip().startswith("iface "):
                 flush_block()
                 parts = line.split()
@@ -507,19 +573,16 @@ class NetworkFixer:
                 iface_block_lines = [line]
                 continue
 
-            # End of block if a new top-level stanza begins
             if line.strip() and not line.startswith((" ", "\t")) and in_iface_block:
                 flush_block()
 
             if in_iface_block:
-                # Remove VMware driver hints
                 for driver_name, pattern in self.VMWARE_DRIVERS.items():
                     if re.search(pattern, line, re.IGNORECASE):
                         line = f"# {line}  # VMware driver removed"
                         fixes_applied.append(f"removed-vmware-driver-{driver_name}")
                         break
 
-                # Handle MAC address pinning (hwaddress)
                 if self.fix_level in (FixLevel.MODERATE, FixLevel.AGGRESSIVE):
                     for pattern, pattern_name in self.MAC_PINNING_PATTERNS:
                         if pattern_name == "interfaces-hwaddress" and re.match(pattern, line):
@@ -529,7 +592,6 @@ class NetworkFixer:
 
                 iface_block_lines.append(line)
             else:
-                # Outside iface block: just remove VMware driver hints
                 for driver_name, pattern in self.VMWARE_DRIVERS.items():
                     if re.search(pattern, line, re.IGNORECASE):
                         line = f"# {line}  # VMware driver removed"
@@ -557,7 +619,6 @@ class NetworkFixer:
         for line in lines:
             stripped = line.strip()
 
-            # Track sections
             if stripped == "[Match]":
                 in_match_section = True
                 in_network_section = False
@@ -569,20 +630,20 @@ class NetworkFixer:
                 in_match_section = False
                 in_network_section = False
 
-            # Remove MACAddress match in [Match]
             if in_match_section and self.fix_level in (FixLevel.MODERATE, FixLevel.AGGRESSIVE):
                 if re.match(r"^\s*MACAddress\s*=", line, re.IGNORECASE):
                     line = f"# {line}  # MAC matching removed by vmdk2kvm"
                     fixes_applied.append("removed-mac-match")
+                elif re.match(r"^\s*Match\s+MACAddress\s*=", line, re.IGNORECASE):
+                    line = f"# {line}  # MAC matching removed by vmdk2kvm"
+                    fixes_applied.append("removed-mac-match")
 
-            # Remove VMware driver hints
             for driver_name, pattern in self.VMWARE_DRIVERS.items():
                 if re.search(pattern, line, re.IGNORECASE):
                     line = f"# {line}  # VMware driver removed"
                     fixes_applied.append(f"removed-vmware-driver-{driver_name}")
                     break
 
-            # Normalize DHCP
             if in_network_section and re.match(r"^\s*DHCP\s*=", line, re.IGNORECASE):
                 saw_dhcp = True
                 if not re.search(r"(?i)=\s*(yes|true|ipv4|ipv6|both)\b", line):
@@ -591,7 +652,6 @@ class NetworkFixer:
 
             new_lines.append(line)
 
-        # If no DHCP directive exists and we're being proactive, add it under [Network]
         if self.fix_level == FixLevel.AGGRESSIVE and saw_network_section and not saw_dhcp:
             out: List[str] = []
             inserted = False
@@ -615,18 +675,15 @@ class NetworkFixer:
         new_lines: List[str] = []
 
         for line in lines:
-            # Remove MAC address settings
             if self.fix_level in (FixLevel.MODERATE, FixLevel.AGGRESSIVE):
                 if re.match(r"^\s*(mac-address|cloned-mac-address)\s*=", line, re.IGNORECASE):
                     line = f"# {line}  # MAC address removed by vmdk2kvm"
                     fixes_applied.append("removed-nm-mac")
 
-            # Remove VMware-specific settings
             if re.search(r"(?i)vmware|vmxnet|e1000", line):
                 line = f"# {line}  # VMware-specific setting removed"
                 fixes_applied.append("removed-vmware-setting")
 
-            # Fix interface names in aggressive mode
             if self.fix_level == FixLevel.AGGRESSIVE:
                 if re.match(r"^\s*interface-name\s*=", line, re.IGNORECASE):
                     m = re.match(r"^\s*interface-name\s*=\s*(.+?)\s*$", line, re.IGNORECASE)
@@ -642,6 +699,32 @@ class NetworkFixer:
         new_content = "\n".join(new_lines)
         return FixResult(config=config, new_content=new_content, applied_fixes=fixes_applied)
 
+    def fix_wicked_xml(self, config: NetworkConfig) -> FixResult:
+        """
+        Best-effort wicked XML fixer.
+
+        IMPORTANT: Do NOT do ifcfg-style line edits on XML.
+        We remove MAC pinning only, keep XML intact.
+        """
+        content = config.content
+        fixes_applied: List[str] = []
+
+        if self.fix_level not in (FixLevel.MODERATE, FixLevel.AGGRESSIVE):
+            return FixResult(config=config, new_content=content, applied_fixes=[])
+
+        new_content = content
+
+        patterns = [
+            (r"(?is)<\s*mac-address\s*>[^<]+<\s*/\s*mac-address\s*>", "wicked-mac-address"),
+            (r"(?is)<\s*match\s*>.*?<\s*mac-address\s*>.*?</\s*mac-address\s*>.*?</\s*match\s*>", "wicked-match-mac"),
+        ]
+        for pat, tag in patterns:
+            if re.search(pat, new_content):
+                new_content = re.sub(pat, "<!-- removed by vmdk2kvm -->", new_content)
+                fixes_applied.append(f"removed-mac-pinning-{tag}")
+
+        return FixResult(config=config, new_content=new_content, applied_fixes=fixes_applied)
+
     # ---------------------------
     # Validation / apply
     # ---------------------------
@@ -653,7 +736,6 @@ class NetworkFixer:
         if not fixed.strip():
             errors.append("Empty configuration after fix")
 
-        # Type-specific validation
         if config_type == NetworkConfigType.NETPLAN and YAML_AVAILABLE:
             try:
                 yaml.safe_load(fixed)
@@ -663,7 +745,8 @@ class NetworkFixer:
         essential_keywords = {
             NetworkConfigType.IFCONFIG_RH: ["DEVICE", "ONBOOT"],
             NetworkConfigType.INTERFACES: ["iface"],
-            NetworkConfigType.SYSTEMD_NETWORK: ["[Match]", "[Network]"],
+            NetworkConfigType.SYSTEMD_NETWORK: ["[Network]"],  # [Match] optional
+            NetworkConfigType.SYSTEMD_NETDEV: ["[NetDev]"],
             NetworkConfigType.NETWORK_MANAGER: ["[connection]"],
         }
         if config_type in essential_keywords:
@@ -676,7 +759,7 @@ class NetworkFixer:
     def apply_fix(self, g: guestfs.GuestFS, config: NetworkConfig, result: FixResult) -> bool:
         """Apply the fix to the guest filesystem."""
         if result.new_content == config.content and not result.applied_fixes:
-            return False  # No changes needed
+            return False
 
         validation_errors = self.validate_fix(config.content, result.new_content, config.type)
         if validation_errors:
@@ -686,8 +769,22 @@ class NetworkFixer:
 
         backup_path = self.create_backup(g, config.path, config.content)
 
+        if self.dry_run:
+            self.logger.info(f"DRY-RUN: would update {config.path} with fixes: {result.applied_fixes}")
+            config.modified = True
+            config.backup_path = backup_path
+            config.fixes_applied.extend(result.applied_fixes)
+            return True
+
         try:
-            g.write(config.path, result.new_content.encode("utf-8"))
+            prefer_mode = None
+            if config.type == NetworkConfigType.NETWORK_MANAGER:
+                prefer_mode = 0o600
+            elif config.type in (NetworkConfigType.NETPLAN, NetworkConfigType.SYSTEMD_NETWORK, NetworkConfigType.SYSTEMD_NETDEV):
+                prefer_mode = 0o644
+
+            self._write_with_mode(g, config.path, result.new_content, prefer_mode=prefer_mode)
+
             self.logger.info(f"Updated {config.path} with fixes: {result.applied_fixes}")
             config.modified = True
             config.backup_path = backup_path
@@ -696,7 +793,6 @@ class NetworkFixer:
         except Exception as e:
             self.logger.error(f"Failed to write {config.path}: {e}")
 
-            # Best-effort restore
             if backup_path and g.is_file(backup_path):
                 try:
                     backup_content = g.read_file(backup_path)
@@ -717,14 +813,10 @@ class NetworkFixer:
         """
         Main entry point for fixing network configurations.
 
-        Args:
-            g: GuestFS instance
-            progress_callback: Optional callback for progress updates
-
         Returns:
             Dictionary with fix results
         """
-        self.logger.info(f"Starting network configuration fixes (level: {self.fix_level.value})")
+        self.logger.info(f"Starting network configuration fixes (level: {self.fix_level.value}, dry_run={self.dry_run})")
 
         configs = self.find_network_configs(g)
         self.logger.info(f"Found {len(configs)} network configuration files")
@@ -738,6 +830,7 @@ class NetworkFixer:
             "by_type": {},
             "details": [],
             "backups_created": 0,
+            "dry_run": self.dry_run,
         }
 
         fixer_map = {
@@ -745,9 +838,9 @@ class NetworkFixer:
             NetworkConfigType.NETPLAN: self.fix_netplan,
             NetworkConfigType.INTERFACES: self.fix_interfaces,
             NetworkConfigType.SYSTEMD_NETWORK: self.fix_systemd_network,
-            NetworkConfigType.SYSTEMD_NETDEV: self.fix_systemd_network,  # same style
+            NetworkConfigType.SYSTEMD_NETDEV: self.fix_systemd_network,
             NetworkConfigType.NETWORK_MANAGER: self.fix_network_manager,
-            NetworkConfigType.WICKED: self.fix_ifcfg_rh,  # best-effort fallback
+            NetworkConfigType.WICKED: self.fix_wicked_xml,
             NetworkConfigType.WICKED_IFCFG: self.fix_ifcfg_rh,
         }
 
@@ -766,12 +859,10 @@ class NetworkFixer:
             try:
                 result = fixer(config)
 
-                # Apply only if there's something to do, or if validation errors exist (record them)
                 success = False
                 if result.applied_fixes:
                     success = self.apply_fix(g, config, result)
                 elif result.validation_errors:
-                    # keep track, but don't write
                     self.logger.warning(f"Validation errors for {config.path}: {result.validation_errors}")
 
                 config_type_str = config.type.value
@@ -789,17 +880,18 @@ class NetworkFixer:
                     else:
                         stats["files_failed"] += 1
 
-                detail = {
-                    "path": config.path,
-                    "type": config.type.value,
-                    "modified": config.modified,
-                    "fixes_applied": result.applied_fixes,
-                    "validation_errors": result.validation_errors,
-                    "backup": config.backup_path,
-                    "original_hash": config.original_hash,
-                    "new_hash": self.calculate_hash(result.new_content) if config.modified else config.original_hash,
-                }
-                stats["details"].append(detail)
+                stats["details"].append(
+                    {
+                        "path": config.path,
+                        "type": config.type.value,
+                        "modified": config.modified,
+                        "fixes_applied": result.applied_fixes,
+                        "validation_errors": result.validation_errors,
+                        "backup": config.backup_path,
+                        "original_hash": config.original_hash,
+                        "new_hash": self.calculate_hash(result.new_content) if config.modified else config.original_hash,
+                    }
+                )
 
             except Exception as e:
                 self.logger.error(f"Error fixing {config.path}: {e}")
@@ -827,6 +919,9 @@ class NetworkFixer:
     def generate_recommendations(self, stats: Dict[str, Any]) -> List[str]:
         """Generate post-fix recommendations."""
         recommendations: List[str] = []
+
+        if stats.get("dry_run"):
+            recommendations.append("Dry-run enabled: no files were written. Review details and rerun with dry_run=False.")
 
         if stats["files_modified"] > 0:
             recommendations.append(
@@ -861,60 +956,3 @@ class NetworkFixer:
             recommendations.append("No network configuration changes were needed. The existing config looks KVM-safe.")
 
         return recommendations
-
-
-# -------------------------------------------------------------------
-# Legacy function for backward compatibility
-# -------------------------------------------------------------------
-def fix_network_config(self, g: guestfs.GuestFS) -> Dict[str, Any]:
-    """
-    Legacy wrapper for the new NetworkFixer class.
-
-    This maintains compatibility with the original function signature.
-    """
-    fix_level_str = getattr(self, "network_fix_level", "moderate")
-    try:
-        fix_level = FixLevel(fix_level_str)
-    except Exception:
-        fix_level = FixLevel.MODERATE
-
-    fixer = NetworkFixer(
-        logger=getattr(self, "logger", logging.getLogger(__name__)),
-        fix_level=fix_level,
-    )
-
-    progress: Optional[Progress] = None
-    task = None
-    if hasattr(self, "show_progress") and getattr(self, "show_progress", False):
-        progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            transient=True,
-        )
-        progress.start()
-        task = progress.add_task("Fixing network configurations...", total=100)
-
-    def update_progress(current: int, total: int, message: str) -> None:
-        if progress and task is not None and total > 0:
-            pct = int((current / total) * 100)
-            progress.update(task, completed=pct, description=message)
-
-    try:
-        result = fixer.fix_network_config(g, update_progress)
-
-        if hasattr(self, "report"):
-            self.report.setdefault("network", {})
-            self.report["network"] = result
-
-        updated_files = [d["path"] for d in result["stats"]["details"] if d.get("modified", False)]
-        return {
-            "updated_files": updated_files,
-            "count": len(updated_files),
-            "analysis": result,
-        }
-    finally:
-        if progress:
-            progress.stop()

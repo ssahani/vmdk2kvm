@@ -43,14 +43,6 @@ class LiveGrubFixer:
       - update root= in /etc/default/grub (best effort; handles root=UUID=/PARTUUID=/LABEL= or /dev/*)
       - regen initramfs + grub config with distro detection + fallbacks
       - optional post-checks: verify grub.cfg contains root=stable_root (best effort)
-
-    Enhancements vs your version:
-      - Fixes missing imports + typing issues (Optional)
-      - More robust root source detection (handles /dev/mapper, LVM, btrfs, zfs-ish gracefully)
-      - Better “stable id” selection order and safety checks
-      - Hardened remote writes (atomic + mode + sync)
-      - Command runner that captures stdout/stderr-ish and logs failures cleanly
-      - Returns a structured report dict for your higher-level report pipeline
     """
 
     def __init__(

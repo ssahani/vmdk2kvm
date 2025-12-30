@@ -159,6 +159,48 @@ verbose: 1
 # sudo ./vmdk2kvm.py --config batch.yaml local
 #
 # --------------------------------------------------------------------------------------
+# 1b) VHD (Azure/Hyper-V style disks: plain .vhd OR .vhd.tar.gz)
+# --------------------------------------------------------------------------------------
+# fedora Azure example (plain VHD):
+# command: vhd
+# vhd: ./fedora-azure-43.0.x86_64.vhd
+# output_dir: ./out
+# flatten: true
+# flatten_format: qcow2
+# to_output: fedora-azure-43.0.qcow2
+# out_format: qcow2
+# compress: true
+# compress_level: 6
+# fstab_mode: stabilize-all
+# print_fstab: true
+# regen_initramfs: true
+# remove_vmware_tools: false
+# qemu_test: true
+# headless: true
+# uefi: true
+# memory: 2048
+# vcpus: 2
+# timeout: 90
+# checksum: true
+# report: fedora-azure-report.md
+# verbose: 1
+#
+# zure example (tarball containing VHD):
+# command: vhd
+# vhd: ./fedora-azure-43.x86_64.vhd.tar.gz
+# output_dir: ./out
+# flatten: true
+# flatten_format: qcow2
+# to_output: fedora-azure-43.0.qcow2
+# out_format: qcow2
+# compress: true
+# compress_level: 6
+# regen_initramfs: true
+# qemu_test: true
+# headless: true
+# uefi: true
+#
+# --------------------------------------------------------------------------------------
 # 2) LIVE-FIX (apply fixes to a running VM via SSH)
 # --------------------------------------------------------------------------------------
 # Basic live-fix: rewrite fstab + regen initramfs/grub + optionally remove VMware tools
@@ -392,7 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
         + c(YAML_EXAMPLE, "cyan")
         + "\n"
         + c("Feature summary:\n", "cyan", ["bold"])
-        + c(" • Inputs: local VMDK, remote ESXi fetch, OVA/OVF extract, live SSH fix, vSphere pyvmomi\n", "cyan")
+        + c(" • Inputs: local VMDK/VHD, remote ESXi fetch, OVA/OVF extract, live SSH fix, vSphere pyvmomi\n", "cyan")
         + c(" • Snapshot: flatten convert, recursive parent descriptor fetch, vSphere snapshots/CBT hooks\n", "cyan")
         + c(
             " • Fixes: fstab UUID/PARTUUID/LABEL, btrfs canonicalization, grub root=, crypttab, mdraid checks\n",
@@ -581,11 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help="Run in daemon mode (for systemd service).")
     p.add_argument("--watch-dir", dest="watch_dir", default=None, help="Directory to watch for new VMDK files in daemon mode.")
 
-    # ----------------------------------------------------------------------------------
-    # OVA/OVF enhancements (requested): qcow2 conversion + virt-filesystems logging
-    # These are GLOBAL flags so they work with YAML defaults and with `ova`/`ovf` commands.
-    # Backward-compatible: default is False/None, so existing behavior unchanged.
-    # ----------------------------------------------------------------------------------
+    # Your existing global OVF/OVA knobs (kept exactly, only shown here because you included them)
     p.add_argument(
         "--log-virt-filesystems",
         dest="log_virt_filesystems",
@@ -642,11 +680,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     po = sub.add_parser("ova", help="Offline: extract from OVA")
     po.add_argument("--ova", required=True)
-    # NOTE: we intentionally do NOT re-add the conversion/log flags here so they remain global
-    # and can be supplied via YAML defaults in the two-phase parse.
 
     povf = sub.add_parser("ovf", help="Offline: parse OVF (disks in same dir)")
     povf.add_argument("--ovf", required=True)
+
+    # ✅ NEW: VHD mode (Azure / Hyper-V style)
+    pvhd = sub.add_parser("vhd", help="Offline: VHD input (.vhd or archive containing .vhd)")
+    pvhd.add_argument(
+        "--vhd",
+        required=True,
+        help="Path to .vhd OR tarball containing a .vhd (e.g. .tar/.tar.gz/.tgz).",
+    )
 
     plive = sub.add_parser("live-fix", help="LIVE: fix running VM over SSH")
     plive.add_argument("--host", required=True)

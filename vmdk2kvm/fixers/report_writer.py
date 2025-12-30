@@ -6,10 +6,6 @@ from pathlib import Path
 from ..core.utils import U
 from .. import __version__
 
-# ---------------------------
-    # report writing
-    # ---------------------------
-
 def write_report(self) -> None:
     self.report["timestamps"]["end"] = _dt.datetime.now().isoformat()
     if not self.report_path:
