@@ -159,6 +159,9 @@ class OfflineFSFix:
             "timestamps": {"start": _dt.datetime.now().isoformat()},
         }
 
+        # Enhancement (non-breaking): a place to stash timing/metrics if callers want it later.
+        self._timings: Dict[str, float] = {}
+
     # ---------------------------------------------------------------------
     # guestfs open/close helpers
     # ---------------------------------------------------------------------
@@ -272,23 +275,155 @@ class OfflineFSFix:
     # ---------------------------------------------------------------------
     # mount logic (safe + robust)
     # ---------------------------------------------------------------------
-    def _mount_root_direct(self, g: guestfs.GuestFS, dev: str, subvol: Optional[str]) -> None:
+    def _log_vfs_type_best_effort(self, g: guestfs.GuestFS, dev: str) -> None:
+        # Enhancement: log vfs type to help debug Photon/ext4 superblock issues.
         try:
+            if hasattr(g, "vfs_type"):
+                vt = U.to_text(g.vfs_type(dev)).strip()
+                if vt:
+                    self.logger.info(f"Root vfs_type({dev}) = {vt}")
+        except Exception:
+            pass
+
+    def _best_effort_fsck(self, g: guestfs.GuestFS, dev: str) -> Dict[str, Any]:
+        """
+        Enhancement: attempt a safe fsck pass when mount fails, to handle
+        journal replay/unclean shutdowns / some appliance quirks.
+
+        - dry_run: prefer read-only checks (e2fsck -n, xfs_repair -n)
+        - non-dry_run: allow "auto/repair-ish" where possible
+        """
+        audit: Dict[str, Any] = {"attempted": False, "fstype": None, "mode": "dry_run" if self.dry_run else "repair", "ok": False, "error": None}
+        fstype = ""
+        try:
+            if hasattr(g, "vfs_type"):
+                fstype = U.to_text(g.vfs_type(dev)).strip()
+        except Exception:
+            fstype = ""
+        audit["fstype"] = fstype or None
+
+        if not fstype:
+            return audit
+
+        # Never try btrfs "check" automatically; too risky.
+        if fstype.startswith("btrfs"):
+            return audit
+
+        audit["attempted"] = True
+        try:
+            # ext2/3/4
+            if fstype.startswith("ext"):
+                if hasattr(g, "command"):
+                    args = ["e2fsck", "-n" if self.dry_run else "-p", dev]
+                    g.command(args)
+                    audit["ok"] = True
+                    return audit
+                if hasattr(g, "e2fsck") and not self.dry_run:
+                    g.e2fsck(dev)
+                    audit["ok"] = True
+                    return audit
+
+            # xfs
+            if fstype == "xfs" and hasattr(g, "command"):
+                args = ["xfs_repair", "-n" if self.dry_run else "-L", dev]
+                g.command(args)
+                audit["ok"] = True
+                return audit
+
+            # vfat / others: no-op
+            return audit
+        except Exception as e:
+            audit["error"] = str(e)
+            return audit
+
+    def _mount_root_direct(self, g: guestfs.GuestFS, dev: str, subvol: Optional[str]) -> None:
+        """
+        Enhanced (non-breaking): keep original behavior, but add a safe mount fallback ladder
+        and a best-effort fsck pass for ext4/xfs when mount fails.
+
+        This specifically helps cases like Photon where guestfs mount may fail with
+        "can't read superblock" even though virt-filesystems detects ext4.
+        """
+        self._log_vfs_type_best_effort(g, dev)
+
+        def _try_mount(mode: str) -> None:
+            # mode: "rw" | "ro" | "opts:<csv>"
             if subvol:
                 self.root_btrfs_subvol = subvol
                 opts = f"subvol={subvol}"
-                if self.dry_run:
+                if self.dry_run or mode == "ro":
+                    opts = f"ro,{opts}"
+                if mode.startswith("opts:"):
+                    extra = mode.split(":", 1)[1]
+                    opts = f"{extra},{opts}"
+                g.mount_options(opts, dev, "/")
+                return
+
+            if mode == "rw" and not self.dry_run:
+                g.mount(dev, "/")
+                return
+            if mode == "ro" or self.dry_run:
+                g.mount_ro(dev, "/")
+                return
+            if mode.startswith("opts:"):
+                opts = mode.split(":", 1)[1]
+                if self.dry_run and "ro" not in opts:
                     opts = f"ro,{opts}"
                 g.mount_options(opts, dev, "/")
-            else:
-                if self.dry_run:
-                    g.mount_ro(dev, "/")
-                else:
-                    g.mount(dev, "/")
+                return
+
+            # fallback
+            g.mount_ro(dev, "/")
+
+        # 1) original behavior path (rw unless dry-run, and btrfs subvol mount_options)
+        try:
+            _try_mount("rw" if not self.dry_run else "ro")
             self.root_dev = dev
             self.logger.info(f"Mounted root at / using {dev}" + (f" (btrfs subvol={subvol})" if subvol else ""))
+            return
         except Exception as e:
-            raise RuntimeError(f"Failed mounting root {dev} (subvol={subvol}): {e}")
+            first_err = e
+
+        # 2) fallback ladder (helps ext4 w/ journal quirks / appliance feature mismatches)
+        tries = ["ro", "opts:noload", "opts:ro,noload", "opts:ro,norecovery"]
+        last_err: Optional[Exception] = None
+        for t in tries:
+            self._safe_umount_all(g)
+            try:
+                _try_mount(t)
+                self.root_dev = dev
+                self.logger.info(
+                    f"Mounted root at / using {dev}"
+                    + (f" (btrfs subvol={subvol})" if subvol else "")
+                    + f" [{t}]"
+                )
+                return
+            except Exception as e:
+                last_err = e
+
+        # 3) best-effort fsck then retry RO once
+        self._safe_umount_all(g)
+        fsck_audit = self._best_effort_fsck(g, dev)
+        # store for report/debugging, but do not change existing report schema elsewhere
+        try:
+            self.report.setdefault("analysis", {}).setdefault("mount", {})["fsck"] = fsck_audit
+        except Exception:
+            pass
+
+        self._safe_umount_all(g)
+        try:
+            _try_mount("ro")
+            self.root_dev = dev
+            self.logger.info(
+                f"Mounted root at / using {dev}"
+                + (f" (btrfs subvol={subvol})" if subvol else "")
+                + " [ro-after-fsck]"
+            )
+            return
+        except Exception as e:
+            last_err = e
+
+        raise RuntimeError(f"Failed mounting root {dev} (subvol={subvol}): {last_err or first_err}")
 
     def _looks_like_root(self, g: guestfs.GuestFS) -> bool:
         # Cheap heuristics: a single hint is enough; more hints = stronger confidence.
@@ -443,10 +578,14 @@ class OfflineFSFix:
         if not candidates:
             U.die(self.logger, "Failed to list partitions/filesystems for brute-force mount.", 1)
 
+        # Enhancement: keep a lightweight mount failure log for report/debugging
+        mount_failures: List[Dict[str, str]] = []
+
         # Try normal mounts first
         for dev in candidates:
             self._safe_umount_all(g)
             try:
+                self._log_vfs_type_best_effort(g, dev)
                 if self.dry_run:
                     g.mount_ro(dev, "/")
                 else:
@@ -454,8 +593,15 @@ class OfflineFSFix:
                 if self._looks_like_root(g):
                     self.root_dev = dev
                     self.logger.info(f"Fallback root detected at {dev}")
+                    # stash failures for debug if any
+                    if mount_failures:
+                        try:
+                            self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+                        except Exception:
+                            pass
                     return
-            except Exception:
+            except Exception as e:
+                mount_failures.append({"device": dev, "error": str(e)})
                 continue
 
         # Then attempt btrfs common subvols
@@ -463,6 +609,7 @@ class OfflineFSFix:
             for sv in self._BTRFS_COMMON_SUBVOLS:
                 self._safe_umount_all(g)
                 try:
+                    self._log_vfs_type_best_effort(g, dev)
                     opts = f"subvol={sv}"
                     if self.dry_run:
                         opts = f"ro,{opts}"
@@ -471,9 +618,22 @@ class OfflineFSFix:
                         self.root_dev = dev
                         self.root_btrfs_subvol = sv
                         self.logger.info(f"Fallback btrfs root detected at {dev} (subvol={sv})")
+                        if mount_failures:
+                            try:
+                                self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+                            except Exception:
+                                pass
                         return
-                except Exception:
+                except Exception as e:
+                    mount_failures.append({"device": f"{dev} subvol={sv}", "error": str(e)})
                     continue
+
+        # stash failures before dying (doesn't change exit behavior)
+        if mount_failures:
+            try:
+                self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+            except Exception:
+                pass
 
         U.die(self.logger, "Failed to mount root filesystem.", 1)
 

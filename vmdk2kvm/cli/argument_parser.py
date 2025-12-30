@@ -4,10 +4,11 @@ import argparse
 import os
 from typing import Any, Dict, Optional, Tuple
 
-from ..core.logger import c
-from ..config.config_loader import Config
 from .. import __version__
+from ..config.config_loader import Config
 from ..config.systemd_template import SYSTEMD_UNIT_TEMPLATE
+from ..core.logger import c
+from ..core.utils import U
 from ..fixers.fstab_rewriter import FstabMode
 
 # --------------------------------------------------------------------------------------
@@ -478,17 +479,57 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[m.value for m in FstabMode],
         help="fstab rewrite mode: stabilize-all (recommended), bypath-only, noop",
     )
-    p.add_argument("--no-grub", dest="no_grub", action="store_true", help="Skip GRUB root= update and device.map cleanup.")
-    p.add_argument("--regen-initramfs", dest="regen_initramfs", action="store_true", help="Regenerate initramfs + grub config (best-effort).")
-    p.add_argument("--no-regen-initramfs", dest="regen_initramfs", action="store_false", help="Disable initramfs/grub regen.")
+    p.add_argument(
+        "--no-grub",
+        dest="no_grub",
+        action="store_true",
+        help="Skip GRUB root= update and device.map cleanup.",
+    )
+    p.add_argument(
+        "--regen-initramfs",
+        dest="regen_initramfs",
+        action="store_true",
+        help="Regenerate initramfs + grub config (best-effort).",
+    )
+    p.add_argument(
+        "--no-regen-initramfs",
+        dest="regen_initramfs",
+        action="store_false",
+        help="Disable initramfs/grub regen.",
+    )
     p.set_defaults(regen_initramfs=True)
-    p.add_argument("--remove-vmware-tools", dest="remove_vmware_tools", action="store_true", help="Remove VMware tools from guest (Linux only).")
-    p.add_argument("--cloud-init-config", dest="cloud_init_config", default=None, help="Cloud-init config (YAML/JSON) to inject.")
-    p.add_argument("--enable-recovery", dest="enable_recovery", action="store_true", help="Enable checkpoint recovery for long operations.")
-    p.add_argument("--parallel-processing", dest="parallel_processing", action="store_true", help="Process multiple disks in parallel.")
+    p.add_argument(
+        "--remove-vmware-tools",
+        dest="remove_vmware_tools",
+        action="store_true",
+        help="Remove VMware tools from guest (Linux only).",
+    )
+    p.add_argument(
+        "--cloud-init-config",
+        dest="cloud_init_config",
+        default=None,
+        help="Cloud-init config (YAML/JSON) to inject.",
+    )
+    p.add_argument(
+        "--enable-recovery",
+        dest="enable_recovery",
+        action="store_true",
+        help="Enable checkpoint recovery for long operations.",
+    )
+    p.add_argument(
+        "--parallel-processing",
+        dest="parallel_processing",
+        action="store_true",
+        help="Process multiple disks in parallel.",
+    )
     p.add_argument("--resize", default=None, help="Resize root filesystem (enlarge only, e.g., +10G or 50G)")
     p.add_argument("--report", default=None, help="Write Markdown report (relative to output-dir if not absolute).")
-    p.add_argument("--virtio-drivers-dir", dest="virtio_drivers_dir", default=None, help="Path to virtio-win drivers directory for Windows injection.")
+    p.add_argument(
+        "--virtio-drivers-dir",
+        dest="virtio_drivers_dir",
+        default=None,
+        help="Path to virtio-win drivers directory for Windows injection.",
+    )
     p.add_argument("--post-v2v", dest="post_v2v", action="store_true", help="Run virt-v2v after internal fixes.")
     p.add_argument("--use-v2v", dest="use_v2v", action="store_true", help="Use virt-v2v for conversion if available.")
     p.add_argument(
@@ -540,6 +581,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help="Run in daemon mode (for systemd service).")
     p.add_argument("--watch-dir", dest="watch_dir", default=None, help="Directory to watch for new VMDK files in daemon mode.")
 
+    # ----------------------------------------------------------------------------------
+    # OVA/OVF enhancements (requested): qcow2 conversion + virt-filesystems logging
+    # These are GLOBAL flags so they work with YAML defaults and with `ova`/`ovf` commands.
+    # Backward-compatible: default is False/None, so existing behavior unchanged.
+    # ----------------------------------------------------------------------------------
+    p.add_argument(
+        "--log-virt-filesystems",
+        dest="log_virt_filesystems",
+        action="store_true",
+        help="For OVA/OVF inputs, log `virt-filesystems --all --long -h` for each disk.",
+    )
+    p.add_argument(
+        "--ova-convert-to-qcow2",
+        dest="ova_convert_to_qcow2",
+        action="store_true",
+        help="For OVA/OVF inputs, convert extracted VMDK(s) to qcow2 before continuing pipeline.",
+    )
+    p.add_argument(
+        "--ova-qcow2-dir",
+        dest="ova_qcow2_dir",
+        default=None,
+        help="Output directory for qcow2 images created from OVA/OVF disks (default: <output-dir>/qcow2).",
+    )
+    p.add_argument(
+        "--ova-convert-compress",
+        dest="ova_convert_compress",
+        action="store_true",
+        help="When converting OVA/OVF disks to qcow2, enable compression.",
+    )
+    p.add_argument(
+        "--ova-convert-compress-level",
+        dest="ova_convert_compress_level",
+        type=int,
+        choices=range(1, 10),
+        default=None,
+        help="Compression level 1-9 for qcow2 conversion of OVA/OVF disks.",
+    )
+
     # Subcommands
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -553,11 +632,18 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--identity", default=None)
     pf.add_argument("--ssh-opt", action="append", default=None, help="Extra ssh/scp options (repeatable).")
     pf.add_argument("--remote", required=True, help="Remote path to VMDK descriptor")
-    pf.add_argument("--fetch-dir", dest="fetch_dir", default=None, help="Where to store fetched files (default: <output-dir>/downloaded)")
+    pf.add_argument(
+        "--fetch-dir",
+        dest="fetch_dir",
+        default=None,
+        help="Where to store fetched files (default: <output-dir>/downloaded)",
+    )
     pf.add_argument("--fetch-all", dest="fetch_all", action="store_true", help="Fetch full snapshot descriptor chain recursively.")
 
     po = sub.add_parser("ova", help="Offline: extract from OVA")
     po.add_argument("--ova", required=True)
+    # NOTE: we intentionally do NOT re-add the conversion/log flags here so they remain global
+    # and can be supplied via YAML defaults in the two-phase parse.
 
     povf = sub.add_parser("ovf", help="Offline: parse OVF (disks in same dir)")
     povf.add_argument("--ovf", required=True)
@@ -583,7 +669,12 @@ def build_parser() -> argparse.ArgumentParser:
     pvs.add_argument("--vc-password-env", dest="vc_password_env", default=None, help="Env var containing vCenter password")
     pvs.add_argument("--vc-port", dest="vc_port", type=int, default=443, help="vCenter HTTPS port (default: 443)")
     pvs.add_argument("--vc-insecure", dest="vc_insecure", action="store_true", help="Disable TLS verification")
-    pvs.add_argument("--dc-name", dest="dc_name", default="ha-datacenter", help="Datacenter name for /folder URL (default: ha-datacenter)")
+    pvs.add_argument(
+        "--dc-name",
+        dest="dc_name",
+        default="ha-datacenter",
+        help="Datacenter name for /folder URL (default: ha-datacenter)",
+    )
 
     vs_sub = pvs.add_subparsers(dest="vs_action", required=True, help="vSphere actions")
 

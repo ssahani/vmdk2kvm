@@ -446,11 +446,22 @@ class Orchestrator:
 
         elif cmd == "ova":
             temp_dir = out_root / "extracted"
+            U.ensure_dir(temp_dir)
+
             self.disks = OVF.extract_ova(
                 self.logger,
                 Path(self.args.ova).expanduser().resolve(),
                 temp_dir,
-            )
+                convert_to_qcow2=bool(getattr(self.args, "to_qcow2", False)),
+                convert_outdir=(
+                    Path(self.args.qcow2_dir).expanduser().resolve()
+                    if getattr(self.args, "qcow2_dir", None)
+                    else (out_root / "qcow2")
+                ),
+                convert_compress=bool(getattr(self.args, "compress", False)),
+                convert_compress_level=getattr(self.args, "compress_level", None),
+                log_virt_filesystems=bool(getattr(self.args, "log_virt_filesystems", False)),
+        )
 
         elif cmd == "ovf":
             temp_dir = out_root / "extracted"

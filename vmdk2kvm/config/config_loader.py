@@ -41,7 +41,8 @@ class Config:
     def load_one(logger: logging.Logger, path: str) -> Dict[str, Any]:
         p = Path(path).expanduser().resolve()
         if not p.exists():
-            U.die(logger, f"Config not found: {p}", 1)
+            # Enhanced error message (no behavior change: still dies with code=1)
+            Config._die_missing_config(logger, p, original_spec=path)
 
         # Verify signature if enabled
         Config.verify_signature(logger, p)
@@ -159,6 +160,10 @@ class Config:
         list_mode: str = "replace",
     ) -> Dict[str, Any]:
         paths = Config.expand_configs(logger, paths)
+
+        # Pre-check missing before the progress UI starts
+        Config._precheck_missing_paths(logger, paths)
+
         conf: Dict[str, Any] = {}
 
         with Progress(
@@ -278,6 +283,9 @@ class Config:
         vm_confs: List[Dict[str, Any]] = []
         paths = Config.expand_configs(logger, paths)
 
+        # Pre-check missing before the progress UI starts
+        Config._precheck_missing_paths(logger, paths)
+
         with Progress(
             TextColumn("{task.description}"),
             BarColumn(),
@@ -391,3 +399,72 @@ class Config:
             return [coerce_one(raw_val)]
 
         return coerce_one(raw_val)
+
+    # -----------------------------
+    # Added: friendly missing-config handling
+    # -----------------------------
+
+    @staticmethod
+    def _precheck_missing_paths(logger: logging.Logger, paths: List[str]) -> None:
+        """
+        Fail early (before progress UI) if any expanded configs don't exist.
+        This avoids partial progress bars and gives one clean actionable error.
+        """
+        if not paths:
+            return
+        missing = [p for p in paths if not Path(p).exists()]
+        if not missing:
+            return
+
+        # Keep message compact but useful
+        msg_lines: List[str] = ["Config file(s) not found:"]
+        for m in missing[:20]:
+            msg_lines.append(f"  - {m}")
+        if len(missing) > 20:
+            msg_lines.append(f"  ... and {len(missing) - 20} more")
+
+        msg_lines.append("")  # spacing
+        msg_lines.append(Config._missing_config_help(missing[0], original_spec=None))
+
+        U.die(logger, "\n".join(msg_lines), 1)
+
+    @staticmethod
+    def _die_missing_config(logger: logging.Logger, resolved: Path, *, original_spec: Optional[str] = None) -> None:
+        msg = f"Config not found: {resolved}\n\n{Config._missing_config_help(str(resolved), original_spec=original_spec)}"
+        U.die(logger, msg, 1)
+
+    @staticmethod
+    def _missing_config_help(resolved_path: str, *, original_spec: Optional[str]) -> str:
+        """
+        Build actionable hints for missing config paths.
+        - Shows whether user passed a glob
+        - Shows nearby configs in same directory
+        - Suggests correct usage
+        """
+        rp = Path(resolved_path).expanduser()
+        parent = rp.parent
+
+        lines: List[str] = []
+
+        if original_spec and (("*" in original_spec) or ("?" in original_spec) or ("[" in original_spec and "]" in original_spec)):
+            lines.append(f"Note: the config argument looked like a glob pattern: {original_spec!r}")
+            lines.append("      It expanded to zero matching files (or matched paths that don't exist).")
+
+        if parent.exists() and parent.is_dir():
+            candidates: List[Path] = []
+            for ext in (".yaml", ".yml", ".json"):
+                candidates.extend(sorted(parent.glob(f"*{ext}")))
+
+            if candidates:
+                lines.append("Configs found in that directory:")
+                for c in candidates[:10]:
+                    lines.append(f"  - {c.resolve()}")
+                if len(candidates) > 10:
+                    lines.append(f"  ... and {len(candidates) - 10} more")
+            else:
+                lines.append("That directory exists, but no *.yaml/*.yml/*.json configs were found there.")
+        else:
+            lines.append("Parent directory does not exist (or is not accessible).")
+
+        lines.append("Tip: pass an absolute path, e.g. --config /full/path/config.yaml")
+        return "\n".join(lines)

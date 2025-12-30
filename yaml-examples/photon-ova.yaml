@@ -1,0 +1,86 @@
+# ------------------------------------------------------------------------------
+# Photon OS 5.0 OVA → KVM/QEMU conversion
+# ------------------------------------------------------------------------------
+
+# REQUIRED by `ova` subcommand (argparse dest = "ova")
+ova: ./photon-hw15-5.0-dde71ec57.x86_64.ova
+
+# ------------------------------------------------------------------------------
+# Output
+# ------------------------------------------------------------------------------
+output:
+  format: qcow2
+  path: ./out/photon-5.0.qcow2
+  compress: true
+
+# ------------------------------------------------------------------------------
+# Fixes
+# ------------------------------------------------------------------------------
+fix:
+  enabled: true
+  fstab:
+    enabled: true
+    prefer: uuid
+  grub:
+    enabled: true
+    regenerate: true
+  initramfs:
+    enabled: true
+    regenerate: true
+
+# ------------------------------------------------------------------------------
+# Testing
+# ------------------------------------------------------------------------------
+test:
+  enabled: true
+  libvirt:
+    enabled: true
+    firmware: bios
+    memory_mb: 2048
+    vcpus: 2# ------------------------------------------------------------------------------
+# Photon OS 5.0 OVA → KVM/QEMU conversion (vmdk2kvm expected keys)
+# ------------------------------------------------------------------------------
+
+command: ova
+ova: ./photon-hw15-5.0-dde71ec57.x86_64.ova
+
+# Where the tool writes intermediate + final stuff
+output_dir: ./out
+workdir: ./out/work
+
+# ---- OVA/OVF enhancements you asked for ----
+# Log: `virt-filesystems -a <disk> --all --long -h` for each extracted disk
+log_virt_filesystems: true
+
+# Convert extracted VMDK(s) to qcow2 before proceeding (so you don't end with only .vmdk)
+ova_convert_to_qcow2: true
+ova_qcow2_dir: ./out/qcow2
+ova_convert_compress: true
+ova_convert_compress_level: 6
+
+# ---- Final conversion output (what you wanted as ./out/photon-5.0.qcow2) ----
+to_output: ./out/photon-5.0.qcow2
+out_format: qcow2
+compress: true
+compress_level: 6
+checksum: true
+
+# ---- Fix policy ----
+fstab_mode: stabilize-all
+print_fstab: true
+no_backup: false
+no_grub: false
+regen_initramfs: true
+remove_vmware_tools: false   # Photon often doesn't ship full open-vm-tools layout; keep default off unless needed
+
+# ---- Tests ----
+libvirt_test: true
+qemu_test: false
+vm_name: photon-5.0
+memory: 2048
+vcpus: 2
+uefi: false
+timeout: 60
+headless: true
+keep_domain: false
+
