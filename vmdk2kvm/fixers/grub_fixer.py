@@ -5,7 +5,7 @@
 #
 # “All distros” in practice means:
 #   1) Don’t assume one initramfs tool (support: update-initramfs, dracut, mkinitcpio, mkinitrd,
-#      kernel-install, zypper-boot tools where present).
+#      kernel-install, mkinitfs, genkernel where present).
 #   2) Don’t assume one bootloader layout (support: GRUB legacy, GRUB2, GRUB+BLS, systemd-boot,
 #      extlinux/syslinux as best-effort).
 #   3) Prefer editing canonical cmdline sources (BLS entries, /etc/kernel/cmdline, /etc/default/grub),
@@ -19,10 +19,16 @@
 #       * /etc/default/grub (if exists)
 #       * grub.cfg files as fallback
 #       * extlinux.conf/syslinux.cfg as fallback
-#   - Regen initramfs using the best available tool *inside the guest*.
+#   - Ensure requested drivers end up in initramfs across major ecosystems:
+#       * dracut:        --add-drivers "a b c"
+#       * Debian:        /etc/initramfs-tools/modules
+#       * Arch:          MODULES=(...) in /etc/mkinitcpio.conf
+#       * SUSE:          INITRD_MODULES="..." in /etc/sysconfig/kernel (best-effort)
+#       * Alpine mkinitfs: best-effort detect + warn (config varies by release)
+#   - Regen initramfs using best available tool *inside the guest*.
 #   - Regen bootloader configs using best available tool *inside the guest*.
 #
-# NOTE: guestfs command execution requires the guest root to be mounted and PATH to include tools.
+# NOTE: guestfs command execution requires the guest root to be mounted.
 # ---------------------------------------------------------------------
 
 from __future__ import annotations
@@ -41,6 +47,177 @@ from rich.progress import (
 
 from ..core.utils import U
 from .fstab_rewriter import Ident, parse_btrfsvol_spec
+
+
+# ---------------------------
+# Small helpers
+# ---------------------------
+
+def _dedup_keep_order(xs: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in xs:
+        x = (x or "").strip()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+# ---------------------------
+# Initramfs extra drivers knob
+# ---------------------------
+
+def _get_initramfs_add_drivers(self, distro: str) -> List[str]:
+    """
+    Returns a list of kernel module names to force into initramfs.
+
+    Knob sources (highest → lowest priority):
+      1) self.initramfs_add_drivers (list[str]) if set by OfflineFSFix/config
+      2) self.regen_add_drivers (legacy alias if you used it elsewhere)
+      3) default recommendation for VMware→KVM virtio path (safe-ish)
+
+    Accepts:
+      - list/tuple/set[str]
+      - space-separated string: "virtio_blk virtio_scsi ..."
+    """
+    val = getattr(self, "initramfs_add_drivers", None)
+    if not val:
+        val = getattr(self, "regen_add_drivers", None)
+
+    if val:
+        if isinstance(val, str):
+            drivers = [x for x in val.split() if x.strip()]
+        else:
+            drivers = [str(x).strip() for x in list(val) if str(x).strip()]
+        return _dedup_keep_order(drivers)
+
+    # Default: virtio + a simple video fallback.
+    # Override per guest if needed (bochs_drm / virtio_gpu etc).
+    return ["virtio_blk", "virtio_scsi", "virtio_net", "bochs"]
+
+
+def _maybe_add_dracut_drivers(cmd: List[str], drivers: List[str]) -> List[str]:
+    """
+    If cmd is a dracut invocation, inject:
+        --add-drivers "a b c"
+    """
+    if not cmd or cmd[0] != "dracut":
+        return cmd
+    if not drivers:
+        return cmd
+    if "--add-drivers" in cmd:
+        return cmd
+    return cmd + ["--add-drivers", " ".join(drivers)]
+
+
+def _write_modules_linefile(self, g: guestfs.GuestFS, path: str, drivers: List[str]) -> Dict[str, Any]:
+    """
+    Ensures each driver appears as its own line in a modules list file.
+    Canonical for Debian initramfs-tools: /etc/initramfs-tools/modules
+    """
+    drivers = _dedup_keep_order(drivers)
+    if not drivers:
+        return {"path": path, "changed": False, "reason": "no_drivers"}
+
+    before = U.to_text(g.read_file(path)) if g.is_file(path) else ""
+    before_lines = [ln.strip() for ln in before.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+    missing = [d for d in drivers if d not in before_lines]
+    if not missing:
+        return {"path": path, "changed": False, "reason": "already_present"}
+
+    new = before.rstrip() + ("\n" if before and not before.endswith("\n") else "")
+    for d in missing:
+        new += f"{d}\n"
+
+    if self.dry_run:
+        return {"path": path, "changed": True, "dry_run": True, "added": missing}
+
+    self.backup_file(g, path)
+    g.write(path, new.encode("utf-8"))
+    return {"path": path, "changed": True, "added": missing}
+
+
+def _patch_mkinitcpio_modules(self, g: guestfs.GuestFS, drivers: List[str]) -> Dict[str, Any]:
+    """
+    Ensures MODULES=(...) in /etc/mkinitcpio.conf includes drivers.
+    Canonical for Arch/mkinitcpio.
+    """
+    path = "/etc/mkinitcpio.conf"
+    drivers = _dedup_keep_order(drivers)
+    if not drivers:
+        return {"path": path, "changed": False, "reason": "no_drivers"}
+    if not g.is_file(path):
+        return {"path": path, "changed": False, "reason": "missing"}
+
+    old = U.to_text(g.read_file(path))
+
+    m = re.search(r"(?m)^\s*MODULES=\((.*?)\)\s*$", old)
+    if not m:
+        # Add a MODULES line if absent (conservative append)
+        insert = "MODULES=(" + " ".join(drivers) + ")\n"
+        new = old.rstrip() + "\n\n" + insert
+        if self.dry_run:
+            return {"path": path, "changed": True, "dry_run": True, "added": drivers, "note": "MODULES_line_added"}
+        self.backup_file(g, path)
+        g.write(path, new.encode("utf-8"))
+        return {"path": path, "changed": True, "added": drivers, "note": "MODULES_line_added"}
+
+    inner = m.group(1).strip()
+    cur = [x for x in inner.split() if x.strip()]
+    merged = _dedup_keep_order(cur + drivers)
+
+    if merged == cur:
+        return {"path": path, "changed": False, "reason": "already_present"}
+
+    new_line = "MODULES=(" + " ".join(merged) + ")"
+    # replace only the first occurrence to avoid surprises
+    new = re.sub(r"(?m)^\s*MODULES=\(.*?\)\s*$", new_line, old, count=1)
+
+    if self.dry_run:
+        return {"path": path, "changed": True, "dry_run": True, "added": [d for d in drivers if d not in cur]}
+
+    self.backup_file(g, path)
+    g.write(path, new.encode("utf-8"))
+    return {"path": path, "changed": True, "added": [d for d in drivers if d not in cur]}
+
+
+def _patch_suse_sysconfig_initrd_modules(self, g: guestfs.GuestFS, drivers: List[str]) -> Dict[str, Any]:
+    """
+    Best-effort SUSE path:
+      /etc/sysconfig/kernel: INITRD_MODULES="a b c"
+    Many SUSE systems also use dracut; this is additive + harmless-ish.
+    """
+    path = "/etc/sysconfig/kernel"
+    drivers = _dedup_keep_order(drivers)
+    if not drivers:
+        return {"path": path, "changed": False, "reason": "no_drivers"}
+    if not g.is_file(path):
+        return {"path": path, "changed": False, "reason": "missing"}
+
+    old = U.to_text(g.read_file(path))
+
+    if re.search(r'(?m)^\s*INITRD_MODULES=', old):
+        def _repl(m: re.Match[str]) -> str:
+            cur_s = (m.group(1) or "").strip()
+            cur = [x for x in cur_s.split() if x.strip()]
+            merged = _dedup_keep_order(cur + drivers)
+            return f'INITRD_MODULES="{" ".join(merged)}"'
+        new = re.sub(r'(?m)^\s*INITRD_MODULES="([^"]*)"\s*$', _repl, old, count=1)
+    else:
+        new = old.rstrip() + '\nINITRD_MODULES="' + " ".join(drivers) + '"\n'
+
+    if new == old:
+        return {"path": path, "changed": False, "reason": "already_present"}
+
+    if self.dry_run:
+        return {"path": path, "changed": True, "dry_run": True, "note": "suse_sysconfig"}
+
+    self.backup_file(g, path)
+    g.write(path, new.encode("utf-8"))
+    return {"path": path, "changed": True, "note": "suse_sysconfig"}
 
 
 # ---------------------------
@@ -221,10 +398,12 @@ def _update_default_grub(self, g: guestfs.GuestFS, new_root: str) -> int:
     try:
         if g.is_file(p):
             old = U.to_text(g.read_file(p))
+
             # Be slightly more conservative: prefer updating only GRUB_CMDLINE_LINUX* lines.
             def repl_line(m: re.Match[str]) -> str:
                 line = m.group(0)
                 return _replace_root_tokens(line, new_root)
+
             new = re.sub(r"^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?=.*)$", repl_line, old, flags=re.M)
             if new != old:
                 self.logger.info(f"Updated root= in {p}" + (" (dry-run)" if self.dry_run else ""))
@@ -303,27 +482,18 @@ def update_grub_root(self, g: guestfs.GuestFS) -> int:
 
     return changed
 
+
 # ---------------------------
 # initramfs + bootloader regeneration (all distros)
 # ---------------------------
+
 def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     """
     Linux-only initramfs + bootloader regen.
 
-    Goal: “works on the weird zoo”:
-      - Debian/Ubuntu (update-initramfs, update-grub)
-      - RHEL/Fedora/CentOS/Rocky/Alma (dracut, grub2-mkconfig, BLS)
-      - SUSE/openSUSE (mkinitrd/dracut, grub2-mkconfig)
-      - Arch (mkinitcpio, grub-mkconfig)
-      - Alpine (mkinitfs, extlinux)
-      - Gentoo (dracut/genkernel, grub-mkconfig)
-      - systemd-boot (kernel-install, bootctl + entries)
-      - GRUB legacy / odd placements: /boot/grub/grub.cfg vs /boot/grub2/grub.cfg
-
     Notes:
       - We stay mostly “config regen”, not “boot sector reinstall”.
       - Offline guestfs environment may lack /dev, efivars, proc; so we:
-          * bind-mount /dev,/proc,/sys when possible (guestfs mountpoints)
           * avoid bootloader installs that write MBR/ESP unless explicitly requested elsewhere
     """
     if not getattr(self, "regen_initramfs", False):
@@ -331,7 +501,9 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 
     # If Windows, skip.
     try:
-        if getattr(self, "inspect_root", None) and (U.to_text(g.inspect_get_type(self.inspect_root)).lower() == "windows"):
+        if getattr(self, "inspect_root", None) and (
+            U.to_text(g.inspect_get_type(self.inspect_root)).lower() == "windows"
+        ):
             self.logger.info("regen(): Windows guest detected; skipping Linux initramfs/bootloader regeneration.")
             return {"enabled": True, "skipped": "windows"}
     except Exception:
@@ -357,18 +529,24 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         "bls": has_bls,
     }
 
+    # Initramfs driver injection knob
+    add_drivers = _get_initramfs_add_drivers(self, distro)
+    info["initramfs_add_drivers"] = add_drivers
+
     if getattr(self, "dry_run", False):
         self.logger.info("DRY-RUN: skipping initramfs/bootloader regeneration.")
         info["dry_run"] = True
         return info
 
-    self.logger.info(f"Regen plan: distro={distro or 'unknown'} boot={'UEFI' if looks_uefi else 'BIOS'} BLS={'yes' if has_bls else 'no'}")
+    self.logger.info(
+        f"Regen plan: distro={distro or 'unknown'} boot={'UEFI' if looks_uefi else 'BIOS'} BLS={'yes' if has_bls else 'no'}"
+    )
     self.logger.info("🛠️ Regenerating initramfs and bootloader configs...")
 
     def run_guest(cmd: List[str], *, chrooted: bool = True) -> Tuple[bool, str]:
         """
-        Execute inside the guest. Prefer chrooted exec for tools that assume / is the guest root.
-        If your codebase already provides a `self._chroot_cmd(...)`, swap here.
+        Execute inside the guest. Today this is best-effort (guestfs command).
+        If your codebase has a real chroot helper, swap it in here.
         """
         try:
             self.logger.info(f"Running (guestfs): {' '.join(cmd)}")
@@ -378,7 +556,6 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
             return False, str(e)
 
     def guest_has_cmd(cmd: str) -> bool:
-        # Some guests won’t have /bin/sh in minimal images; but most do. Best-effort.
         try:
             g.command(["sh", "-c", f"command -v {cmd} >/dev/null 2>&1"])
             return True
@@ -397,13 +574,7 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         except Exception:
             return False
 
-    def read_text(p: str) -> str:
-        try:
-            return U.to_text(g.read_file(p))
-        except Exception:
-            return ""
-
-    # Collect guest kernel versions (helps dracut/mkinitrd/genkernel fallbacks)
+    # Collect guest kernel versions
     guest_kvers: List[str] = []
     try:
         if dir_exists("/lib/modules"):
@@ -413,7 +584,11 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     info["guest_kernels"] = guest_kvers
 
     # Detect init system / boot style hints
-    has_systemd = dir_exists("/run/systemd") or file_exists("/usr/lib/systemd/systemd") or file_exists("/lib/systemd/systemd")
+    has_systemd = (
+        dir_exists("/run/systemd")
+        or file_exists("/usr/lib/systemd/systemd")
+        or file_exists("/lib/systemd/systemd")
+    )
     has_boot_loader_spec = has_bls or dir_exists("/boot/loader/entries") or dir_exists("/usr/lib/kernel/install.d")
     uses_extlinux = file_exists("/boot/extlinux/extlinux.conf") or file_exists("/etc/extlinux.conf")
     has_esp = dir_exists("/boot/efi") or dir_exists("/efi") or dir_exists("/boot/EFI")
@@ -425,50 +600,79 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     }
 
     # -----------------
-    # Initramfs regen: build candidate commands in “best chance first” order
+    # Cross-distro initramfs driver injection (config edits)
+    # -----------------
+    inject_audit: Dict[str, Any] = {"drivers": add_drivers, "actions": [], "warnings": []}
+
+    if add_drivers:
+        # Debian/Ubuntu initramfs-tools
+        if guest_has_cmd("update-initramfs") and dir_exists("/etc/initramfs-tools"):
+            inject_audit["actions"].append(
+                _write_modules_linefile(self, g, "/etc/initramfs-tools/modules", add_drivers)
+            )
+
+        # Arch mkinitcpio
+        if guest_has_cmd("mkinitcpio") and file_exists("/etc/mkinitcpio.conf"):
+            inject_audit["actions"].append(_patch_mkinitcpio_modules(self, g, add_drivers))
+
+        # SUSE sysconfig kernel (best-effort)
+        if file_exists("/etc/sysconfig/kernel"):
+            inject_audit["actions"].append(_patch_suse_sysconfig_initrd_modules(self, g, add_drivers))
+
+        # Alpine mkinitfs: config varies; best-effort warn if we can't do deterministic injection
+        if guest_has_cmd("mkinitfs"):
+            # We do not mutate mkinitfs configs here unless you standardize a policy for your Alpine baseline.
+            # Most virtio boots work without forcing; keep this as an explicit future enhancement.
+            inject_audit["warnings"].append("mkinitfs_detected: no deterministic module-injection implemented (best-effort no-op)")
+
+    info["initramfs_driver_injection"] = inject_audit
+
+    # -----------------
+    # Initramfs regen: candidate commands in “best chance first” order
     # -----------------
     initramfs_attempts: List[List[str]] = []
 
-    # Debian/Ubuntu: update-initramfs is canonical
+    # Debian/Ubuntu
     if guest_has_cmd("update-initramfs"):
         initramfs_attempts += [
             ["update-initramfs", "-u", "-k", "all"],
             ["update-initramfs", "-u"],
         ]
 
-    # Arch: mkinitcpio
+    # Arch
     if guest_has_cmd("mkinitcpio"):
         initramfs_attempts += [["mkinitcpio", "-P"]]
 
-    # Fedora/RHEL/SUSE/Gentoo often have dracut
+    # dracut family (Fedora/RHEL/SUSE/Gentoo)
     if guest_has_cmd("dracut"):
-        # Most reliable for “fix what is there”: regenerate-all if supported
-        initramfs_attempts += [["dracut", "-f", "--regenerate-all"], ["dracut", "-f"]]
-        # If we have a kernel version, try targeted first (sometimes faster, sometimes less surprising)
         if guest_kvers:
-            initramfs_attempts.insert(0, ["dracut", "-f", "--kver", guest_kvers[-1]])
+            initramfs_attempts.insert(
+                0,
+                _maybe_add_dracut_drivers(["dracut", "-f", "--kver", guest_kvers[-1]], add_drivers),
+            )
+        initramfs_attempts += [
+            _maybe_add_dracut_drivers(["dracut", "-f", "--regenerate-all"], add_drivers),
+            _maybe_add_dracut_drivers(["dracut", "-f"], add_drivers),
+        ]
 
-    # SUSE classic
+    # SUSE classic mkinitrd
     if guest_has_cmd("mkinitrd"):
         initramfs_attempts += [["mkinitrd"]]
 
-    # Alpine Linux: mkinitfs is the thing (OpenRC world)
-    # Typical usage: mkinitfs -c /etc/mkinitfs/mkinitfs.conf -b / <kver>
+    # Alpine mkinitfs
     if guest_has_cmd("mkinitfs") and guest_kvers:
         initramfs_attempts += [["mkinitfs", "-b", "/", guest_kvers[-1]]]
-        # best-effort with config if present
         if file_exists("/etc/mkinitfs/mkinitfs.conf"):
-            initramfs_attempts.insert(0, ["mkinitfs", "-c", "/etc/mkinitfs/mkinitfs.conf", "-b", "/", guest_kvers[-1]])
+            initramfs_attempts.insert(
+                0, ["mkinitfs", "-c", "/etc/mkinitfs/mkinitfs.conf", "-b", "/", guest_kvers[-1]]
+            )
 
-    # Gentoo: genkernel (if present)
+    # Gentoo genkernel
     if guest_has_cmd("genkernel"):
-        # “--install” will touch /boot; usually OK, but offline environments can be fragile.
         initramfs_attempts += [["genkernel", "--install", "initramfs"]]
 
-    # systemd kernel-install path: try to (re)generate entries for newest kver
-    # WARNING: can fail if vmlinuz path isn’t where the tool expects; still useful.
+    # systemd kernel-install path
     if guest_has_cmd("kernel-install") and guest_kvers:
-        # Try common vmlinuz locations
         k = guest_kvers[-1]
         vmlinuz_candidates = [
             f"/lib/modules/{k}/vmlinuz",
@@ -480,7 +684,7 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
                 initramfs_attempts += [["kernel-install", "add", k, vml]]
                 break
 
-    # de-dup commands (avoid spam)
+    # de-dup commands
     seen = set()
     deduped: List[List[str]] = []
     for c in initramfs_attempts:
@@ -509,10 +713,6 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     if guest_has_cmd("update-grub"):
         boot_attempts.append(["update-grub"])
 
-    # GRUB2 mkconfig locations vary:
-    #  - /boot/grub2/grub.cfg (RHEL/Fedora/SUSE)
-    #  - /boot/grub/grub.cfg  (Debian/Arch in some setups)
-    # We'll generate to whichever directory exists.
     grub2_cfg_targets: List[str] = []
     if dir_exists("/boot/grub2"):
         grub2_cfg_targets.append("/boot/grub2/grub.cfg")
@@ -521,20 +721,17 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 
     if guest_has_cmd("grub2-mkconfig"):
         if not grub2_cfg_targets:
-            # still try the “most common” rpm path
             grub2_cfg_targets = ["/boot/grub2/grub.cfg"]
         for tgt in grub2_cfg_targets:
             boot_attempts.append(["grub2-mkconfig", "-o", tgt])
 
-    # Some distros ship grub-mkconfig (not grub2-mkconfig)
     if guest_has_cmd("grub-mkconfig"):
         if not grub2_cfg_targets:
             grub2_cfg_targets = ["/boot/grub/grub.cfg"]
         for tgt in grub2_cfg_targets:
             boot_attempts.append(["grub-mkconfig", "-o", tgt])
 
-    # UEFI vendor grub.cfg in ESP (ONLY if file exists; generating into ESP is sometimes used)
-    # We only attempt if looks_uefi and grub{,2}-mkconfig exists.
+    # UEFI vendor grub.cfg in ESP (ONLY if file exists)
     if looks_uefi and (guest_has_cmd("grub2-mkconfig") or guest_has_cmd("grub-mkconfig")):
         mk = "grub2-mkconfig" if guest_has_cmd("grub2-mkconfig") else "grub-mkconfig"
         for p in (
@@ -551,40 +748,29 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
             if file_exists(p):
                 boot_attempts.append([mk, "-o", p])
 
-    # BLS systems (RHEL/Fedora): often you don’t need grub.cfg regen.
-    # But “grub2-mkconfig” is harmless-ish; still, if grubby exists, we can sanity check.
     if guest_has_cmd("grubby"):
         boot_attempts.append(["grubby", "--info=ALL"])  # non-destructive
 
-    # systemd-boot: bootctl update works when EFI vars/efivars exist (often NOT offline).
-    # Still useful to try non-destructive checks.
     if guest_has_cmd("bootctl"):
         boot_attempts.append(["bootctl", "status"])
-        # Only attempt update if ESP seems mounted and looks_uefi
         if looks_uefi and (dir_exists("/boot/efi") or dir_exists("/efi")):
             boot_attempts.append(["bootctl", "update"])
 
-    # extlinux/syslinux: configs typically edited directly, but we can at least validate it parses.
-    # Alpine often uses extlinux + mkinitfs.
     if guest_has_cmd("extlinux"):
-        # Avoid install commands that write boot sectors here.
         boot_attempts.append(["extlinux", "--version"])
-        # If config exists, attempt a "dry" parse by catting it (helps debugging)
         if file_exists("/boot/extlinux/extlinux.conf"):
             boot_attempts.append(["sh", "-c", "sed -n '1,200p' /boot/extlinux/extlinux.conf"])
         elif file_exists("/etc/extlinux.conf"):
             boot_attempts.append(["sh", "-c", "sed -n '1,200p' /etc/extlinux.conf"])
 
-    # lilo is ancient; do not run lilo offline (writes MBR). But detect for reporting.
     if guest_has_cmd("lilo"):
         boot_attempts.append(["lilo", "-V"])
 
-    # zipl (s390x) / yaboot (ppc) / elilo (ancient EFI) – detect only, don’t install/rewrite
     for tool in ("zipl", "yaboot", "elilo"):
         if guest_has_cmd(tool):
             boot_attempts.append([tool, "--version"])
 
-    # De-dup boot attempts
+    # de-dup boot attempts
     seen = set()
     deduped = []
     for c in boot_attempts:
@@ -596,34 +782,28 @@ def regen(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 
     boot_ran: List[Dict[str, Any]] = []
     did_boot = False
-
-    # Run “safe” boot commands; stop early on first real regen success,
-    # but allow multiple grub-mkconfig outputs if present.
     for cmd in boot_attempts:
         ok, out = run_guest(cmd)
         boot_ran.append({"cmd": cmd, "ok": ok, "out": out[-3000:]})
         if ok:
             did_boot = True
-            # keep going for multiple grub{,2}-mkconfig targets, else stop
             if cmd and cmd[0] not in ("grub2-mkconfig", "grub-mkconfig"):
                 break
 
     info["bootloader"] = {"attempts": boot_ran, "success": did_boot}
 
     # -----------------
-    # Extra: quick “did we actually create initramfs files?” sanity hints (non-fatal)
+    # Sanity hints (non-fatal)
     # -----------------
     sanity: Dict[str, Any] = {"boot": {}, "initramfs": {}}
     try:
-        # Common initramfs paths vary
         boot_ls = []
         if dir_exists("/boot"):
             boot_ls = sorted([U.to_text(x) for x in g.ls("/boot")])
-        sanity["boot"]["boot_ls"] = boot_ls[-50:]  # last 50 names
+        sanity["boot"]["boot_ls"] = boot_ls[-50:]
     except Exception:
         pass
 
-    # systemd-boot entries existence
     if dir_exists("/boot/loader/entries"):
         try:
             entries = sorted([U.to_text(x) for x in g.ls("/boot/loader/entries")])
