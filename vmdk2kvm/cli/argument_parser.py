@@ -1,3 +1,4 @@
+# vmdk2kvm/cli/argument_parser.py
 from __future__ import annotations
 
 import argparse
@@ -406,6 +407,33 @@ verbose: 1
 # disk: 0
 # local_path: ./downloads/myVM-disk0.vmdk
 #
+# ✅ NEW: Download-only VM folder pull (NO virt-v2v, NO guest inspection):
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: download_only_vm
+# vm_name: myVM
+# output_dir: ./downloads/myVM-folder
+# include_glob: ["*"]
+# exclude_glob: ["*.lck", "*.log", "*.vswp", "*.vmem", "*.vmsn"]
+# concurrency: 4
+#
+# ✅ NEW: VDDK raw download (single disk) (requires vddk_client + VDDK libs):
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+# vs_action: vddk_download_disk
+# vm_name: myVM
+# disk: 0
+# local_path: ./downloads/myVM-disk0.vmdk
+# vddk_libdir: /opt/vmware-vix-disklib-distrib
+# # vddk_thumbprint: "AA:BB:CC:..."
+# no_verify: true
+#
 # Create a quiesced snapshot for safer reads:
 # command: vsphere
 # vcenter: vcenter.example.com
@@ -489,6 +517,9 @@ verbose: 1
 # # vs_snapshot_moref: "snapshot-123"
 # # vs_create_snapshot: true
 #
+# # ✅ NEW: “download-only” handoff (do not run any inspection/fix/test after export)
+# vs_download_only: true
+#
 # # Safety default: keep this 1 unless you REALLY know your datastore can take it
 # vs_v2v_concurrency: 1
 #
@@ -513,8 +544,17 @@ verbose: 1
 # vSphere download a VM disk by index:
 #   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure --dc-name ha-datacenter download_vm_disk --vm-name myVM --disk 0 --local-path ./downloads/myVM-disk0.vmdk
 #
+# vSphere download-only VM folder:
+#   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure download_only_vm --vm-name myVM --output-dir ./downloads/myVM-folder --concurrency 4
+#
+# vSphere VDDK raw disk download:
+#   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure vddk_download_disk --vm-name myVM --disk 0 --local-path ./downloads/myVM-disk0.vmdk --vddk-libdir /opt/vmware-vix-disklib-distrib --no-verify
+#
 # vSphere -> virt-v2v export scaffold:
 #   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure --vs-v2v --vs-vm myVM --vs-transport vddk --vs-vddk-libdir /opt/vmware-vix-disklib-distrib list_vm_names
+#
+# vSphere -> virt-v2v download-only (stop after export):
+#   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure --vs-v2v --vs-vm myVM --vs-transport vddk --vs-vddk-libdir /opt/vmware-vix-disklib-distrib --vs-download-only list_vm_names
 #
 # --------------------------------------------------------------------------------------
 """
@@ -544,6 +584,8 @@ def build_parser() -> argparse.ArgumentParser:
         + c(" • Safety: dry-run, backups, report generation, verbose logs, recovery checkpoints\n", "cyan")
         + c(" • Performance: parallel batch processing\n", "cyan")
         + c(" • vSphere export: experimental virt-v2v (VDDK) export hook\n", "cyan")
+        + c(" • vSphere download-only: VM folder file pull via /folder (no inspection)\n", "cyan")
+        + c(" • vSphere VDDK raw: single disk direct pull via VDDK client (no inspection)\n", "cyan")
         + c("\nSystemd Service Example:\n", "cyan", ["bold"])
         + c(SYSTEMD_UNIT_TEMPLATE, "cyan")
     )
@@ -816,16 +858,18 @@ def build_parser() -> argparse.ArgumentParser:
     # Subcommands
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # NOTE: do NOT use required=True for options you want YAML to satisfy.
+    # We validate after parsing instead.
     pl = sub.add_parser("local", help="Offline: local VMDK")
-    pl.add_argument("--vmdk", required=True, help="Local VMDK path (descriptor OR monolithic/binary VMDK)")
+    pl.add_argument("--vmdk", required=False, default=None, help="Local VMDK path (descriptor OR monolithic/binary VMDK)")
 
     pf = sub.add_parser("fetch-and-fix", help="Fetch from remote ESXi over SSH/SCP and fix offline")
-    pf.add_argument("--host", required=True)
+    pf.add_argument("--host", required=False, default=None)
     pf.add_argument("--user", default="root")
     pf.add_argument("--port", type=int, default=22)
     pf.add_argument("--identity", default=None)
     pf.add_argument("--ssh-opt", action="append", default=None, help="Extra ssh/scp options (repeatable).")
-    pf.add_argument("--remote", required=True, help="Remote path to VMDK descriptor")
+    pf.add_argument("--remote", required=False, default=None, help="Remote path to VMDK descriptor")
     pf.add_argument(
         "--fetch-dir",
         dest="fetch_dir",
@@ -835,16 +879,17 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--fetch-all", dest="fetch_all", action="store_true", help="Fetch full snapshot descriptor chain recursively.")
 
     po = sub.add_parser("ova", help="Offline: extract from OVA")
-    po.add_argument("--ova", required=True)
+    po.add_argument("--ova", required=False, default=None)
 
     povf = sub.add_parser("ovf", help="Offline: parse OVF (disks in same dir)")
-    povf.add_argument("--ovf", required=True)
+    povf.add_argument("--ovf", required=False, default=None)
 
     # ✅ NEW: VHD mode (Azure / Hyper-V style)
     pvhd = sub.add_parser("vhd", help="Offline: VHD input (.vhd or archive containing .vhd)")
     pvhd.add_argument(
         "--vhd",
-        required=True,
+        required=False,
+        default=None,
         help="Path to .vhd OR tarball containing a .vhd (e.g. .tar/.tar.gz/.tgz).",
     )
 
@@ -852,12 +897,13 @@ def build_parser() -> argparse.ArgumentParser:
     pami = sub.add_parser("ami", help="Offline: AMI/cloud-image tarball (extract payload disk(s) from tar archives)")
     pami.add_argument(
         "--ami",
-        required=True,
+        required=False,
+        default=None,
         help="Path to tar/tar.gz/tgz/tar.xz containing a disk payload (raw/img/qcow2/vmdk/vhd/...).",
     )
 
     plive = sub.add_parser("live-fix", help="LIVE: fix running VM over SSH")
-    plive.add_argument("--host", required=True)
+    plive.add_argument("--host", required=False, default=None)
     plive.add_argument("--user", default="root")
     plive.add_argument("--port", type=int, default=22)
     plive.add_argument("--identity", default=None)
@@ -871,8 +917,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # vSphere / vCenter (pyvmomi) mode
     pvs = sub.add_parser("vsphere", help="vSphere/vCenter: scan VMs, download VMDK, CBT delta sync")
-    pvs.add_argument("--vcenter", required=True, help="vCenter/ESXi hostname or IP")
-    pvs.add_argument("--vc-user", dest="vc_user", required=True, help="vCenter username")
+    pvs.add_argument("--vcenter", required=False, default=None, help="vCenter/ESXi hostname or IP")
+    pvs.add_argument("--vc-user", dest="vc_user", required=False, default=None, help="vCenter username")
     pvs.add_argument("--vc-password", dest="vc_password", default=None, help="vCenter password (or use --vc-password-env)")
     pvs.add_argument("--vc-password-env", dest="vc_password_env", default=None, help="Env var containing vCenter password")
     pvs.add_argument("--vc-port", dest="vc_port", type=int, default=443, help="vCenter HTTPS port (default: 443)")
@@ -899,6 +945,22 @@ def build_parser() -> argparse.ArgumentParser:
     pvs.add_argument("--vs-vddk-thumbprint", dest="vs_vddk_thumbprint", default=None, help="vCenter TLS thumbprint for VDDK verification")
     pvs.add_argument("--vs-snapshot-moref", dest="vs_snapshot_moref", default=None, help="Snapshot MoRef (e.g. snapshot-123) to export from")
     pvs.add_argument("--vs-create-snapshot", dest="vs_create_snapshot", action="store_true", help="Create a quiesced snapshot before export and use it")
+
+    # ✅ NEW: download-only mode for vSphere->virt-v2v hook
+    pvs.add_argument(
+        "--vs-download-only",
+        dest="vs_download_only",
+        action="store_true",
+        help="vSphere virt-v2v hook: download/export ONLY (skip inspection/fixes/tests in later pipeline).",
+    )
+    pvs.add_argument(
+        "--vs-no-download-only",
+        dest="vs_download_only",
+        action="store_false",
+        help="Disable download-only mode (run normal pipeline after export).",
+    )
+    pvs.set_defaults(vs_download_only=False)
+
     pvs.add_argument(
         "--vs-v2v-concurrency",
         dest="vs_v2v_concurrency",
@@ -920,35 +982,110 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable TLS verification for virt-v2v vpx:// input (use with caution).",
     )
 
+    # ✅ NEW: additional vSphere download knobs (generic, only used by new actions)
+    pvs.add_argument(
+        "--include-glob",
+        dest="vs_include_glob",
+        action="append",
+        default=[],
+        help="download-only VM folder: include file glob (repeatable). Default is ['*'] if none supplied.",
+    )
+    pvs.add_argument(
+        "--exclude-glob",
+        dest="vs_exclude_glob",
+        action="append",
+        default=[],
+        help="download-only VM folder: exclude file glob (repeatable).",
+    )
+    pvs.add_argument(
+        "--concurrency",
+        dest="vs_concurrency",
+        type=int,
+        default=4,
+        help="download-only VM folder: concurrent downloads (default: 4).",
+    )
+    pvs.add_argument(
+        "--max-files",
+        dest="vs_max_files",
+        type=int,
+        default=5000,
+        help="download-only VM folder: refuse to download more than this many files (default: 5000).",
+    )
+    pvs.add_argument(
+        "--use-async-http",
+        dest="vs_use_async_http",
+        action="store_true",
+        help="download-only VM folder: prefer aiohttp/aiofiles when available.",
+    )
+    pvs.add_argument(
+        "--no-use-async-http",
+        dest="vs_use_async_http",
+        action="store_false",
+        help="download-only VM folder: disable aiohttp/aiofiles (force requests).",
+    )
+    pvs.set_defaults(vs_use_async_http=True)
+    pvs.add_argument(
+        "--fail-on-missing",
+        dest="vs_fail_on_missing",
+        action="store_true",
+        help="download-only VM folder: treat any failed/missing download as fatal.",
+    )
+
+    # ✅ NEW: VDDK raw download knobs (single disk)
+    pvs.add_argument(
+        "--vddk-libdir",
+        dest="vs_vddk_libdir2",
+        default=None,
+        help="VDDK raw download: directory containing libvixDiskLib.so (or a parent that contains it).",
+    )
+    pvs.add_argument(
+        "--vddk-thumbprint",
+        dest="vs_vddk_thumbprint2",
+        default=None,
+        help="VDDK raw download: ESXi/vCenter thumbprint (SHA1 AA:BB:..).",
+    )
+    pvs.add_argument(
+        "--no-verify",
+        dest="vs_no_verify2",
+        action="store_true",
+        help="VDDK raw download: disable TLS verification (insecure).",
+    )
+    pvs.add_argument(
+        "--vddk-transports",
+        dest="vs_vddk_transports2",
+        default=None,
+        help="VDDK raw download: transport modes string (e.g. 'nbdssl:nbd').",
+    )
+
     vs_sub = pvs.add_subparsers(dest="vs_action", required=True, help="vSphere actions")
 
-    # Existing vs_action parsers (unchanged)
+    # Existing vs_action parsers (unchanged semantics, but required=True removed where config should satisfy)
     plist = vs_sub.add_parser("list_vm_names", help="List all VM names")
     plist.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pget = vs_sub.add_parser("get_vm_by_name", help="Get VM by name")
-    pget.add_argument("--name", required=True, help="VM name")
+    pget.add_argument("--name", required=False, default=None, help="VM name")
     pget.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pvm_disks = vs_sub.add_parser("vm_disks", help="List disks for VM")
-    pvm_disks.add_argument("--vm_name", required=True, help="VM name")
+    pvm_disks.add_argument("--vm_name", required=False, default=None, help="VM name")
     pvm_disks.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pselect = vs_sub.add_parser("select_disk", help="Select disk")
-    pselect.add_argument("--vm_name", required=True, help="VM name")
+    pselect.add_argument("--vm_name", required=False, default=None, help="VM name")
     pselect.add_argument("--label_or_index", default=None, help="Disk label or index")
     pselect.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pdownload = vs_sub.add_parser("download_datastore_file", help="Download datastore file")
-    pdownload.add_argument("--datastore", required=True, help="Datastore name")
-    pdownload.add_argument("--ds_path", required=True, help="Datastore path")
-    pdownload.add_argument("--local_path", required=True, help="Local output path")
+    pdownload.add_argument("--datastore", required=False, default=None, help="Datastore name")
+    pdownload.add_argument("--ds_path", required=False, default=None, help="Datastore path")
+    pdownload.add_argument("--local_path", required=False, default=None, help="Local output path")
     pdownload.add_argument("--chunk_size", type=int, default=1024 * 1024, help="Download chunk size (bytes)")
     pdownload.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pcreate = vs_sub.add_parser("create_snapshot", help="Create snapshot")
-    pcreate.add_argument("--vm_name", required=True, help="VM name")
-    pcreate.add_argument("--name", required=True, help="Snapshot name")
+    pcreate.add_argument("--vm_name", required=False, default=None, help="VM name")
+    pcreate.add_argument("--name", required=False, default=None, help="Snapshot name")
     pcreate.add_argument("--quiesce", action="store_true", default=True, help="Quiesce filesystem")
     pcreate.add_argument("--no_quiesce", action="store_false", dest="quiesce", help="Disable quiesce")
     pcreate.add_argument("--memory", action="store_true", default=False, help="Include memory")
@@ -956,12 +1093,12 @@ def build_parser() -> argparse.ArgumentParser:
     pcreate.add_argument("--json", action="store_true", help="Output in JSON format")
 
     penable = vs_sub.add_parser("enable_cbt", help="Enable CBT")
-    penable.add_argument("--vm_name", required=True, help="VM name")
+    penable.add_argument("--vm_name", required=False, default=None, help="VM name")
     penable.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pquery = vs_sub.add_parser("query_changed_disk_areas", help="Query changed disk areas")
-    pquery.add_argument("--vm_name", required=True, help="VM name")
-    pquery.add_argument("--snapshot_name", required=True, help="Snapshot name")
+    pquery.add_argument("--vm_name", required=False, default=None, help="VM name")
+    pquery.add_argument("--snapshot_name", required=False, default=None, help="Snapshot name")
     pquery.add_argument("--device_key", type=int, required=False, help="Device key")
     pquery.add_argument("--disk", default=None, help="Disk index or label (alternative to device_key)")
     pquery.add_argument("--start_offset", type=int, default=0, help="Start offset")
@@ -969,22 +1106,119 @@ def build_parser() -> argparse.ArgumentParser:
     pquery.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pdownload_vm = vs_sub.add_parser("download_vm_disk", help="Download VM disk")
-    pdownload_vm.add_argument("--vm_name", required=True, help="VM name")
+    pdownload_vm.add_argument("--vm_name", required=False, default=None, help="VM name")
     pdownload_vm.add_argument("--disk", default=None, help="Disk index or label")
-    pdownload_vm.add_argument("--local_path", required=True, help="Local output path")
+    pdownload_vm.add_argument("--local_path", required=False, default=None, help="Local output path")
     pdownload_vm.add_argument("--chunk_size", type=int, default=1024 * 1024, help="Download chunk size (bytes)")
     pdownload_vm.add_argument("--json", action="store_true", help="Output in JSON format")
 
     pcbt_sync = vs_sub.add_parser("cbt_sync", help="CBT delta sync")
-    pcbt_sync.add_argument("--vm_name", required=True, help="VM name")
+    pcbt_sync.add_argument("--vm_name", required=False, default=None, help="VM name")
     pcbt_sync.add_argument("--disk", default=None, help="Disk index or label")
-    pcbt_sync.add_argument("--local_path", required=True, help="Local output path")
+    pcbt_sync.add_argument("--local_path", required=False, default=None, help="Local output path")
     pcbt_sync.add_argument("--enable_cbt", action="store_true", help="Enable CBT")
     pcbt_sync.add_argument("--snapshot_name", default="vmdk2kvm-cbt", help="Snapshot name")
     pcbt_sync.add_argument("--change_id", default="*", help="Change ID for CBT query (default: '*')")
     pcbt_sync.add_argument("--json", action="store_true", help="Output in JSON format")
 
+    # ✅ NEW: download-only VM folder pull (no inspection)
+    pdl_only = vs_sub.add_parser("download_only_vm", help="Download the entire VM folder from datastore (no virt-v2v)")
+    pdl_only.add_argument("--vm_name", required=False, default=None, help="VM name")
+    # IMPORTANT: do NOT set dest="output_dir" here; that would clobber the global output_dir.
+    # Use vs_output_dir if you want per-action override.
+    pdl_only.add_argument(
+        "--output_dir",
+        dest="vs_output_dir",
+        default=None,
+        help="Local output directory override for this action (defaults to global --output-dir).",
+    )
+    pdl_only.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    # ✅ NEW: VDDK raw disk download (single disk)
+    pvddk_dl = vs_sub.add_parser("vddk_download_disk", help="VDDK raw download of a VM disk (no virt-v2v)")
+    pvddk_dl.add_argument("--vm_name", required=False, default=None, help="VM name")
+    pvddk_dl.add_argument("--disk", default=None, help="Disk index or label (default: first disk)")
+    pvddk_dl.add_argument(
+        "--local_path",
+        required=False,
+        default=None,
+        help="Local output path for downloaded disk.",
+    )
+    pvddk_dl.add_argument("--json", action="store_true", help="Output in JSON format")
+
     return p
+
+
+def _require(v: Any) -> bool:
+    return v is not None and v != ""
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """
+    Enforce "required" semantics AFTER config defaults have been applied.
+    This is the only way YAML can satisfy parameters that argparse would otherwise require on the CLI.
+    """
+    cmd = getattr(args, "cmd", None)
+
+    if cmd == "local":
+        if not _require(getattr(args, "vmdk", None)):
+            raise SystemExit("local: missing required value: vmdk (set in YAML as `vmdk:` or pass --vmdk)")
+
+    elif cmd == "fetch-and-fix":
+        if not _require(getattr(args, "host", None)):
+            raise SystemExit("fetch-and-fix: missing required value: host (YAML `host:` or --host)")
+        if not _require(getattr(args, "remote", None)):
+            raise SystemExit("fetch-and-fix: missing required value: remote (YAML `remote:` or --remote)")
+
+    elif cmd == "ova":
+        if not _require(getattr(args, "ova", None)):
+            raise SystemExit("ova: missing required value: ova (YAML `ova:` or --ova)")
+
+    elif cmd == "ovf":
+        if not _require(getattr(args, "ovf", None)):
+            raise SystemExit("ovf: missing required value: ovf (YAML `ovf:` or --ovf)")
+
+    elif cmd == "vhd":
+        if not _require(getattr(args, "vhd", None)):
+            raise SystemExit("vhd: missing required value: vhd (YAML `vhd:` or --vhd)")
+
+    elif cmd == "ami":
+        if not _require(getattr(args, "ami", None)):
+            raise SystemExit("ami: missing required value: ami (YAML `ami:` or --ami)")
+
+    elif cmd == "live-fix":
+        if not _require(getattr(args, "host", None)):
+            raise SystemExit("live-fix: missing required value: host (YAML `host:` or --host)")
+
+    elif cmd == "vsphere":
+        if not _require(getattr(args, "vcenter", None)):
+            raise SystemExit("vsphere: missing required value: vcenter (YAML `vcenter:` or --vcenter)")
+        if not _require(getattr(args, "vc_user", None)):
+            raise SystemExit("vsphere: missing required value: vc_user (YAML `vc_user:` or --vc-user)")
+
+        act = getattr(args, "vs_action", None)
+        if act in ("vm_disks", "select_disk", "download_vm_disk", "cbt_sync", "create_snapshot", "enable_cbt", "query_changed_disk_areas", "download_only_vm", "vddk_download_disk"):
+            if not _require(getattr(args, "vm_name", None)):
+                raise SystemExit(f"vsphere {act}: missing required value: vm_name (YAML `vm_name:` or --vm_name)")
+
+        if act == "get_vm_by_name":
+            if not _require(getattr(args, "name", None)):
+                raise SystemExit("vsphere get_vm_by_name: missing required value: name (YAML `name:` or --name)")
+
+        if act == "download_datastore_file":
+            for k in ("datastore", "ds_path", "local_path"):
+                if not _require(getattr(args, k, None)):
+                    raise SystemExit(f"vsphere download_datastore_file: missing required value: {k}")
+
+        if act == "download_vm_disk":
+            if not _require(getattr(args, "local_path", None)):
+                raise SystemExit("vsphere download_vm_disk: missing required value: local_path (YAML `local_path:` or --local_path)")
+
+        if act == "vddk_download_disk":
+            if not _require(getattr(args, "local_path", None)):
+                raise SystemExit("vsphere vddk_download_disk: missing required value: local_path (YAML `local_path:` or --local_path)")
+
+    # other cmds: daemon/generate-systemd etc typically don't need post-validate
 
 
 def parse_args_with_config(argv=None, logger=None):
@@ -1032,5 +1266,8 @@ def parse_args_with_config(argv=None, logger=None):
     if getattr(args0, "dump_args", False):
         print(U.json_dump(vars(args)))
         raise SystemExit(0)
+
+    # ✅ NEW: validate after config defaults are applied
+    validate_args(args)
 
     return args, conf, logger

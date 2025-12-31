@@ -1,16 +1,20 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
-import os
-from pathlib import Path
-import logging
+import fnmatch
 import json
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import quote
 
-from ..core.exceptions import Fatal
-from .vmware_client import VMwareClient, REQUESTS_AVAILABLE
-from ..core.exceptions import VMwareError
 import requests
 from pyVmomi import vim, vmodl
+
+from ..core.exceptions import Fatal, VMwareError
+from .vmware_client import REQUESTS_AVAILABLE, VMwareClient
 
 
 class VsphereMode:
@@ -34,6 +38,147 @@ class VsphereMode:
         v = getattr(self.args, "dc_name", None)
         return v if v else "ha-datacenter"
 
+    # ----------------------------------------------------------------------------------
+    # Download-only VM folder helpers (pure additive)
+    # ----------------------------------------------------------------------------------
+
+    def _parse_vm_datastore_dir(self, vmx_path: str) -> tuple[str, str]:
+        """
+        vm.summary.config.vmPathName looks like:
+          "[datastore1] folder/vm.vmx"
+        Return: (datastore_name, folder_path)
+          - datastore_name = "datastore1"
+          - folder_path = "folder" (no leading slash). Can be "" for datastore root.
+        """
+        s = (vmx_path or "").strip()
+        if not s.startswith("[") or "]" not in s:
+            raise VMwareError(f"Unexpected vmPathName format: {vmx_path}")
+        ds = s[1 : s.index("]")]
+        rest = s[s.index("]") + 1 :].strip()  # "folder/vm.vmx"
+        if "/" not in rest:
+            folder = ""
+        else:
+            folder = rest.rsplit("/", 1)[0].lstrip("/")
+        return ds, folder
+
+    def _find_datastore_obj(self, client: VMwareClient, datastore_name: str) -> vim.Datastore:
+        """
+        Find a vim.Datastore object by name using inventory.
+        Best-effort across folders/datacenters.
+        """
+        content = client._content()
+
+        def iter_children(obj):
+            try:
+                return list(getattr(obj, "childEntity", []) or [])
+            except Exception:
+                return []
+
+        # content.rootFolder.childEntity may contain folders and/or datacenters
+        for top in iter_children(content.rootFolder):
+            try:
+                if isinstance(top, vim.Datacenter):
+                    for ds in (top.datastore or []):
+                        if ds.name == datastore_name:
+                            return ds
+                elif isinstance(top, vim.Folder):
+                    for child in iter_children(top):
+                        if isinstance(child, vim.Datacenter):
+                            for ds in (child.datastore or []):
+                                if ds.name == datastore_name:
+                                    return ds
+            except Exception:
+                continue
+
+        raise VMwareError(f"Datastore not found in inventory: {datastore_name}")
+
+    def _list_vm_folder_files(
+        self,
+        client: VMwareClient,
+        datastore_obj: vim.Datastore,
+        ds_name: str,
+        folder: str,
+        include_glob: list[str],
+        exclude_glob: list[str],
+        max_files: int,
+    ) -> list[str]:
+        """
+        Use HostDatastoreBrowser to list files in the VM folder.
+
+        Returns:
+          list of datastore-relative paths like:
+            "folder/file.vmdk" or "folder/file-flat.vmdk" or "folder/vm.vmx"
+        """
+        browser = datastore_obj.browser  # vim.HostDatastoreBrowser
+
+        ds_folder_path = f"[{ds_name}] {folder}" if folder else f"[{ds_name}]"
+
+        spec = vim.HostDatastoreBrowserSearchSpec()
+        spec.details = vim.FileQueryFlags(fileOwner=True, fileSize=True, fileType=True, modification=True)
+        spec.sortFoldersFirst = True
+
+        task = browser.SearchDatastore_Task(datastorePath=ds_folder_path, searchSpec=spec)
+        client.wait_for_task(task)
+
+        result = getattr(task.info, "result", None)
+        if not result:
+            return []
+
+        files: list[str] = []
+        base = folder.rstrip("/")
+
+        for f in getattr(result, "file", []) or []:
+            name = getattr(f, "path", None)
+            if not name:
+                continue
+            rel = f"{base}/{name}" if base else name
+
+            # include/exclude filtering (match both rel and basename)
+            if include_glob and not any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat) for pat in include_glob):
+                continue
+            if exclude_glob and any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat) for pat in exclude_glob):
+                continue
+
+            files.append(rel)
+
+            if max_files and len(files) > max_files:
+                raise VMwareError(f"Refusing to download > max_files={max_files} (found so far: {len(files)})")
+
+        return files
+
+    def _download_one_folder_file(
+        self,
+        client: VMwareClient,
+        vc_host: str,
+        dc_name: str,
+        ds_name: str,
+        ds_path: str,
+        local_path: Path,
+        verify_tls: bool,
+        chunk_size: int = 1024 * 1024,
+    ) -> None:
+        """
+        Download a single datastore file via /folder endpoint using the session cookie from VMwareClient.
+        """
+        if not REQUESTS_AVAILABLE:
+            raise VMwareError("requests not installed. Install: pip install requests")
+
+        # /folder expects a datastore-relative path; it MUST be URL-encoded but keep slashes.
+        quoted_path = quote(ds_path, safe="/")
+        url = f"https://{vc_host}/folder/{quoted_path}?dcPath={quote(dc_name)}&dsName={quote(ds_name)}"
+        headers = {"Cookie": client._session_cookie()}
+
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with requests.get(url, headers=headers, verify=verify_tls, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+
+    # ----------------------------------------------------------------------------------
+
     def run(self) -> int:
         vc_host = self.args.vcenter
         vc_user = self.args.vc_user
@@ -41,7 +186,7 @@ class VsphereMode:
 
         if not vc_pass and getattr(self.args, "vc_password_env", None):
             vc_pass = os.environ.get(self.args.vc_password_env)
-        
+
         # ✅ normalize whitespace to prevent accidental InvalidLogin
         if isinstance(vc_pass, str):
             vc_pass = vc_pass.strip()
@@ -426,6 +571,131 @@ class VsphereMode:
                     print(json.dumps(output, indent=2))
                 else:
                     print(f"Downloaded disk from VM {self.args.vm_name} to {local_path}")
+                return 0
+
+            # ✅ NEW: download-only VM folder pull (no guest inspection; no virt-v2v)
+            if action == "download_only_vm":
+                if not getattr(self.args, "vm_name", None):
+                    raise Fatal(2, "vsphere download_only_vm: --vm_name is required")
+
+                vm = client.get_vm_by_name(self.args.vm_name)
+                if not vm:
+                    raise Fatal(2, f"vsphere: VM not found: {self.args.vm_name}")
+
+                out_dir = Path(self.args.output_dir).expanduser().resolve()
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                include_glob = list(getattr(self.args, "vs_include_glob", None) or ["*"])
+                exclude_glob = list(getattr(self.args, "vs_exclude_glob", None) or [])
+                concurrency = int(getattr(self.args, "vs_concurrency", 4) or 4)
+                max_files = int(getattr(self.args, "vs_max_files", 5000) or 5000)
+                fail_on_missing = bool(getattr(self.args, "vs_fail_on_missing", False))
+
+                vmx_path = None
+                try:
+                    vmx_path = vm.summary.config.vmPathName if vm.summary and vm.summary.config else None
+                except Exception:
+                    vmx_path = None
+
+                if not vmx_path:
+                    raise Fatal(2, "vsphere download_only_vm: cannot determine VM folder (vm.summary.config.vmPathName missing)")
+
+                ds_name, folder = self._parse_vm_datastore_dir(str(vmx_path))
+                ds_obj = self._find_datastore_obj(client, ds_name)
+
+                files = self._list_vm_folder_files(
+                    client=client,
+                    datastore_obj=ds_obj,
+                    ds_name=ds_name,
+                    folder=folder,
+                    include_glob=include_glob,
+                    exclude_glob=exclude_glob,
+                    max_files=max_files,
+                )
+
+                if not files:
+                    output = {
+                        "status": "success",
+                        "vm_name": self.args.vm_name,
+                        "datastore": ds_name,
+                        "folder": folder,
+                        "matched": 0,
+                        "downloaded": 0,
+                        "output_dir": str(out_dir),
+                        "include_glob": include_glob,
+                        "exclude_glob": exclude_glob,
+                    }
+                    if self.args.json:
+                        print(json.dumps(output, indent=2, default=str))
+                    else:
+                        print("No files matched; nothing downloaded.")
+                    return 0
+
+                self.logger.info(f"download_only_vm: matched {len(files)} files in [{ds_name}] {folder or '.'}")
+
+                verify_tls = not client.insecure
+                dc_name = self._dc_name()
+
+                downloaded: list[str] = []
+                errors: list[str] = []
+
+                def _job(ds_path: str) -> None:
+                    local_path = out_dir / ds_path
+                    try:
+                        self._download_one_folder_file(
+                            client=client,
+                            vc_host=vc_host,
+                            dc_name=dc_name,
+                            ds_name=ds_name,
+                            ds_path=ds_path,
+                            local_path=local_path,
+                            verify_tls=verify_tls,
+                        )
+                        downloaded.append(ds_path)
+                    except Exception as e:
+                        msg = f"{ds_path}: {e}"
+                        errors.append(msg)
+                        if fail_on_missing:
+                            raise
+
+                if concurrency <= 1:
+                    for p in files:
+                        _job(p)
+                else:
+                    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                        futs = {ex.submit(_job, p): p for p in files}
+                        for fut in as_completed(futs):
+                            try:
+                                fut.result()
+                            except Exception:
+                                if fail_on_missing:
+                                    raise Fatal(2, f"download_only_vm: failed: {errors[-1] if errors else 'unknown'}")
+
+                output = {
+                    "status": "success" if not errors else "partial",
+                    "vm_name": self.args.vm_name,
+                    "datastore": ds_name,
+                    "folder": folder,
+                    "output_dir": str(out_dir),
+                    "matched": len(files),
+                    "downloaded": len(downloaded),
+                    "errors": errors,
+                    "include_glob": include_glob,
+                    "exclude_glob": exclude_glob,
+                    "concurrency": concurrency,
+                    "dc_name": dc_name,
+                    "verify_tls": verify_tls,
+                }
+                if self.args.json:
+                    print(json.dumps(output, indent=2, default=str))
+                else:
+                    print(f"Downloaded {len(downloaded)}/{len(files)} files into {out_dir}")
+                    if errors:
+                        print("Some downloads failed:")
+                        for e in errors[:20]:
+                            print(f"  - {e}")
+                        if len(errors) > 20:
+                            print(f"  ... and {len(errors)-20} more")
                 return 0
 
             if action == "cbt_sync":

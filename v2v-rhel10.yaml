@@ -1,0 +1,110 @@
+# vSphere → virt-v2v export (download only)
+# VM: esx8.0-rhel10.0beta-x86_64-efi
+# Guest: RHEL 10.0 beta (EFI)
+# Power state: poweredOff
+#
+# Run:
+#   export VC_PASSWORD='VCENTER@redhat2025'
+#   sudo -E ./vmdk2kvm.py --config v2v-rhel10.yaml vsphere list_vm_names
+#   # (Orchestrator will still take the v2v-export path because vs_v2v:true)
+#
+# Notes:
+#   - Control-plane: pyvmomi (inventory, host/dc resolution, optional snapshot/CBT hooks)
+#   - Data-plane: virt-v2v (downloads/exports disks)
+#   - This YAML is “download/export only”: it exports disks to output_dir and stops.
+#   - IMPORTANT: your vCenter inventory shows datacenter ['data'] so we set dc_name/vs_datacenter to "data".
+
+command: vsphere
+
+# ------------------------------------------------------------------
+# vCenter connection (pyvmomi control-plane)
+# ------------------------------------------------------------------
+vcenter: 10.73.213.134
+vc_user: administrator@vsphere.local
+vc_password_env: VC_PASSWORD
+vc_insecure: true
+vc_port: 443
+
+# /folder downloads + some actions use dc_name (keep aligned)
+dc_name: data
+
+# ------------------------------------------------------------------
+# IMPORTANT: v2v-export hook credential aliases
+# Some parts of the code look for vs_host/vs_user/vs_password(_env).
+# Keep these in sync with the vc_* values above.
+# ------------------------------------------------------------------
+vs_host: 10.73.213.134
+vs_user: administrator@vsphere.local
+vs_password_env: VC_PASSWORD
+# vs_password: ""   # avoid plaintext; prefer env
+
+# virt-v2v vpx:// TLS policy
+vs_no_verify: true
+# If you want verification instead, set vs_no_verify:false and either provide
+# vs_vddk_thumbprint or let it be auto-computed by the client.
+
+# ------------------------------------------------------------------
+# Enable virt-v2v export path (data-plane via virt-v2v)
+# ------------------------------------------------------------------
+vs_v2v: true
+
+# Which VM(s) to export
+#vs_vm: esx8.0-rhel10.0beta-x86_64-efi
+vs_vm: mtv-ubuntu22-server
+
+# vs_vms: ["vm1", "vm2"]   # optional multi-export
+
+# Datacenter (be explicit; MUST match vCenter inventory)
+vs_datacenter: data
+
+# Transport: vddk | ssh
+vs_transport: vddk
+
+# VDDK configuration (REQUIRED for vddk transport)
+vs_vddk_libdir: /opt/vmware-vix-disklib-distrib
+# vs_vddk_thumbprint: "AA:BB:CC:DD:..."   # optional if vs_no_verify:false (or auto-computed)
+# vs_vddk_transports: "nbdssl:nbd"        # optional (advanced; defaults typically OK)
+
+# Snapshot handling
+vs_create_snapshot: false
+# vs_snapshot_moref: snapshot-123         # only if exporting from an existing snapshot MoRef
+
+# Safety: keep concurrency = 1
+vs_v2v_concurrency: 1
+
+# Extra virt-v2v flags (optional but useful)
+vs_v2v_extra_args:
+  - "-v"
+  - "-x"
+
+# ------------------------------------------------------------------
+# virt-v2v output (download/export artifact location)
+# ------------------------------------------------------------------
+output_dir: ./out/v2v/esx8.0-rhel10.0beta-x86_64-efi
+out_format: qcow2
+compress: true
+
+# ------------------------------------------------------------------
+# What happens AFTER v2v?
+# DOWNLOAD-ONLY mode:
+#   - do NOT run vmdk2kvm internal conversion pipeline
+#   - do NOT run post_v2v
+# ------------------------------------------------------------------
+use_v2v: false
+post_v2v: false
+vs_download_only: true
+
+# ------------------------------------------------------------------
+# Optional smoke testing AFTER export (disabled)
+# ------------------------------------------------------------------
+libvirt_test: false
+qemu_test: false
+uefi: true
+memory: 2048
+vcpus: 1
+timeout: 90
+headless: true
+
+# Logging / reporting
+verbose: 1
+report: v2v-export-report.md

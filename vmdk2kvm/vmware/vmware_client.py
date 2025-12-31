@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import logging
 import os
@@ -15,7 +16,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from urllib.parse import quote
+from urllib.parse import quote  
+
 
 # ---------------------------------------------------------------------------
 # Errors / creds resolver (robust import fallbacks)
@@ -27,6 +29,7 @@ try:
 except Exception:  # pragma: no cover
     class VMwareError(RuntimeError):
         pass
+
 
 # ✅ shared credential resolver (supports vs_password_env + vc_password_env)
 # NOTE: if your file is core/creds.py, change to: from ..core.creds import resolve_vsphere_creds
@@ -79,6 +82,17 @@ except Exception:  # pragma: no cover
     AIOFILES_AVAILABLE = False
 
 
+# ✅ NEW: raw VDDK downloader (data-plane)
+try:
+    from .vddk_client import VDDKESXClient, VDDKConnectionSpec  # type: ignore
+
+    VDDK_CLIENT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    VDDKESXClient = None  # type: ignore
+    VDDKConnectionSpec = None  # type: ignore
+    VDDK_CLIENT_AVAILABLE = False
+
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
@@ -86,11 +100,23 @@ except Exception:  # pragma: no cover
 @dataclass(frozen=True)
 class V2VExportOptions:
     """
-    virt-v2v “export/download” options.
+    Export / download options.
 
-    Intent:
-      - Use pyvmomi for control-plane: resolve datacenter + compute (host path), find VM, snapshot hooks.
-      - Use virt-v2v for data-plane: pull disks via VDDK/SSH and write local output.
+    Three modes:
+
+      1) export_mode="v2v" (default):
+         - Uses virt-v2v (VDDK or SSH) which *may* inspect and modify the guest as part of conversion.
+         - Writes local output (qcow2/raw) under output_dir.
+
+      2) export_mode="download_only":
+         - Uses pyvmomi control-plane ONLY + HTTPS /folder downloads (session cookie)
+         - Downloads VM directory files from datastore (VMDKs, VMX, NVRAM, logs, snapshots, etc.)
+         - NO guest inspection, NO virt-v2v, NO libguestfs mutation.
+
+      3) export_mode="vddk_download":
+         - Uses pyvmomi control-plane to locate ESXi host + disk backing path
+         - Uses a VDDK data-plane client to download one disk (remote VMDK) to local storage
+         - NO guest inspection, NO virt-v2v
 
     IMPORTANT defaults:
       - datacenter defaults to "auto" (never hardcode ha-datacenter for vCenter)
@@ -102,9 +128,13 @@ class V2VExportOptions:
 
     vm_name: str
 
+    # ✅ NEW: knob
+    export_mode: str = "v2v"  # "v2v" | "download_only" | "vddk_download"
+
     datacenter: str = "auto"   # "auto" => resolve from VM parent chain
     compute: str = "auto"      # "auto" => resolve to host/<compute>/<host>
 
+    # v2v (virt-v2v) options
     transport: str = "vddk"    # "vddk" | "ssh"
     no_verify: bool = False
 
@@ -115,16 +145,54 @@ class V2VExportOptions:
 
     output_dir: Path = Path("./out")
     output_format: str = "qcow2"  # qcow2|raw
-
     extra_args: Tuple[str, ...] = ()
 
     # ✅ Optional: if non-empty, inventory gets printed (otherwise: FAST, no scan)
     print_vm_names: Tuple[str, ...] = ()
     vm_list_limit: int = 120
     vm_list_columns: int = 3
-
-    # ✅ Optional: speed vs huge VMs; if True, get_vm_by_name uses a cache built by list_vm_names()
     prefer_cached_vm_lookup: bool = False
+
+    # ------------------------------------------------------------------
+    # ✅ NEW: download-only options (NO guest inspection)
+    # ------------------------------------------------------------------
+    download_only_include_globs: Tuple[str, ...] = (
+        "*",  # by default: everything in VM directory
+    )
+    download_only_exclude_globs: Tuple[str, ...] = (
+        "*.lck",
+        "*.log",
+        "*.scoreboard",
+        "*.vswp",
+        "*.vmem",
+        "*.vmsn",
+        "*.nvram~",
+        "*.tmp",
+    )
+    download_only_max_files: int = 5000
+    download_only_concurrency: int = 4
+    download_only_use_async_http: bool = True  # if aiohttp/aiofiles available
+    download_only_fail_on_missing: bool = False  # if True, missing file is fatal
+
+    # ------------------------------------------------------------------
+    # ✅ NEW: vddk_download options (single-disk raw pull via VDDK client)
+    # ------------------------------------------------------------------
+    vddk_download_disk: Optional[str] = None
+    """
+    Disk selector for vddk_download:
+      - None => first disk
+      - "0", "1", ...
+      - or a substring of VirtualDisk label (deviceInfo.label)
+    """
+
+    vddk_download_output: Optional[Path] = None
+    """
+    Local file path for downloaded disk.
+    If None, defaults to: <output_dir>/<vm_name>-disk0.vmdk
+    """
+
+    vddk_download_sectors_per_read: int = 2048  # 1 MiB chunks (2048 * 512)
+    vddk_download_log_every_bytes: int = 256 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +205,15 @@ class VMwareClient:
       - pyvmomi control-plane (inventory, compute path, snapshots)
       - HTTPS /folder downloads via session cookie (requests or aiohttp)
       - virt-v2v command builder + runner
+      - ✅ NEW: VDDK raw disk downloader (optional)
 
     Key fixes:
       ✅ compute path is host-system path (host/<cluster>/<esx>) not cluster-only
       ✅ vddk-libdir validated/auto-resolved to directory containing libvixDiskLib.so
       ✅ inventory printing is OPT-IN (otherwise no expensive scans)
       ✅ avoids repeated CreateContainerView where possible via simple caches
+      ✅ NEW: download-only mode (no guest inspection; datastore folder download)
+      ✅ NEW: vddk_download mode (single disk direct VDDK pull)
     """
 
     def __init__(
@@ -235,7 +306,9 @@ class VMwareClient:
             await self.async_disconnect()
         finally:
             if exc_type is not None:
-                self.logger.error("Exception in async context: %s: %s", getattr(exc_type, "__name__", exc_type), exc_val)
+                self.logger.error(
+                    "Exception in async context: %s: %s", getattr(exc_type, "__name__", exc_type), exc_val
+                )
         return False
 
     # ---------------------------
@@ -838,10 +911,25 @@ class VMwareClient:
 
     @staticmethod
     def parse_backing_filename(file_name: str) -> Tuple[str, str]:
+        """
+        Parse VMware style backing fileName:
+          "[datastore] path/to/file.ext" -> ("datastore", "path/to/file.ext")
+        """
         m = re.match(r"\[(.+?)\]\s+(.*)", file_name)
         if not m:
             raise VMwareError(f"Could not parse backing filename: {file_name}")
         return m.group(1), m.group(2)
+
+    @staticmethod
+    def _split_ds_path(path: str) -> Tuple[str, str, str]:
+        """
+        "[ds] folder/file" -> (ds, "folder", "file")
+        """
+        ds, rel = VMwareClient.parse_backing_filename(path)
+        rel = (rel or "").lstrip("/")
+        folder = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        base = rel.rsplit("/", 1)[1] if "/" in rel else rel
+        return ds, folder, base
 
     # ---------------------------
     # Session cookie (for HTTPS /folder downloads)
@@ -943,7 +1031,9 @@ class VMwareClient:
         headers = {"Cookie": self._session_cookie()}
 
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        self.logger.info("Async downloading datastore file: [%s] %s (dc=%s) -> %s", datastore, ds_path, dc_use, local_path)
+        self.logger.info(
+            "Async downloading datastore file: [%s] %s (dc=%s) -> %s", datastore, ds_path, dc_use, local_path
+        )
 
         ssl_param: Union[bool, ssl.SSLContext] = True
         if self.insecure:
@@ -983,6 +1073,398 @@ class VMwareClient:
                     await asyncio.to_thread(tmp.unlink)
                 except Exception:
                     pass
+
+    # =========================================================================
+    # ✅ download-only mode (NO guest inspection)
+    #   - List VM directory files using DatastoreBrowser (pyvmomi control-plane)
+    #   - Download each file using /folder + session cookie (requests/aiohttp)
+    # =========================================================================
+
+    def _get_vm_datastore_browser(self, vm_obj: Any) -> Any:
+        """
+        Returns a DatastoreBrowser for the datastore that contains the VMX (and usually the VM folder).
+        """
+        self._require_pyvmomi()
+        ds = None
+        try:
+            # VMX is in a datastore; vm.datastore is a list of DS refs
+            ds_list = getattr(vm_obj, "datastore", None) or []
+            if ds_list:
+                ds = ds_list[0]
+        except Exception:
+            ds = None
+
+        if ds is None:
+            raise VMwareError("Could not resolve VM datastore reference (vm.datastore empty)")
+
+        browser = getattr(ds, "browser", None)
+        if browser is None:
+            raise VMwareError("Datastore has no browser (unexpected)")
+        return browser
+
+    def _vmx_pathname(self, vm_obj: Any) -> str:
+        """
+        Returns the VMX path string: "[ds] folder/vm.vmx"
+        """
+        s = getattr(vm_obj, "summary", None)
+        cfg = getattr(s, "config", None) if s else None
+        vmx = getattr(cfg, "vmPathName", None) if cfg else None
+        if not vmx:
+            # fallback: config.files.vmPathName
+            try:
+                vmx = getattr(getattr(vm_obj, "config", None), "files", None)
+                vmx = getattr(vmx, "vmPathName", None) if vmx else None
+            except Exception:
+                vmx = None
+        if not vmx:
+            raise VMwareError("Could not determine VMX path (summary.config.vmPathName missing)")
+        return str(vmx)
+
+    def _list_vm_directory_files(self, vm_obj: Any) -> Tuple[str, str, List[str]]:
+        """
+        Returns: (datastore_name, folder_rel, [files...]) where files are *relative to folder_rel*.
+        Uses DatastoreBrowser.SearchDatastoreSubFolders_Task against the VM folder.
+        """
+        self._require_pyvmomi()
+
+        vmx = self._vmx_pathname(vm_obj)
+        ds_name, folder_rel, _base = self._split_ds_path(vmx)
+
+        folder_rel = folder_rel.strip("/")
+
+        # Search path must be "[ds] folder"
+        search_root = f"[{ds_name}] {folder_rel}" if folder_rel else f"[{ds_name}]"
+
+        browser = self._get_vm_datastore_browser(vm_obj)
+
+        # Query: include everything; we filter ourselves.
+        q = vim.HostDatastoreBrowserSearchSpec()  # type: ignore[attr-defined]
+        q.matchPattern = ["*"]
+        q.details = vim.HostDatastoreBrowserFileInfoDetails()  # type: ignore[attr-defined]
+        q.details.fileSize = True
+        q.details.modification = True
+        q.details.fileType = True
+
+        task = browser.SearchDatastoreSubFolders_Task(search_root, q)  # type: ignore[attr-defined]
+        self.wait_for_task(task)
+
+        results = getattr(task.info, "result", None) or []
+        files: List[str] = []
+        for r in results:
+            # r.folderPath looks like: "[ds] folder/"
+            fp = str(getattr(r, "folderPath", "") or "")
+            if not fp:
+                continue
+
+            # Each r.file is a list of FileInfo with .path
+            for fi in (getattr(r, "file", None) or []):
+                name = str(getattr(fi, "path", "") or "")
+                if not name:
+                    continue
+                files.append(name)
+
+        # Deduplicate & sort
+        files = sorted(set(files))
+        return ds_name, folder_rel, files
+
+    @staticmethod
+    def _glob_any(name: str, globs: Sequence[str]) -> bool:
+        if not globs:
+            return False
+        return any(fnmatch.fnmatch(name, g) for g in globs)
+
+    def _filter_download_only_files(
+        self,
+        files: Sequence[str],
+        *,
+        include_globs: Sequence[str],
+        exclude_globs: Sequence[str],
+        max_files: int,
+    ) -> List[str]:
+        out: List[str] = []
+        for f in files:
+            if include_globs and not self._glob_any(f, include_globs):
+                continue
+            if exclude_globs and self._glob_any(f, exclude_globs):
+                continue
+            out.append(f)
+
+        if max_files and len(out) > int(max_files):
+            raise VMwareError(
+                f"Refusing to download {len(out)} files (limit={max_files}). "
+                "Tune download_only_max_files / include/exclude globs."
+            )
+        return out
+
+    async def _download_one_file_auto_http(
+        self,
+        *,
+        datastore: str,
+        ds_path: str,
+        local_path: Path,
+        dc_name: str,
+        use_async_http: bool,
+    ) -> None:
+        """
+        Uses aiohttp if enabled+available; otherwise falls back to requests in a thread.
+        """
+        if use_async_http and AIOHTTP_AVAILABLE and AIOFILES_AVAILABLE:
+            await self.async_download_datastore_file(
+                datastore=datastore,
+                ds_path=ds_path,
+                local_path=local_path,
+                dc_name=dc_name,
+            )
+            return
+
+        # requests path in thread to avoid blocking event loop
+        if not REQUESTS_AVAILABLE:
+            raise VMwareError("download-only requires aiohttp+aiofiles or requests; install one of them.")
+        await asyncio.to_thread(
+            self.download_datastore_file,
+            datastore=datastore,
+            ds_path=ds_path,
+            local_path=local_path,
+            dc_name=dc_name,
+        )
+
+    async def async_download_only_vm(self, opt: V2VExportOptions) -> Path:
+        """
+        ✅ Download-only: NO virt-v2v, NO guest inspection.
+
+        What it does:
+          - Locate the VM's directory from summary.config.vmPathName (VMX)
+          - List files in VM folder using DatastoreBrowser
+          - Download selected files using HTTPS /folder with session cookie
+          - Output is a byte-for-byte file pull from datastore (no conversions)
+        """
+        if not self.si:
+            raise VMwareError("Not connected to vSphere; cannot download. Call connect() first.")
+
+        if (opt.export_mode or "").strip().lower() not in ("download_only", "download-only", "download"):
+            raise VMwareError(f"async_download_only_vm() called with export_mode={opt.export_mode!r}")
+
+        vm_obj = self.get_vm_by_name(opt.vm_name)
+        if vm_obj is None:
+            raise VMwareError(f"VM not found: {opt.vm_name!r}")
+
+        # Resolve DC (needed for /folder dcPath=...)
+        resolved_dc = self.resolve_datacenter_for_vm(opt.vm_name, opt.datacenter)
+
+        ds_name, folder_rel, files = await asyncio.to_thread(self._list_vm_directory_files, vm_obj)
+
+        include_globs = tuple(opt.download_only_include_globs or ())
+        exclude_globs = tuple(opt.download_only_exclude_globs or ())
+
+        selected = self._filter_download_only_files(
+            files,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+            max_files=int(opt.download_only_max_files or 0),
+        )
+
+        out_dir = Path(opt.output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info(
+            "Download-only VM folder: dc=%s ds=%s folder=%s files=%d (selected=%d)",
+            resolved_dc,
+            ds_name,
+            folder_rel or ".",
+            len(files),
+            len(selected),
+        )
+
+        sem = asyncio.Semaphore(max(1, int(opt.download_only_concurrency or 1)))
+        failures: List[str] = []
+
+        async def _dl_one(name: str) -> None:
+            ds_path = f"{folder_rel}/{name}" if folder_rel else name
+            local_path = out_dir / name
+
+            async with sem:
+                try:
+                    await self._download_one_file_auto_http(
+                        datastore=ds_name,
+                        ds_path=ds_path,
+                        local_path=local_path,
+                        dc_name=resolved_dc,
+                        use_async_http=bool(opt.download_only_use_async_http),
+                    )
+                except Exception as e:
+                    msg = f"{name}: {e}"
+                    failures.append(msg)
+                    if opt.download_only_fail_on_missing:
+                        raise
+                    self.logger.error("Download failed (non-fatal): %s", msg)
+
+        await asyncio.gather(*[_dl_one(n) for n in selected])
+
+        if failures and opt.download_only_fail_on_missing:
+            raise VMwareError("One or more downloads failed:\n" + "\n".join(failures))
+
+        self.logger.info("Download-only completed: %s", out_dir)
+        return out_dir
+
+    def download_only_vm(self, opt: V2VExportOptions) -> Path:
+        """
+        Sync wrapper for async_download_only_vm.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return asyncio.run(asyncio.to_thread(lambda: asyncio.run(self.async_download_only_vm(opt))))  # type: ignore[return-value]
+        return asyncio.run(self.async_download_only_vm(opt))
+
+    # =========================================================================
+    # ✅ NEW: vddk_download mode (single disk direct pull via VDDK client)
+    # =========================================================================
+
+    def _require_vddk_client(self) -> None:
+        if not VDDK_CLIENT_AVAILABLE:
+            raise VMwareError(
+                "VDDK raw download requested but vddk_client is not importable. "
+                "Ensure vmdk2kvm/vsphere/vddk_client.py exists and imports cleanly."
+            )
+
+    def _vm_disk_backing_filename(self, disk_obj: Any) -> str:
+        """
+        Return backing.fileName for a vim.vm.device.VirtualDisk
+        Example: "[datastore1] vm/vm.vmdk"
+        """
+        backing = getattr(disk_obj, "backing", None)
+        fn = getattr(backing, "fileName", None) if backing else None
+        if not fn:
+            raise VMwareError("Selected disk has no backing.fileName (unexpected)")
+        return str(fn)
+
+    def _resolve_esx_host_for_vm(self, vm_obj: Any) -> str:
+        """
+        Resolve ESXi hostname for runtime.host.
+        We use this as the VDDK endpoint (host=esx_host).
+        """
+        host_obj = self._vm_runtime_host(vm_obj)
+        if host_obj is None:
+            raise VMwareError("VM has no runtime.host; cannot determine ESXi host for VDDK download")
+        name = str(getattr(host_obj, "name", "") or "").strip()
+        if not name:
+            raise VMwareError("Could not resolve ESXi host name for VM runtime.host")
+        return name
+
+    def _default_vddk_download_path(self, opt: V2VExportOptions, *, disk_index: int) -> Path:
+        out_dir = Path(opt.output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_vm = re.sub(r"[^A-Za-z0-9_.-]+", "_", opt.vm_name or "vm")
+        return out_dir / f"{safe_vm}-disk{disk_index}.vmdk"
+
+    async def async_vddk_download_disk(self, opt: V2VExportOptions) -> Path:
+        """
+        ✅ export_mode="vddk_download"
+          - control-plane: pyvmomi finds ESXi host + disk backing path
+          - data-plane: VDDK reads and writes a local file
+        """
+        self._require_pyvmomi()
+        self._require_vddk_client()
+
+        if not self.si:
+            raise VMwareError("Not connected to vSphere; cannot download. Call connect() first.")
+
+        vm_obj = self.get_vm_by_name(opt.vm_name)
+        if vm_obj is None:
+            raise VMwareError(f"VM not found: {opt.vm_name!r}")
+
+        disk_obj = self.select_disk(vm_obj, opt.vddk_download_disk)
+
+        # Find disk index for default output name (best-effort)
+        try:
+            disks = self.vm_disks(vm_obj)
+            disk_index = disks.index(disk_obj)
+        except Exception:
+            disk_index = 0
+
+        remote_vmdk = self._vm_disk_backing_filename(disk_obj)  # "[ds] folder/disk.vmdk"
+        esx_host = self._resolve_esx_host_for_vm(vm_obj)
+
+        # Use the same VDDK libdir resolver as virt-v2v integration
+        vddk_dir = self._resolve_vddk_libdir(opt)
+        if not vddk_dir:
+            raise VMwareError(
+                "vddk_download requires VDDK library directory.\n"
+                "Provide opt.vddk_libdir=Path('...') pointing to the directory containing libvixDiskLib.so,\n"
+                "or export VDDK_LIBDIR=..., or install/extract VDDK under /opt."
+            )
+
+        # Thumbprint: use provided, else compute unless no_verify
+        thumb = (opt.vddk_thumbprint or "").strip() or None
+        if (not thumb) and (not opt.no_verify):
+            self.logger.info("VDDK: computing TLS thumbprint (SHA1) for ESXi %s:%d ...", esx_host, 443)
+            thumb = await asyncio.to_thread(self.compute_server_thumbprint_sha1, esx_host, 443, 10.0)
+
+        # Output path
+        local_path = Path(opt.vddk_download_output) if opt.vddk_download_output else self._default_vddk_download_path(opt, disk_index=disk_index)
+
+        spec = VDDKConnectionSpec(
+            host=esx_host,
+            user=self.user,
+            password=self.password,
+            port=443,
+            vddk_libdir=vddk_dir,
+            transport_modes=opt.vddk_transports or "nbdssl:nbd",
+            thumbprint=thumb,
+            insecure=bool(opt.no_verify),
+        )
+
+        c = VDDKESXClient(self.logger, spec)
+
+        def _progress(done: int, total: int, pct: float) -> None:
+            # keep it cheap; logs every ~256MiB by default
+            if total and done and int(opt.vddk_download_log_every_bytes or 0) > 0:
+                if done % int(opt.vddk_download_log_every_bytes) < int(opt.vddk_download_sectors_per_read or 2048) * 512:
+                    self.logger.info(
+                        "VDDK download progress: %.1f%% (%.1f/%.1f GiB)",
+                        pct,
+                        done / (1024**3),
+                        total / (1024**3),
+                    )
+
+        self.logger.info(
+            "VDDK download: vm=%s disk=%s esx=%s remote=%s -> %s",
+            opt.vm_name,
+            opt.vddk_download_disk or str(disk_index),
+            esx_host,
+            remote_vmdk,
+            local_path,
+        )
+
+        await asyncio.to_thread(c.connect)
+        try:
+            out = await asyncio.to_thread(
+                c.download_vmdk,
+                remote_vmdk,
+                Path(local_path),
+                sectors_per_read=int(opt.vddk_download_sectors_per_read or 2048),
+                progress=_progress,
+                log_every_bytes=int(opt.vddk_download_log_every_bytes or 0),
+            )
+            return Path(out)
+        finally:
+            await asyncio.to_thread(c.disconnect)
+
+    def vddk_download_disk(self, opt: V2VExportOptions) -> Path:
+        """
+        Sync wrapper for async_vddk_download_disk().
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return asyncio.run(asyncio.to_thread(lambda: asyncio.run(self.async_vddk_download_disk(opt))))  # type: ignore[return-value]
+        return asyncio.run(self.async_vddk_download_disk(opt))
 
     # =========================================================================
     # VDDK libdir validation / auto-resolution (FIXES your error)
@@ -1276,6 +1758,34 @@ class VMwareClient:
             return asyncio.run(asyncio.to_thread(lambda: asyncio.run(self.async_v2v_export_vm(opt))))  # type: ignore[return-value]
         return asyncio.run(self.async_v2v_export_vm(opt))
 
+    # ---------------------------------------------------------------------
+    # ✅ Unified entrypoint (uses knob export_mode)
+    # ---------------------------------------------------------------------
+
+    async def async_export_vm(self, opt: V2VExportOptions) -> Path:
+        mode = (opt.export_mode or "v2v").strip().lower()
+        if mode in ("download_only", "download-only", "download"):
+            return await self.async_download_only_vm(opt)
+
+        if mode in ("vddk_download", "vddk-download", "vddkdownload"):
+            return await self.async_vddk_download_disk(opt)
+
+        # default
+        return await self.async_v2v_export_vm(opt)
+
+    def export_vm(self, opt: V2VExportOptions) -> Path:
+        """
+        Sync wrapper for async_export_vm(). Uses opt.export_mode knob.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return asyncio.run(asyncio.to_thread(lambda: asyncio.run(self.async_export_vm(opt))))  # type: ignore[return-value]
+        return asyncio.run(self.async_export_vm(opt))
+
 
 # ---------------------------------------------------------------------------
 # ADDITIONS: stderr tail capture + verbose export (NO REMOVALS ABOVE)
@@ -1454,3 +1964,130 @@ async def async_v2v_export_vm_verbose(self: VMwareClient, opt: V2VExportOptions)
 
 # Monkey-patch add-only (keeps your existing API intact)
 VMwareClient.async_v2v_export_vm_verbose = async_v2v_export_vm_verbose  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# ADDITIONS: chunk-based subprocess pumping (fixes asyncio LimitOverrunError)
+#   - Do NOT remove existing code; we override by monkey-patching at the end.
+# ---------------------------------------------------------------------------
+
+async def _pump_stream_chunked(
+    stream: Optional[asyncio.StreamReader],
+    logger: logging.Logger,
+    level: int,
+    prefix: str,
+    *,
+    tail: Optional["_TailBuffer"] = None,
+    chunk_size: int = 8192,
+) -> None:
+    """
+    Robust pump that DOES NOT use readline().
+    Fixes: asyncio.exceptions.LimitOverrunError:
+      "Separator is not found, and chunk exceed the limit"
+    which happens when virt-v2v/libguestfs emits very long lines without '\\n'.
+    """
+    if stream is None:
+        return
+
+    buf = b""
+    while True:
+        data = await stream.read(chunk_size)
+        if not data:
+            break
+
+        buf += data
+
+        # Emit complete lines
+        while b"\n" in buf:
+            raw_line, buf = buf.split(b"\n", 1)
+            msg = _strip_ansi(_safe_decode(raw_line).rstrip())
+            if not msg:
+                continue
+            if tail is not None:
+                tail.add(msg)
+            logger.log(level, "%s%s", prefix, msg)
+
+    # Flush remaining partial line
+    if buf:
+        msg = _strip_ansi(_safe_decode(buf).rstrip())
+        if msg:
+            if tail is not None:
+                tail.add(msg)
+            logger.log(level, "%s%s", prefix, msg)
+
+
+async def _run_logged_subprocess_chunked(
+    logger: logging.Logger,
+    argv: Sequence[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+) -> int:
+    """
+    Drop-in replacement for VMwareClient._run_logged_subprocess(), but safe.
+    """
+    logger.info("Running: %s", " ".join(shlex.quote(a) for a in argv))
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+
+    await asyncio.gather(
+        _pump_stream_chunked(proc.stdout, logger, logging.INFO, "", tail=None),
+        _pump_stream_chunked(proc.stderr, logger, logging.INFO, "", tail=None),
+    )
+    return int(await proc.wait())
+
+
+async def _run_logged_subprocess_with_tails_chunked(
+    logger: logging.Logger,
+    argv: Sequence[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    stderr_tail_lines: int = 160,
+    stdout_tail_lines: int = 60,
+) -> Tuple[int, str, str]:
+    """
+    Safe replacement for _run_logged_subprocess_with_tails().
+    Keeps the same signature/return value: (rc, stdout_tail, stderr_tail).
+    """
+    logger.info("Running: %s", " ".join(shlex.quote(a) for a in argv))
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+
+    out_tail = _TailBuffer(max_lines=stdout_tail_lines)
+    err_tail = _TailBuffer(max_lines=stderr_tail_lines)
+
+    await asyncio.gather(
+        _pump_stream_chunked(proc.stdout, logger, logging.INFO, "", tail=out_tail),
+        _pump_stream_chunked(proc.stderr, logger, logging.INFO, "", tail=err_tail),
+    )
+
+    rc = int(await proc.wait())
+    return rc, out_tail.text(), err_tail.text()
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch: upgrade existing methods to safe chunked versions
+#   - No call sites need to change.
+# ---------------------------------------------------------------------------
+
+async def _vmwareclient__run_logged_subprocess_safe(
+    self: "VMwareClient",
+    argv: Sequence[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+) -> int:
+    # preserve existing logging format; do not log secrets
+    return await _run_logged_subprocess_chunked(self.logger, argv, env=env)
+
+
+VMwareClient._run_logged_subprocess = _vmwareclient__run_logged_subprocess_safe  # type: ignore[attr-defined]
+
+# Also override the module-level tails helper used by async_v2v_export_vm_verbose()
+_run_logged_subprocess_with_tails = _run_logged_subprocess_with_tails_chunked  # type: ignore[assignment]
