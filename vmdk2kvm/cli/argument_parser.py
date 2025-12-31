@@ -144,11 +144,11 @@ verbose: 1
 # --- Local: batch multiple VMs (shared defaults + per-VM overrides) ---
 # vms:
 # - vmdk: /path/to/vm1.vmdk
-# to_output: vm1.qcow2
-# resize: +10G
+#   to_output: vm1.qcow2
+#   resize: +10G
 # - vmdk: /path/to/vm2.vmdk
-# to_output: vm2.qcow2
-# remove_vmware_tools: false
+#   to_output: vm2.qcow2
+#   remove_vmware_tools: false
 # flatten: true
 # out_format: qcow2
 # compress: true
@@ -185,7 +185,7 @@ verbose: 1
 # report: fedora-azure-report.md
 # verbose: 1
 #
-# zure example (tarball containing VHD):
+# azure example (tarball containing VHD):
 # command: vhd
 # vhd: ./fedora-azure-43.x86_64.vhd.tar.gz
 # output_dir: ./out
@@ -264,15 +264,15 @@ verbose: 1
 # --- Live-fix: multi-VM sequential list ---
 # vms:
 # - host: vm1.example.com
-# user: root
-# sudo: true
-# regen_initramfs: true
+#   user: root
+#   sudo: true
+#   regen_initramfs: true
 # - host: vm2.example.com
-# user: admin
-# identity: ~/.ssh/key
-# remove_vmware_tools: false
-# print_fstab: true
-# fstab_mode: stabilize-all
+#   user: admin
+#   identity: ~/.ssh/key
+#   remove_vmware_tools: false
+#   print_fstab: true
+#   fstab_mode: stabilize-all
 #
 # Run:
 # sudo ./vmdk2kvm.py --config live-batch.yaml live-fix
@@ -311,11 +311,11 @@ verbose: 1
 # --- Fetch: multi-VM batch (parallel fetch + fix) ---
 # vms:
 # - host: esxi1.example.com
-# remote: /vmfs/volumes/ds1/vm1/vm1.vmdk
-# fetch_all: true
+#   remote: /vmfs/volumes/ds1/vm1/vm1.vmdk
+#   fetch_all: true
 # - host: esxi2.example.com
-# remote: /vmfs/volumes/ds2/vm2/vm2.vmdk
-# identity: ~/.ssh/key2
+#   remote: /vmfs/volumes/ds2/vm2/vm2.vmdk
+#   identity: ~/.ssh/key2
 # flatten: true
 # out_format: qcow2
 # parallel_processing: true
@@ -453,7 +453,70 @@ verbose: 1
 # local_path: ./downloads/myVM-disk0.vmdk
 # enable_cbt: true
 # snapshot_name: vmdk2kvm-cbt
+# change_id: "*"
 # json: true
+#
+# --------------------------------------------------------------------------------------
+# 6b) vSphere -> virt-v2v export (EXPERIMENTAL scaffold)
+# --------------------------------------------------------------------------------------
+# This path is intended for "export a VM (or snapshot) directly from vCenter/ESXi"
+# using virt-v2v with VDDK transport. By default we keep concurrency = 1 because
+# datastore thrash and session limits are real.
+#
+# command: vsphere
+# vcenter: vcenter.example.com
+# vc_user: administrator@vsphere.local
+# vc_password_env: VC_PASSWORD
+# vc_insecure: true
+#
+# # Enable vSphere->v2v export hook:
+# vs_v2v: true
+#
+# # Which VM(s) to export:
+# # vs_vm: myVM
+# # vs_vms: ["vm1", "vm2"]
+# vm_name: myVM
+#
+# # Export settings:
+# out_format: qcow2
+# compress: true
+# vs_datacenter: ha-datacenter
+# vs_transport: vddk
+# vs_vddk_libdir: /opt/vmware-vix-disklib-distrib
+# # vs_vddk_thumbprint: "AA:BB:CC:..."   # recommended if TLS verify is enabled
+#
+# # Snapshot source:
+# # vs_snapshot_moref: "snapshot-123"
+# # vs_create_snapshot: true
+#
+# # Safety default: keep this 1 unless you REALLY know your datastore can take it
+# vs_v2v_concurrency: 1
+#
+# # Optionally run virt-v2v *after* vmdk2kvm internal conversion/fixes too:
+# post_v2v: true
+#
+# --------------------------------------------------------------------------------------
+#
+# --------------------------------------------------------------------------------------
+# 7) CLI examples (copy/paste)
+# --------------------------------------------------------------------------------------
+#
+# Local conversion (offline):
+#   sudo ./vmdk2kvm.py --output-dir ./out local --vmdk /path/to/vm.vmdk --flatten --to-output vm.qcow2 --compress --regen-initramfs --print-fstab --fstab-mode stabilize-all --libvirt-test
+#
+# Fetch from ESXi and fix+test:
+#   sudo ./vmdk2kvm.py --output-dir ./out fetch-and-fix --host esxi.example.com --user root --remote /vmfs/volumes/datastore1/vm/vm.vmdk --fetch-all --flatten --to-output esxi-vm.qcow2 --compress --regen-initramfs --libvirt-test --vm-name esxi-test --memory 4096 --vcpus 4 --uefi --timeout 90
+#
+# vSphere list VMs:
+#   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure list_vm_names --json
+#
+# vSphere download a VM disk by index:
+#   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure --dc-name ha-datacenter download_vm_disk --vm-name myVM --disk 0 --local-path ./downloads/myVM-disk0.vmdk
+#
+# vSphere -> virt-v2v export scaffold:
+#   sudo ./vmdk2kvm.py vsphere --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure --vs-v2v --vs-vm myVM --vs-transport vddk --vs-vddk-libdir /opt/vmware-vix-disklib-distrib list_vm_names
+#
+# --------------------------------------------------------------------------------------
 """
 
 
@@ -465,7 +528,10 @@ def build_parser() -> argparse.ArgumentParser:
         + c(YAML_EXAMPLE, "cyan")
         + "\n"
         + c("Feature summary:\n", "cyan", ["bold"])
-        + c(" • Inputs: local VMDK/VHD, remote ESXi fetch, OVA/OVF extract, AMI/cloud tarball extract, live SSH fix, vSphere pyvmomi\n", "cyan")
+        + c(
+            " • Inputs: local VMDK/VHD, remote ESXi fetch, OVA/OVF extract, AMI/cloud tarball extract, live SSH fix, vSphere pyvmomi\n",
+            "cyan",
+        )
         + c(" • Snapshot: flatten convert, recursive parent descriptor fetch, vSphere snapshots/CBT hooks\n", "cyan")
         + c(
             " • Fixes: fstab UUID/PARTUUID/LABEL, btrfs canonicalization, grub root=, crypttab, mdraid checks\n",
@@ -477,6 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
         + c(" • Tests: libvirt and qemu smoke tests, BIOS/UEFI modes\n", "cyan")
         + c(" • Safety: dry-run, backups, report generation, verbose logs, recovery checkpoints\n", "cyan")
         + c(" • Performance: parallel batch processing\n", "cyan")
+        + c(" • vSphere export: experimental virt-v2v (VDDK) export hook\n", "cyan")
         + c("\nSystemd Service Example:\n", "cyan", ["bold"])
         + c(SYSTEMD_UNIT_TEMPLATE, "cyan")
     )
@@ -605,6 +672,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--post-v2v", dest="post_v2v", action="store_true", help="Run virt-v2v after internal fixes.")
     p.add_argument("--use-v2v", dest="use_v2v", action="store_true", help="Use virt-v2v for conversion if available.")
+
+    # ADD: opt-in v2v multi-process parallelism (does not affect behavior unless used)
+    p.add_argument(
+        "--v2v-parallel",
+        dest="v2v_parallel",
+        action="store_true",
+        help="Run multiple virt-v2v jobs in parallel when multiple disks/images are provided (experimental).",
+    )
+    p.add_argument(
+        "--v2v-concurrency",
+        dest="v2v_concurrency",
+        type=int,
+        default=2,
+        help="Max concurrent virt-v2v jobs when --v2v-parallel is set (default: 2).",
+    )
+
     p.add_argument(
         "--luks-passphrase",
         dest="luks_passphrase",
@@ -801,8 +884,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Datacenter name for /folder URL (default: ha-datacenter)",
     )
 
+    # ADD: vSphere -> virt-v2v export hook args (safe; only used if your Orchestrator consumes them)
+    pvs.add_argument(
+        "--vs-v2v",
+        dest="vs_v2v",
+        action="store_true",
+        help="EXPERIMENTAL: export VM(s) directly from vSphere via virt-v2v (VDDK/SSH) and then run normal pipeline.",
+    )
+    pvs.add_argument("--vs-vm", dest="vs_vm", default=None, help="VM name to export (alternative to --vm-name).")
+    pvs.add_argument("--vs-vms", dest="vs_vms", nargs="*", default=None, help="Multiple VM names to export.")
+    pvs.add_argument("--vs-datacenter", dest="vs_datacenter", default="ha-datacenter", help="Datacenter name (default: ha-datacenter)")
+    pvs.add_argument("--vs-transport", dest="vs_transport", default="vddk", choices=["vddk", "ssh"], help="virt-v2v input transport (default: vddk)")
+    pvs.add_argument("--vs-vddk-libdir", dest="vs_vddk_libdir", default=None, help="Path to VDDK libdir (if using vddk transport)")
+    pvs.add_argument("--vs-vddk-thumbprint", dest="vs_vddk_thumbprint", default=None, help="vCenter TLS thumbprint for VDDK verification")
+    pvs.add_argument("--vs-snapshot-moref", dest="vs_snapshot_moref", default=None, help="Snapshot MoRef (e.g. snapshot-123) to export from")
+    pvs.add_argument("--vs-create-snapshot", dest="vs_create_snapshot", action="store_true", help="Create a quiesced snapshot before export and use it")
+    pvs.add_argument(
+        "--vs-v2v-concurrency",
+        dest="vs_v2v_concurrency",
+        type=int,
+        default=1,  # keep safe; you wanted “maybe later”
+        help="Max concurrent vSphere virt-v2v exports (default: 1).",
+    )
+    pvs.add_argument(
+        "--vs-v2v-extra-args",
+        dest="vs_v2v_extra_args",
+        action="append",
+        default=[],
+        help="Extra args passed through to virt-v2v (repeatable).",
+    )
+    pvs.add_argument(
+        "--vs-no-verify",
+        dest="vs_no_verify",
+        action="store_true",
+        help="Disable TLS verification for virt-v2v vpx:// input (use with caution).",
+    )
+
     vs_sub = pvs.add_subparsers(dest="vs_action", required=True, help="vSphere actions")
 
+    # Existing vs_action parsers (unchanged)
     plist = vs_sub.add_parser("list_vm_names", help="List all VM names")
     plist.add_argument("--json", action="store_true", help="Output in JSON format")
 
@@ -861,6 +981,7 @@ def build_parser() -> argparse.ArgumentParser:
     pcbt_sync.add_argument("--local_path", required=True, help="Local output path")
     pcbt_sync.add_argument("--enable_cbt", action="store_true", help="Enable CBT")
     pcbt_sync.add_argument("--snapshot_name", default="vmdk2kvm-cbt", help="Snapshot name")
+    pcbt_sync.add_argument("--change_id", default="*", help="Change ID for CBT query (default: '*')")
     pcbt_sync.add_argument("--json", action="store_true", help="Output in JSON format")
 
     return p

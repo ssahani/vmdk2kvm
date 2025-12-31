@@ -92,6 +92,11 @@ class OfflineFSFix:
       - VMware tools removal (mounted-tree remover)
       - report + recovery checkpoints
       - FULL LUKS support: unlock + map + LVM activation + audit
+
+    Additive storage-stack support:
+      - mdraid assemble (mdadm --assemble --scan --run) if available in appliance
+      - best-effort ZFS import if zpool exists in appliance
+      - stronger brute-force root choice via scoring (multi-root safety)
     """
 
     _BTRFS_COMMON_SUBVOLS = ["@", "@/", "@root", "@rootfs", "@/.snapshots/1/snapshot"]
@@ -272,6 +277,75 @@ class OfflineFSFix:
             self._activate_lvm(g)
         return audit
 
+    # -----------------------
+    # storage stack activation (mdraid/zfs) — additive
+    # -----------------------
+    def _guestfs_can_run(self, g: guestfs.GuestFS, prog: str) -> bool:
+        try:
+            return bool(getattr(g, "command", None)) and guest_has_cmd(g, prog)
+        except Exception:
+            return False
+
+    def _activate_mdraid(self, g: guestfs.GuestFS) -> Dict[str, Any]:
+        """
+        Best-effort mdraid assembly inside the guestfs appliance.
+        Helps when root lives on /dev/mdX or PV-on-md.
+        """
+        audit: Dict[str, Any] = {"attempted": False, "ok": False, "details": "", "error": None}
+        if not self._guestfs_can_run(g, "mdadm"):
+            audit["details"] = "mdadm_not_available_in_appliance"
+            return audit
+        audit["attempted"] = True
+        try:
+            g.command(["mdadm", "--assemble", "--scan", "--run"])
+            audit["ok"] = True
+            audit["details"] = "mdadm_assemble_scan_ok"
+            return audit
+        except Exception as e:
+            audit["error"] = str(e)
+            audit["details"] = "mdadm_assemble_scan_failed"
+            return audit
+
+    def _activate_zfs(self, g: guestfs.GuestFS) -> Dict[str, Any]:
+        """
+        Best-effort ZFS import. Harmless on non-ZFS guests.
+        Depends on guestfs appliance having zpool.
+        """
+        if not self._guestfs_can_run(g, "zpool"):
+            return {"attempted": False, "ok": False, "reason": "zpool_not_available_in_appliance"}
+        audit: Dict[str, Any] = {"attempted": True, "ok": False, "pools": [], "error": None}
+        try:
+            out = g.command(["sh", "-lc", "ZPOOL_VDEV_NAME_PATH=1 zpool import 2>/dev/null || true"])
+            text = U.to_text(out).strip()
+            audit["pools"] = [ln.strip() for ln in text.splitlines() if ln.strip()][:100]
+        except Exception:
+            pass
+        try:
+            # -N: do not auto-mount datasets
+            g.command(["sh", "-lc", "ZPOOL_VDEV_NAME_PATH=1 zpool import -a -N -f 2>/dev/null || true"])
+            audit["ok"] = True
+            return audit
+        except Exception as e:
+            audit["error"] = str(e)
+            return audit
+
+    def _pre_mount_activate_storage_stack(self, g: guestfs.GuestFS) -> Dict[str, Any]:
+        """
+        Additive activation pipeline (best-effort, do-no-harm):
+          - mdraid assemble
+          - zfs import
+          - lvm activate
+        """
+        audit: Dict[str, Any] = {"mdraid": None, "zfs": None, "lvm": None}
+        audit["mdraid"] = self._activate_mdraid(g)
+        audit["zfs"] = self._activate_zfs(g)
+        try:
+            self._activate_lvm(g)
+            audit["lvm"] = {"attempted": True, "ok": True}
+        except Exception as e:
+            audit["lvm"] = {"attempted": True, "ok": False, "error": str(e)}
+        return audit
+
     # ---------------------------------------------------------------------
     # mount logic (safe + robust)
     # ---------------------------------------------------------------------
@@ -293,7 +367,13 @@ class OfflineFSFix:
         - dry_run: prefer read-only checks (e2fsck -n, xfs_repair -n)
         - non-dry_run: allow "auto/repair-ish" where possible
         """
-        audit: Dict[str, Any] = {"attempted": False, "fstype": None, "mode": "dry_run" if self.dry_run else "repair", "ok": False, "error": None}
+        audit: Dict[str, Any] = {
+            "attempted": False,
+            "fstype": None,
+            "mode": "dry_run" if self.dry_run else "repair",
+            "ok": False,
+            "error": None,
+        }
         fstype = ""
         try:
             if hasattr(g, "vfs_type"):
@@ -404,7 +484,6 @@ class OfflineFSFix:
         # 3) best-effort fsck then retry RO once
         self._safe_umount_all(g)
         fsck_audit = self._best_effort_fsck(g, dev)
-        # store for report/debugging, but do not change existing report schema elsewhere
         try:
             self.report.setdefault("analysis", {}).setdefault("mount", {})["fsck"] = fsck_audit
         except Exception:
@@ -446,6 +525,45 @@ class OfflineFSFix:
                 continue
         return hits >= 2  # avoid false positives on random partitions
 
+    def _score_root(self, g: guestfs.GuestFS) -> int:
+        """
+        Additive root scoring: helps multi-OS / ambiguous layouts.
+        Higher score = more likely this mount is the real rootfs.
+        """
+        score = 0
+        for p in self._ROOT_HINT_FILES:
+            try:
+                if g.is_file(p):
+                    score += 5
+            except Exception:
+                pass
+        for p in self._ROOT_STRONG_HINTS:
+            try:
+                if p.endswith("/"):
+                    if g.is_dir(p[:-1]):
+                        score += 2
+                else:
+                    if g.is_file(p) or g.is_dir(p):
+                        score += 2
+            except Exception:
+                pass
+        try:
+            if g.is_file("/etc/os-release"):
+                score += 10
+        except Exception:
+            pass
+        try:
+            if g.is_file("/usr/lib/systemd/systemd") or g.is_file("/sbin/init"):
+                score += 5
+        except Exception:
+            pass
+        try:
+            if g.is_file("/.discinfo") or g.is_file("/isolinux/isolinux.cfg"):
+                score -= 20
+        except Exception:
+            pass
+        return score
+
     def detect_and_mount_root(self, g: guestfs.GuestFS) -> None:
         try:
             roots = g.inspect_os()
@@ -456,7 +574,33 @@ class OfflineFSFix:
             self.mount_root_bruteforce(g)
             return
 
-        root = U.to_text(roots[0])
+        # Avoid "roots[0]" roulette on multi-OS disks; pick the best-looking one.
+        best_root: Optional[str] = None
+        best_score = -10**9
+        for r in roots:
+            rr = U.to_text(r)
+            score = 0
+            try:
+                if g.inspect_get_product_name(rr):
+                    score += 2
+            except Exception:
+                pass
+            try:
+                if g.inspect_get_distro(rr):
+                    score += 2
+            except Exception:
+                pass
+            try:
+                mp = g.inspect_get_mountpoints(rr) or {}
+                if U.to_text(mp.get("/", "")).strip():
+                    score += 2
+            except Exception:
+                pass
+            if score > best_score:
+                best_score = score
+                best_root = rr
+
+        root = best_root or U.to_text(roots[0])
         self.inspect_root = root
 
         # Log identity (best-effort)
@@ -530,7 +674,7 @@ class OfflineFSFix:
     def _candidate_root_devices(self, g: guestfs.GuestFS) -> List[str]:
         """
         Build a *better-than-list_partitions()* candidate list:
-          - after LUKS open + LVM activation, new mountables appear
+          - after LUKS open + mdraid assemble + LVM activation, new mountables appear
           - list_filesystems() often includes LV paths
         """
         candidates: List[str] = []
@@ -564,6 +708,28 @@ class OfflineFSFix:
         except Exception:
             pass
 
+        # 4) mdraid devices (if assembled)
+        try:
+            if hasattr(g, "command"):
+                out = g.command(["sh", "-lc", "ls -1 /dev/md* 2>/dev/null || true"])
+                for ln in U.to_text(out).splitlines():
+                    d = ln.strip()
+                    if d.startswith("/dev/"):
+                        candidates.append(d)
+        except Exception:
+            pass
+
+        # 5) device-mapper nodes (crypt/LVM edge cases)
+        try:
+            if hasattr(g, "command"):
+                out = g.command(["sh", "-lc", "ls -1 /dev/mapper/* 2>/dev/null || true"])
+                for ln in U.to_text(out).splitlines():
+                    d = ln.strip()
+                    if d.startswith("/dev/mapper/") and "control" not in d:
+                        candidates.append(d)
+        except Exception:
+            pass
+
         # Unique + stable-ish order (preserve first-seen)
         seen: set[str] = set()
         out: List[str] = []
@@ -581,7 +747,8 @@ class OfflineFSFix:
         # Enhancement: keep a lightweight mount failure log for report/debugging
         mount_failures: List[Dict[str, str]] = []
 
-        # Try normal mounts first
+        # Try normal mounts first, but score candidates and pick best (multi-OS safety)
+        best: Tuple[int, Optional[str]] = (-10**9, None)
         for dev in candidates:
             self._safe_umount_all(g)
             try:
@@ -591,20 +758,35 @@ class OfflineFSFix:
                 else:
                     g.mount(dev, "/")
                 if self._looks_like_root(g):
-                    self.root_dev = dev
-                    self.logger.info(f"Fallback root detected at {dev}")
-                    # stash failures for debug if any
-                    if mount_failures:
-                        try:
-                            self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
-                        except Exception:
-                            pass
-                    return
+                    sc = self._score_root(g)
+                    if sc > best[0]:
+                        best = (sc, dev)
+                self._safe_umount_all(g)
             except Exception as e:
                 mount_failures.append({"device": dev, "error": str(e)})
                 continue
 
-        # Then attempt btrfs common subvols
+        if best[1]:
+            dev = best[1]
+            self._safe_umount_all(g)
+            try:
+                if self.dry_run:
+                    g.mount_ro(dev, "/")
+                else:
+                    g.mount(dev, "/")
+                self.root_dev = dev
+                self.logger.info(f"Fallback root detected at {dev} (score={best[0]})")
+                if mount_failures:
+                    try:
+                        self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                mount_failures.append({"device": dev, "error": f"best_root_mount_failed:{e}"})
+
+        # Then attempt btrfs common subvols (also scored)
+        best_btrfs: Tuple[int, Optional[str], Optional[str]] = (-10**9, None, None)
         for dev in candidates:
             for sv in self._BTRFS_COMMON_SUBVOLS:
                 self._safe_umount_all(g)
@@ -615,18 +797,35 @@ class OfflineFSFix:
                         opts = f"ro,{opts}"
                     g.mount_options(opts, dev, "/")
                     if self._looks_like_root(g):
-                        self.root_dev = dev
-                        self.root_btrfs_subvol = sv
-                        self.logger.info(f"Fallback btrfs root detected at {dev} (subvol={sv})")
-                        if mount_failures:
-                            try:
-                                self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
-                            except Exception:
-                                pass
-                        return
+                        sc = self._score_root(g)
+                        if sc > best_btrfs[0]:
+                            best_btrfs = (sc, dev, sv)
+                    self._safe_umount_all(g)
                 except Exception as e:
                     mount_failures.append({"device": f"{dev} subvol={sv}", "error": str(e)})
                     continue
+
+        if best_btrfs[1] and best_btrfs[2]:
+            dev = best_btrfs[1]
+            sv = best_btrfs[2]
+            self._safe_umount_all(g)
+            try:
+                self._log_vfs_type_best_effort(g, dev)
+                opts = f"subvol={sv}"
+                if self.dry_run:
+                    opts = f"ro,{opts}"
+                g.mount_options(opts, dev, "/")
+                self.root_dev = dev
+                self.root_btrfs_subvol = sv
+                self.logger.info(f"Fallback btrfs root detected at {dev} (subvol={sv}, score={best_btrfs[0]})")
+                if mount_failures:
+                    try:
+                        self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                mount_failures.append({"device": f"{dev} subvol={sv}", "error": f"best_btrfs_mount_failed:{e}"})
 
         # stash failures before dying (doesn't change exit behavior)
         if mount_failures:
@@ -975,7 +1174,6 @@ class OfflineFSFix:
             try:
                 # On success, we should see at least a few root entries soon-ish.
                 if mountpoint.exists():
-                    # If it's truly mounted, listing shouldn't throw and often isn't empty.
                     _ = list(mountpoint.iterdir())
                     return True, None, t
             except Exception:
@@ -1048,7 +1246,6 @@ class OfflineFSFix:
                 except Exception:
                     pass
             if t:
-                # Give the FUSE loop a moment to unwind cleanly
                 t.join(timeout=3.0)
             try:
                 shutil.rmtree(str(mnt), ignore_errors=True)
@@ -1179,10 +1376,17 @@ class OfflineFSFix:
             self.report["analysis"]["luks"] = luks_audit
             self.logger.info(f"LUKS audit: {U.json_dump(luks_audit)}")
 
-            # 2) LVM activation (safe even if no LVM)
+            # 2) storage stack activation (additive): mdraid + zfs + lvm
+            try:
+                stack_audit = self._pre_mount_activate_storage_stack(g)
+                self.report.setdefault("analysis", {})["storage_stack"] = stack_audit
+            except Exception as e:
+                self.report.setdefault("analysis", {})["storage_stack"] = {"error": str(e)}
+
+            # 3) LVM activation (existing behavior; safe even if no LVM)
             self._activate_lvm(g)
 
-            # 3) Mount root
+            # 4) Mount root
             self.detect_and_mount_root(g)
 
             # identity into report
@@ -1269,7 +1473,6 @@ class OfflineFSFix:
 
         finally:
             try:
-                # extra safety: if anything mounted, try to umount all
                 self._safe_umount_all(g)
             except Exception:
                 pass

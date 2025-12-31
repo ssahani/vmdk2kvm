@@ -24,7 +24,8 @@ from ..converters.flatten import Flatten
 from ..converters.ovf_extractor import OVF
 from ..converters.vhd_extractor import VHD
 from ..converters.qemu_converter import Convert
-from ..core.exceptions import Fatal
+from ..core.cred import resolve_vsphere_creds
+from ..core.exceptions import Fatal, VMwareError
 from ..core.recovery_manager import RecoveryManager
 from ..core.sanity_checker import SanityChecker
 from ..core.utils import U
@@ -37,6 +38,29 @@ from ..testers.qemu_tester import QemuTest
 from ..vmware.vmdk_parser import VMDK
 from ..vmware.vmware_client import PYVMOMI_AVAILABLE, REQUESTS_AVAILABLE
 from ..vmware.vsphere_mode import VsphereMode
+
+# ---------------------------
+# ADD: optional async v2v export via vSphere (pyvmomi + virt-v2v)
+# (kept optional so current flows stay untouched)
+# ---------------------------
+try:
+    import asyncio
+
+    ASYNCIO_AVAILABLE = True
+except Exception:  # pragma: no cover
+    asyncio = None  # type: ignore
+    ASYNCIO_AVAILABLE = False
+
+try:
+    # Enhanced VMwareClient that can run async virt-v2v export (vddk/ssh).
+    # Keep optional import so existing code works even if module not present yet.
+    from ..vmware.vmware_client import VMwareClient, V2VExportOptions  # type: ignore
+
+    VSPHERE_V2V_AVAILABLE = True
+except Exception:  # pragma: no cover
+    VMwareClient = None  # type: ignore
+    V2VExportOptions = None  # type: ignore
+    VSPHERE_V2V_AVAILABLE = False
 
 
 class Orchestrator:
@@ -52,6 +76,9 @@ class Orchestrator:
     - Optional parallel processing for multi-disk inputs
     """
 
+    # =========================================================================
+    # Existing virt-v2v wrapper (disk input)
+    # =========================================================================
     @staticmethod
     def v2v_convert(
         logger: logging.Logger,
@@ -124,7 +151,6 @@ class Orchestrator:
                     pass
 
         # virt-v2v output files can vary; capture common ones robustly.
-        # Keep qcow2-first behavior, but don’t silently miss raw/img/vdi etc.
         patterns = ["*.qcow2", "*.raw", "*.img", "*.vmdk", "*.vdi"]
         out_images: List[Path] = []
         for pat in patterns:
@@ -145,6 +171,238 @@ class Orchestrator:
             logger.info(f"virt-v2v conversion completed: produced {len(uniq)} image(s).")
         return uniq
 
+    # =========================================================================
+    # ADD: parallel virt-v2v when disks > 1 (multi-process v2v)
+    # =========================================================================
+    @staticmethod
+    def v2v_convert_parallel(
+        logger: logging.Logger,
+        disks: List[Path],
+        out_root: Path,
+        out_format: str,
+        compress: bool,
+        passphrase: Optional[str] = None,
+        passphrase_env: Optional[str] = None,
+        keyfile: Optional[str] = None,
+        *,
+        concurrency: int = 2,
+    ) -> List[Path]:
+        """
+        Run multiple virt-v2v processes in parallel (bounded), each fed one disk.
+        Keeps stable ordering and returns a flattened list of output images.
+        """
+        if not disks:
+            return []
+        if len(disks) == 1:
+            return Orchestrator.v2v_convert(
+                logger,
+                disks,
+                out_root,
+                out_format,
+                compress,
+                passphrase,
+                passphrase_env,
+                keyfile,
+            )
+
+        U.ensure_dir(out_root)
+        results: List[Optional[List[Path]]] = [None] * len(disks)
+
+        concurrency = max(1, int(concurrency))
+        concurrency = min(concurrency, len(disks))
+
+        env_c = os.environ.get("VMDK2KVM_V2V_CONCURRENCY")
+        if env_c:
+            try:
+                concurrency = max(1, min(int(env_c), len(disks)))
+            except Exception:
+                pass
+
+        def _one(idx: int, disk: Path) -> List[Path]:
+            job_dir = out_root / f"v2v-disk{idx}"
+            U.ensure_dir(job_dir)
+            return Orchestrator.v2v_convert(
+                logger,
+                [disk],
+                job_dir,
+                out_format,
+                compress,
+                passphrase,
+                passphrase_env,
+                keyfile,
+            )
+
+        logger.info(f"virt-v2v parallel: {len(disks)} job(s), concurrency={concurrency}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = {ex.submit(_one, i, d): i for i, d in enumerate(disks)}
+            for fut in concurrent.futures.as_completed(futs):
+                i = futs[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    logger.error(f"virt-v2v job failed for disk {i} ({disks[i].name}): {e}")
+                    results[i] = []
+
+        out_images: List[Path] = []
+        for lst in results:
+            if lst:
+                out_images.extend(lst)
+
+        seen: set[str] = set()
+        uniq: List[Path] = []
+        for p in out_images:
+            sp = str(p)
+            if sp not in seen:
+                seen.add(sp)
+                uniq.append(p)
+
+        return uniq
+
+    # =========================================================================
+    # ADD: vSphere async virt-v2v export (VDDK/SSH) – optional, does not change existing modes
+    # =========================================================================
+    def _vsphere_v2v_enabled(self) -> bool:
+        return bool(getattr(self.args, "vs_v2v", False))
+
+    def _run_async(self, coro):
+        if not ASYNCIO_AVAILABLE:
+            raise Fatal(2, "asyncio not available in this environment")
+        try:
+            return asyncio.run(coro)  # type: ignore[misc]
+        except RuntimeError:
+            loop = asyncio.get_event_loop()  # type: ignore[attr-defined]
+            return loop.run_until_complete(coro)  # type: ignore[union-attr]
+
+    async def _async_vsphere_export_many(self, out_root: Path) -> List[Path]:
+        if not VSPHERE_V2V_AVAILABLE:
+            raise Fatal(2, "vSphere virt-v2v export not available (VMwareClient/V2VExportOptions missing)")
+
+        if not PYVMOMI_AVAILABLE:
+            raise Fatal(2, "pyvmomi not installed. Install: pip install pyvmomi")
+
+        if U.which("virt-v2v") is None:
+            raise Fatal(2, "virt-v2v not found in PATH; cannot perform vSphere export")
+
+        # Determine VM list
+        vms: List[str] = []
+        if getattr(self.args, "vs_vm", None):
+            vms = [str(self.args.vs_vm)]
+        elif getattr(self.args, "vs_vms", None):
+            v = getattr(self.args, "vs_vms")
+            if isinstance(v, (list, tuple)):
+                vms = [str(x) for x in v]
+            else:
+                vms = [s.strip() for s in str(v).split(",") if s.strip()]
+        elif getattr(self.args, "vm_name", None):
+            vms = [str(self.args.vm_name)]
+
+        if not vms:
+            raise Fatal(2, "No vSphere VM name(s) provided for v2v export (vs_vm/vs_vms/vm_name)")
+
+        # ✅ Resolve creds using shared core/cred.py (supports vs_* aliases + *_password_env)
+        try:
+            creds = resolve_vsphere_creds(vars(self.args))
+        except Exception as e:
+            raise Fatal(2, f"Missing vSphere credentials for v2v export: {e}")
+
+        # Accept both vs_* and vc_* knobs (since your config uses both)
+        port = int(getattr(self.args, "vs_port", None) or getattr(self.args, "vc_port", None) or 443)
+        vs_insecure = getattr(self.args, "vs_insecure", None)
+        insecure = bool(vs_insecure if vs_insecure is not None else getattr(self.args, "vc_insecure", False))
+
+        timeout = getattr(self.args, "vs_timeout", None) or getattr(self.args, "vc_timeout", None)
+        timeout_f = float(timeout) if timeout is not None else None
+
+        datacenter = str(getattr(self.args, "vs_datacenter", None) or getattr(self.args, "vc_datacenter", None) or "ha-datacenter")
+        transport = str(getattr(self.args, "vs_transport", "vddk")).strip().lower()
+
+        vddk_libdir = getattr(self.args, "vs_vddk_libdir", None)
+        vddk_thumbprint = getattr(self.args, "vs_vddk_thumbprint", None)
+
+        snapshot_moref = getattr(self.args, "vs_snapshot_moref", None)
+        create_snapshot = bool(getattr(self.args, "vs_create_snapshot", False))
+        v2v_conc = int(getattr(self.args, "vs_v2v_concurrency", 2))
+
+        sem = asyncio.Semaphore(max(1, min(v2v_conc, len(vms))))
+
+        out_images: List[Path] = []
+        failures: List[str] = []
+
+        async with VMwareClient(  # type: ignore[misc]
+            self.logger,
+            host=str(creds.host),
+            user=str(creds.user),
+            password=str(creds.password),
+            port=port,
+            insecure=insecure,
+            timeout=timeout_f,
+        ) as vc:
+
+            async def _one(vm_name: str) -> List[Path]:
+                async with sem:
+                    try:
+                        snap_moref = str(snapshot_moref) if snapshot_moref else None
+                        if create_snapshot:
+                            vm_obj = vc.get_vm_by_name(vm_name)
+                            if not vm_obj:
+                                raise VMwareError(f"VM not found: {vm_name}")
+                            snap_obj = vc.create_snapshot(vm_obj, name=f"vmdk2kvm-{vm_name}", quiesce=True, memory=False)
+                            snap_moref = vc.snapshot_moref(snap_obj)
+
+                        job_dir = out_root / "vsphere-v2v" / vm_name
+                        U.ensure_dir(job_dir)
+
+                        opt = V2VExportOptions(  # type: ignore[misc]
+                            vm_name=vm_name,
+                            datacenter=datacenter,
+                            transport=transport,
+                            no_verify=bool(getattr(self.args, "vs_no_verify", False)),
+                            vddk_libdir=Path(vddk_libdir).expanduser().resolve() if vddk_libdir else None,
+                            vddk_thumbprint=str(vddk_thumbprint) if vddk_thumbprint else None,
+                            vddk_snapshot_moref=snap_moref,
+                            vddk_transports=str(getattr(self.args, "vs_vddk_transports", "")) or None,
+                            output_dir=job_dir,
+                            output_format=str(getattr(self.args, "out_format", "qcow2")),
+                            extra_args=tuple(getattr(self.args, "vs_v2v_extra_args", []) or ()),
+                        )
+
+                        await vc.async_v2v_export_vm(opt)  # type: ignore[attr-defined]
+
+                        pats = ["*.qcow2", "*.raw", "*.img", "*.vmdk", "*.vdi"]
+                        imgs: List[Path] = []
+                        for pat in pats:
+                            imgs.extend(sorted(job_dir.glob(pat)))
+                        if not imgs:
+                            self.logger.warning(f"vSphere v2v export produced no outputs for {vm_name} in {job_dir}")
+                        return imgs
+
+                    except Exception as e:
+                        self.logger.error("vSphere v2v export failed for %s: %s", vm_name, e)
+                        failures.append(f"{vm_name}: {e}")
+                        return []
+
+            tasks = [asyncio.create_task(_one(n)) for n in vms]
+            for t in asyncio.as_completed(tasks):
+                out_images.extend(await t)
+
+        seen: set[str] = set()
+        uniq: List[Path] = []
+        for p in out_images:
+            sp = str(p)
+            if sp not in seen:
+                seen.add(sp)
+                uniq.append(p)
+
+        if failures:
+            self.logger.warning("Some vSphere v2v export jobs failed:")
+            for f in failures:
+                self.logger.warning(f" - {f}")
+
+        return uniq
+
+    # =========================================================================
+    # Existing init + helpers
+    # =========================================================================
     def __init__(self, logger: logging.Logger, args: argparse.Namespace):
         self.logger = logger
         self.args = args
@@ -187,7 +445,6 @@ class Orchestrator:
             return None
 
     def _is_luks_enabled(self) -> bool:
-        # If CLI has luks_enable, honor it; else infer from passphrase/key presence.
         if hasattr(self.args, "luks_enable"):
             return bool(getattr(self.args, "luks_enable"))
         return bool(
@@ -198,7 +455,6 @@ class Orchestrator:
 
     @staticmethod
     def _ensure_parent_dir(path: Optional[Path]) -> None:
-        # Enhancement: consistent safe parent creation without exploding on weird paths.
         if not path:
             return
         try:
@@ -209,16 +465,11 @@ class Orchestrator:
 
     @staticmethod
     def _throttled_progress_logger(logger: logging.Logger, step_pct: int = 5):
-        """
-        Enhancement: drop-in progress callback generator to avoid log spam.
-        Logs every N% and completion.
-        """
         if step_pct <= 0:
             step_pct = 5
         last_bucket = {"b": -1}
 
         def cb(progress: float) -> None:
-            # bucket count across 0..100 by step_pct
             b = int((progress * 100.0) // step_pct)
             if b != last_bucket["b"]:
                 last_bucket["b"] = b
@@ -231,12 +482,6 @@ class Orchestrator:
 
     @staticmethod
     def _normalize_ssh_opts(v) -> Optional[List[str]]:
-        """
-        Enhancement: normalize ssh_opt whether it came in as:
-          - None
-          - string
-          - list[str]
-        """
         if v is None:
             return None
         if isinstance(v, (list, tuple)):
@@ -246,19 +491,12 @@ class Orchestrator:
 
     @staticmethod
     def _choose_workdir(args: argparse.Namespace, out_root: Path) -> Path:
-        """
-        Enhancement: consistent workdir selection used by flatten and other steps.
-        """
         if getattr(args, "workdir", None):
             return Path(args.workdir).expanduser().resolve()
         return out_root / "work"
 
     @staticmethod
     def _resolve_output_path(to_output: str, out_root: Path, disk_index: int, multi: bool) -> Path:
-        """
-        Enhancement: deterministic per-disk naming when multiple disks exist.
-        Preserves existing behavior but centralizes edge-cases.
-        """
         base_output = Path(to_output)
         if multi:
             base_output = base_output.parent / f"{base_output.stem}_disk{disk_index}{base_output.suffix}"
@@ -270,7 +508,6 @@ class Orchestrator:
         self.log_input_layout(disk)
         working = disk
 
-        # Flatten first (optional)
         if getattr(self.args, "flatten", False):
             workdir = self._choose_workdir(self.args, out_root)
             U.ensure_dir(workdir)
@@ -281,7 +518,6 @@ class Orchestrator:
                 fmt=getattr(self.args, "flatten_format", "qcow2"),
             )
 
-        # Per-disk report path (optional)
         report_path = None
         if getattr(self.args, "report", None):
             rp = Path(self.args.report)
@@ -308,7 +544,6 @@ class Orchestrator:
             recovery_manager=self.recovery_manager,
             resize=getattr(self.args, "resize", None),
             virtio_drivers_dir=getattr(self.args, "virtio_drivers_dir", None),
-            # LUKS wiring (keep backward compat; don’t assume arg exists)
             luks_enable=self._is_luks_enabled(),
             luks_passphrase=getattr(self.args, "luks_passphrase", None),
             luks_passphrase_env=getattr(self.args, "luks_passphrase_env", None),
@@ -319,7 +554,6 @@ class Orchestrator:
 
         out_image: Optional[Path] = None
 
-        # Convert final output (optional)
         if getattr(self.args, "to_output", None) and not getattr(self.args, "dry_run", False):
             out_image = self._resolve_output_path(
                 str(self.args.to_output),
@@ -350,10 +584,8 @@ class Orchestrator:
     def process_disks_parallel(self, disks: List[Path], out_root: Path) -> List[Path]:
         self.logger.info(f"Processing {len(disks)} disks in parallel")
 
-        # Enhancement: stable ordering in results (don’t reorder based on completion timing).
         results: List[Optional[Path]] = [None] * len(disks)
 
-        # Enhancement: cap workers sanely, but allow env override for power users.
         env_workers = os.environ.get("VMDK2KVM_WORKERS")
         if env_workers:
             try:
@@ -384,11 +616,9 @@ class Orchestrator:
                         results[idx] = result
                         self.logger.info(f"Completed processing disk {idx}: {disk.name}")
                     except Exception as e:
-                        # preserve failure but continue
                         self.logger.error(f"Failed processing disk {idx} ({disk.name}): {e}")
                     progress.update(task, advance=1)
 
-        # Filter None, keep deterministic ordering
         return [r for r in results if r is not None]
 
     def _setup_recovery(self, out_root: Path) -> None:
@@ -408,12 +638,26 @@ class Orchestrator:
         if cmd == "vsphere":
             if not PYVMOMI_AVAILABLE:
                 raise Fatal(2, "pyvmomi not installed. Install: pip install pyvmomi")
-            # requests needed for download-ish actions
             vs_action = getattr(self.args, "vs_action", "")
             if not REQUESTS_AVAILABLE and (vs_action in ("download_datastore_file", "download_vm_disk", "cbt_sync")):
                 raise Fatal(2, "requests not installed. Install: pip install requests")
+
+            # Existing behavior: VsphereMode handles its own output and exits orchestration.
+            # ADD (non-breaking): if user asked for vSphere->virt-v2v export, run it here and continue pipeline.
+            if self._vsphere_v2v_enabled():
+                if not ASYNCIO_AVAILABLE:
+                    raise Fatal(2, "asyncio not available; cannot run vsphere v2v export")
+                U.banner(self.logger, "vSphere virt-v2v export (async)")
+                exported = self._run_async(self._async_vsphere_export_many(out_root))
+                if exported:
+                    self.disks = exported
+                    return None
+                self.logger.warning("vSphere virt-v2v export produced no disks; falling back to VsphereMode")
+                VsphereMode(self.logger, self.args).run()
+                return None
+
             VsphereMode(self.logger, self.args).run()
-            return None  # vsphere handles its own output; stop orchestration
+            return None
 
         if cmd == "local":
             self.disks = [Path(self.args.vmdk).expanduser().resolve()]
@@ -462,7 +706,7 @@ class Orchestrator:
                 convert_compress=bool(getattr(self.args, "compress", False)),
                 convert_compress_level=getattr(self.args, "compress_level", None),
                 log_virt_filesystems=bool(getattr(self.args, "log_virt_filesystems", False)),
-        )
+            )
 
         elif cmd == "ovf":
             temp_dir = out_root / "extracted"
@@ -471,6 +715,7 @@ class Orchestrator:
                 Path(self.args.ovf).expanduser().resolve(),
                 temp_dir,
             )
+
         elif cmd == "vhd":
             temp_dir = out_root / "extracted"
             self.disks = VHD.extract_vhd_or_tar(
@@ -482,7 +727,8 @@ class Orchestrator:
                 convert_compress=bool(self.args.compress),
                 convert_compress_level=self.args.compress_level,
                 log_virt_filesystems=True,
-            )   
+            )
+
         elif cmd == "ami":
             from vmdk2kvm.converters.ami_extractor import AMI  # new extractor
 
@@ -497,12 +743,13 @@ class Orchestrator:
                 convert_outdir=(
                     Path(self.args.payload_qcow2_dir).expanduser().resolve()
                     if getattr(self.args, "payload_qcow2_dir", None)
-                else (out_root / "qcow2")
-        ),
-        convert_compress=bool(getattr(self.args, "payload_convert_compress", False)),
-        convert_compress_level=getattr(self.args, "payload_convert_compress_level", None),
-        log_virt_filesystems=True,
-        )
+                    else (out_root / "qcow2")
+                ),
+                convert_compress=bool(getattr(self.args, "payload_convert_compress", False)),
+                convert_compress_level=getattr(self.args, "payload_convert_compress_level", None),
+                log_virt_filesystems=True,
+            )
+
         elif cmd == "live-fix":
             sshc = SSHClient(
                 self.logger,
@@ -556,8 +803,10 @@ class Orchestrator:
 
         temp_dir = self._discover_disks(out_root)
         if temp_dir is None and getattr(self.args, "cmd", None) in ("live-fix", "vsphere"):
-            # those modes already executed
-            return
+            if getattr(self.args, "cmd", None) == "vsphere" and self.disks:
+                pass
+            else:
+                return
 
         if self.recovery_manager:
             self.recovery_manager.save_checkpoint(
@@ -567,36 +816,73 @@ class Orchestrator:
 
         fixed_images: List[Path] = []
 
+        # ---------------------------
+        # virt-v2v PRE step (existing) + ADD: optional v2v parallel
+        # ---------------------------
         if getattr(self.args, "use_v2v", False):
-            v2v_images = Orchestrator.v2v_convert(
-                self.logger,
-                self.disks,
-                out_root,
-                getattr(self.args, "out_format", "qcow2"),
-                getattr(self.args, "compress", False),
-                getattr(self.args, "luks_passphrase", None),
-                getattr(self.args, "luks_passphrase_env", None),
-                getattr(self.args, "luks_keyfile", None),
-            )
+            use_parallel_v2v = bool(getattr(self.args, "v2v_parallel", False))
+            if use_parallel_v2v and len(self.disks) > 1:
+                v2v_images = Orchestrator.v2v_convert_parallel(
+                    self.logger,
+                    self.disks,
+                    out_root,
+                    getattr(self.args, "out_format", "qcow2"),
+                    getattr(self.args, "compress", False),
+                    getattr(self.args, "luks_passphrase", None),
+                    getattr(self.args, "luks_passphrase_env", None),
+                    getattr(self.args, "luks_keyfile", None),
+                    concurrency=int(getattr(self.args, "v2v_concurrency", 2)),
+                )
+            else:
+                v2v_images = Orchestrator.v2v_convert(
+                    self.logger,
+                    self.disks,
+                    out_root,
+                    getattr(self.args, "out_format", "qcow2"),
+                    getattr(self.args, "compress", False),
+                    getattr(self.args, "luks_passphrase", None),
+                    getattr(self.args, "luks_passphrase_env", None),
+                    getattr(self.args, "luks_keyfile", None),
+                )
+
             fixed_images = v2v_images if v2v_images else self._internal_process(out_root)
         else:
             fixed_images = self._internal_process(out_root)
 
         out_images = fixed_images
 
+        # ---------------------------
+        # Post virt-v2v (existing) + ADD: optional post-v2v parallel
+        # ---------------------------
         if getattr(self.args, "post_v2v", False) and out_images:
             v2v_dir = out_root / "post-v2v"
             U.ensure_dir(v2v_dir)
-            v2v_images = Orchestrator.v2v_convert(
-                self.logger,
-                fixed_images,
-                v2v_dir,
-                getattr(self.args, "out_format", "qcow2"),
-                getattr(self.args, "compress", False),
-                getattr(self.args, "luks_passphrase", None),
-                getattr(self.args, "luks_passphrase_env", None),
-                getattr(self.args, "luks_keyfile", None),
-            )
+
+            use_parallel_v2v = bool(getattr(self.args, "v2v_parallel", False))
+            if use_parallel_v2v and len(fixed_images) > 1:
+                v2v_images = Orchestrator.v2v_convert_parallel(
+                    self.logger,
+                    fixed_images,
+                    v2v_dir,
+                    getattr(self.args, "out_format", "qcow2"),
+                    getattr(self.args, "compress", False),
+                    getattr(self.args, "luks_passphrase", None),
+                    getattr(self.args, "luks_passphrase_env", None),
+                    getattr(self.args, "luks_keyfile", None),
+                    concurrency=int(getattr(self.args, "v2v_concurrency", 2)),
+                )
+            else:
+                v2v_images = Orchestrator.v2v_convert(
+                    self.logger,
+                    fixed_images,
+                    v2v_dir,
+                    getattr(self.args, "out_format", "qcow2"),
+                    getattr(self.args, "compress", False),
+                    getattr(self.args, "luks_passphrase", None),
+                    getattr(self.args, "luks_passphrase_env", None),
+                    getattr(self.args, "luks_keyfile", None),
+                )
+
             if v2v_images:
                 out_images = v2v_images
 
@@ -627,7 +913,6 @@ class Orchestrator:
         if self.recovery_manager:
             self.recovery_manager.cleanup_old_checkpoints()
 
-        # Cleanup extraction dir only if it was created for ova/ovf flows.
         if temp_dir and temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
