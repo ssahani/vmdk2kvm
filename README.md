@@ -1,4 +1,3 @@
-```md
 # vmdk2kvm
 
 **VMware → KVM/QEMU conversion, repair, and automation toolkit**
