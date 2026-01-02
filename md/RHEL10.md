@@ -1,220 +1,299 @@
- Offline VMware → KVM Conversion (vmdk2kvm)
+# Testing Converted RHEL 10 qcow2 on Fedora (GUI, UEFI)
 
-This document describes an **offline, deterministic conversion** of a VMware
-VMDK into a KVM-ready qcow2 image using **vmdk2kvm**.
+This guide describes how to **validate a converted RHEL 10 qcow2 image**
+using **KVM + libvirt** on Fedora, booting **directly into graphical (GUI) mode**
+with **UEFI (OVMF)**.
 
-The workflow is designed to be:
-- reproducible
-- boot-safe
-- distro-agnostic
-- hostile to `/dev/disk/by-path` (on purpose)
-
-It is suitable for **RHEL / openSUSE / SLES / Fedora / Debian-family** guests
-that must boot reliably after migration.
+This is intended as a **post-conversion smoke test** after migrating
+a VMware VMDK to qcow2 and applying offline fixes (fstab, GRUB/BLS, initramfs, etc.).
 
 ---
 
-## How to run
+## Host Requirements (Fedora)
+
+Install required virtualization tools:
 
 ```bash
-sudo ./vmdk2kvm.py --config vmdk2kvm.yaml local
-````
-
-This runs **entirely offline** using libguestfs.
-No VM is booted during conversion.
-
----
-
-## What this configuration guarantees
-
-* ✅ Snapshot chains are flattened first
-* ✅ All filesystem references are rewritten to **stable identifiers**
-* ✅ `root=` is fixed everywhere it matters
-* ✅ Initramfs is regenerated safely (dracut-aware)
-* ✅ Final image is compressed qcow2
-* ✅ Before/after state is visible (fstab + report)
-* ✅ No reliance on host-specific device paths
-
-If this image boots in raw `qemu-system-x86_64`, it will boot under libvirt.
-
----
-
-## Configuration: `vmdk2kvm.yaml`
-
-```yaml
-# Offline VMware → KVM conversion
-#
-# Run with:
-#   sudo ./vmdk2kvm.py --config vmdk2kvm.yaml local
-#
-# Core guarantees:
-# - No /dev/disk/by-path usage
-# - Stable UUID/PARTUUID everywhere
-# - Safe GRUB + initramfs regeneration
-# - Deterministic output qcow2
-
-command: local
-
-# --------------------------------------------------------------------
-# Input
-# --------------------------------------------------------------------
-# Source VMDK (can be a flat VMDK or part of a snapshot chain)
-vmdk: /home/ssahani/tt/vmdk2kvm/downloads/esx8.0-rhel10.0beta-x86_64-efi/esx8.0-rhel10.0beta-x86_64-efi/esx8.0-rhel10.0beta-x86_64-efi_1-flat.vmdk
-
-# --------------------------------------------------------------------
-# Output layout
-# --------------------------------------------------------------------
-# Base output directory
-output_dir: /home/ssahani/by-path/out
-
-# Always flatten snapshot chains first (recommended)
-flatten: true
-flatten_format: qcow2
-
-# Final image name (relative to output_dir)
-to_output: rhel10-fixed.qcow2
-out_format: qcow2
-
-# Space + integrity
-compress: true
-checksum: true
-
-# --------------------------------------------------------------------
-# Filesystem + boot fixes
-# --------------------------------------------------------------------
-
-# Always show /etc/fstab before and after modification
-print_fstab: true
-
-# Rewrite *all* mount entries to stable identifiers.
-# Priority order:
-#   UUID= → PARTUUID= → LABEL=
-fstab_mode: stabilize-all
-
-# Fix GRUB kernel cmdline root=
-no_grub: false
-
-# Regenerate initramfs
-# (openSUSE, RHEL, Fedora → dracut)
-regen_initramfs: true
-
-# Keep backups inside the guest filesystem
-no_backup: false
-
-# --------------------------------------------------------------------
-# Safety / visibility
-# --------------------------------------------------------------------
-
-# Perform real writes (set true to preview only)
-dry_run: false
-
-# Verbosity:
-#   0 = INFO
-#   1 = verbose
-#   2 = DEBUG (recommended while developing)
-verbose: 2
-
-# Optional log file
-log_file: /home/ssahani/by-path/out/vmdk2kvm.log
-
-# Optional Markdown report (recommended)
-report: /home/ssahani/by-path/out/vmdk2kvm-report.md
-
-# --------------------------------------------------------------------
-# Optional smoke tests (disabled by default)
-# --------------------------------------------------------------------
-# libvirt_test: true
-# vm_name: rhel10-fixed
-# memory: 2048
-# vcpus: 2
-# uefi: true
-# timeout: 30
-# keep_domain: false
-# headless: true
+sudo dnf install -y \
+  libvirt \
+  qemu-kvm \
+  qemu-img \
+  virt-viewer \
+  libguestfs-tools \
+  edk2-ovmf
 ```
 
----
-
-## What happens internally (high level)
-
-1. **VMDK opened offline**
-
-   * libguestfs only
-   * no kernel boot, no udev races
-
-2. **Snapshot flattening**
-
-   * produces a single coherent disk image
-
-3. **Filesystem inspection**
-
-   * detects root, boot, EFI, LVM, Btrfs subvols
-
-4. **fstab rewrite**
-
-   * `/dev/disk/by-path/*` → `UUID=` / `PARTUUID=`
-   * consistent across reboots and hypervisors
-
-5. **GRUB fixup**
-
-   * canonical sources first (BLS, `/etc/kernel/cmdline`)
-   * generated configs treated as output only
-
-6. **Initramfs regeneration**
-
-   * dracut-aware
-   * avoids host-only traps
-   * virtio-safe
-
-7. **Final qcow2 creation**
-
-   * compressed
-   * validated
-   * checksum generated
-
----
-
-## Expected output
-
-After a successful run:
-
-```text
-/home/ssahani/by-path/out/
-├── rhel10-fixed.qcow2
-├── vmdk2kvm.log
-└── vmdk2kvm-report.md
-```
-
-The image is ready for:
-
-* raw `qemu-system-x86_64`
-* libvirt (UEFI or BIOS)
-* further automation (Packer, Ansible, Tinkerbell, etc.)
-
----
-
-## Boot validation (recommended)
-
-Always validate **outside libvirt first**:
+Enable libvirt and ensure the default network is active:
 
 ```bash
-qemu-system-x86_64 \
-  -enable-kvm \
-  -machine q35 \
-  -cpu host \
-  -m 4096 \
-  -drive file=/var/tmp/rhel10-fixed.qcow2,if=virtio,format=qcow2 \
-  -serial mon:stdio
+sudo systemctl enable --now libvirtd
+sudo virsh net-start default 2>/dev/null || true
 ```
-
-If this boots, libvirt will not surprise you later.
 
 ---
 
-## Philosophy
+## Image Under Test
 
-This config follows a simple rule:
+```
+/home/ssahani/by-path/out/rhel10-fixed.qcow2
+```
 
-> **If the guest cannot explain its own boot path in UUIDs, it does not deserve to boot.**
+**Assumptions:**
 
-That harshness is what makes the result boring — and boring systems survive migrations.
+* Converted from VMware VMDK
+* UEFI guest (OVMF)
+* RHEL 10 (or RHEL-like) with GRUB2 + BLS
+
+---
+
+## Why UEFI Needs a VARS Template (and Why Libvirt Yells)
+
+UEFI guests use **two firmware blobs**:
+
+* `OVMF_CODE.fd` (read-only firmware code)
+* `OVMF_VARS.fd` (mutable per-VM NVRAM “vars store”)
+
+Libvirt must know a **master VARS template** so it can create a per-VM NVRAM file.
+On your host, the available firmware pairs are:
+
+* `/usr/share/edk2/ovmf/OVMF_CODE.fd`
+* `/usr/share/edk2/ovmf/OVMF_VARS.fd`
+* (secureboot variants also exist, but we use non-secureboot by default)
+
+---
+
+## Put the qcow2 Where Libvirt Can Read It (Avoid Permission/SELinux Traps)
+
+Copy the image into the standard libvirt images directory:
+
+```bash
+sudo install -o qemu -g qemu -m 0640 \
+  /home/ssahani/by-path/out/rhel10-fixed.qcow2 \
+  /var/lib/libvirt/images/rhel10-fixed.qcow2
+```
+
+Create the NVRAM directory (safe even if it already exists):
+
+```bash
+sudo mkdir -p /var/lib/libvirt/qemu/nvram
+```
+
+---
+
+## UEFI + GUI libvirt XML (Known-Good)
+
+This XML is a conservative, reliable UEFI configuration:
+
+* q35 machine
+* OVMF UEFI firmware
+* Explicit VARS template (prevents “master var store” errors)
+* Virtio disk + network
+* SPICE graphics + virtio video
+* Serial console
+* Virtio RNG (helps entropy-starved boots)
+
+```bash
+cat >/tmp/rhel10-uefi-gui.xml <<'EOF'
+<domain type='kvm'>
+  <name>rhel10-fixed-uefi-gui</name>
+
+  <memory unit='MiB'>4096</memory>
+  <currentMemory unit='MiB'>4096</currentMemory>
+  <vcpu placement='static'>2</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+
+    <!-- UEFI firmware (non-secureboot) -->
+    <loader readonly='yes' type='pflash'>/usr/share/edk2/ovmf/OVMF_CODE.fd</loader>
+
+    <!-- Per-VM NVRAM file, copied from template on first boot -->
+    <nvram template='/usr/share/edk2/ovmf/OVMF_VARS.fd'>/var/lib/libvirt/qemu/nvram/rhel10-fixed-uefi-gui_VARS.fd</nvram>
+
+    <!-- Optional: enable temporarily for deep boot debugging -->
+    <!-- <cmdline>rd.debug rd.shell loglevel=7 systemd.log_level=debug systemd.log_target=console</cmdline> -->
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+    <vmport state='off'/>
+  </features>
+
+  <cpu mode='host-passthrough' check='none'/>
+
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- USB controller (tablet input) -->
+    <controller type='usb' index='0' model='qemu-xhci'/>
+
+    <!-- Root disk -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>
+      <source file='/var/lib/libvirt/images/rhel10-fixed.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='1'/>
+    </disk>
+
+    <!-- Network -->
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- Serial console -->
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+
+    <!-- Guest agent channel (install qemu-guest-agent inside guest) -->
+    <channel type='unix'>
+      <source mode='bind'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+
+    <!-- Graphics: SPICE + virtio GPU -->
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'/>
+    <video>
+      <model type='virtio' heads='1'/>
+    </video>
+
+    <input type='tablet' bus='usb'/>
+
+    <!-- RNG helps early boot -->
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+
+    <memballoon model='virtio'/>
+  </devices>
+</domain>
+EOF
+```
+
+---
+
+## Define and Start the VM
+
+If a domain with the same name already exists, remove it first:
+
+```bash
+sudo virsh destroy rhel10-fixed-uefi-gui 2>/dev/null || true
+sudo virsh undefine rhel10-fixed-uefi-gui --nvram 2>/dev/null || sudo virsh undefine rhel10-fixed-uefi-gui 2>/dev/null || true
+```
+
+Define and start the VM:
+
+```bash
+sudo virsh define /tmp/rhel10-uefi-gui.xml
+sudo virsh start rhel10-fixed-uefi-gui
+```
+
+---
+
+## Connect to the GUI
+
+### Option 1: virt-viewer (recommended)
+
+```bash
+virt-viewer rhel10-fixed-uefi-gui
+```
+
+### Option 2: SPICE display address
+
+```bash
+sudo virsh domdisplay rhel10-fixed-uefi-gui
+```
+
+---
+
+## Expected Boot Sequence
+
+A successful boot should show:
+
+1. OVMF splash (or quick handoff)
+2. GRUB menu
+3. RHEL kernel + initramfs (dracut)
+4. Graphical login screen (gdm)
+
+If this sequence completes, the image is **boot-validated**.
+
+---
+
+## Troubleshooting
+
+### “unable to find any master var store … OVMF_CODE.fd”
+
+Your XML is missing the VARS template link. Confirm these lines exist:
+
+```xml
+<loader readonly='yes' type='pflash'>/usr/share/edk2/ovmf/OVMF_CODE.fd</loader>
+<nvram template='/usr/share/edk2/ovmf/OVMF_VARS.fd'>/var/lib/libvirt/qemu/nvram/NAME_VARS.fd</nvram>
+```
+
+### Permission denied reading qcow2
+
+Keep the qcow2 under `/var/lib/libvirt/images/` with `qemu:qemu` ownership:
+
+```bash
+sudo chown qemu:qemu /var/lib/libvirt/images/rhel10-fixed.qcow2
+sudo chmod 0640 /var/lib/libvirt/images/rhel10-fixed.qcow2
+```
+
+### Black screen after GRUB
+
+Try a simpler video model:
+
+```xml
+<video><model type='qxl'/></video>
+```
+
+or even:
+
+```xml
+<video><model type='vga'/></video>
+```
+
+### “No bootable device” / drops to UEFI shell
+
+Usually the EFI boot entry/NVRAM is missing or wrong. Two common fixes:
+
+1) Ensure you’re using UEFI (OVMF) and the guest actually has an EFI System Partition.
+2) From the guest’s GRUB, confirm BLS/root is correct and regenerate if needed.
+
+### Boot logs needed (no GUI)
+
+Attach the serial console:
+
+```bash
+sudo virsh console rhel10-fixed-uefi-gui
+```
+
+Optionally enable debug kernel args in the XML `<cmdline>` (commented in the XML).
+
+---
+
+## Notes
+
+* This test uses **UEFI + OVMF** (not SeaBIOS)
+* Explicit VARS template avoids the classic libvirt “master var store” failure
+* Designed for VMware → KVM migrations where you want a quick, repeatable smoke test
+
+---
+
+**Status:** ✅ Verified working for RHEL 10 qcow2 (UEFI, GUI)
+
