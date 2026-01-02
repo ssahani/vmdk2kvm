@@ -1,15 +1,17 @@
 # vmdk2kvm/fixers/windows_fixer.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+import os
 import re
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import guestfs  # type: ignore
 
@@ -97,6 +99,16 @@ class DriverFile:
     # Class GUID for device class
     class_guid: str
 
+    # Optional: directory containing the full driver package (INF/CAT/SYS/etc.)
+    package_dir: Optional[Path] = None
+
+    # Optional: INF path (if discovered)
+    inf_path: Optional[Path] = None
+
+    # For reporting: which bucket/layout matched
+    bucket_used: Optional[str] = None
+    match_pattern: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -107,6 +119,10 @@ class DriverFile:
             "service_name": self.service_name,
             "pci_ids": list(self.pci_ids),
             "class_guid": self.class_guid,
+            "package_dir": str(self.package_dir) if self.package_dir else None,
+            "inf_path": str(self.inf_path) if self.inf_path else None,
+            "bucket_used": self.bucket_used,
+            "match_pattern": self.match_pattern,
         }
 
 
@@ -148,6 +164,13 @@ def _normalize_product_name(name: str) -> str:
     return normalized
 
 
+def _json_safe(obj: Any) -> str:
+    try:
+        return json.dumps(obj, indent=2, sort_keys=True, default=str)
+    except Exception:
+        return str(obj)
+
+
 # ---------------------------
 # Registry encoding helpers (CRITICAL)
 # ---------------------------
@@ -162,6 +185,11 @@ def _reg_sz(s: str) -> bytes:
 def _set_sz(h, node, key: str, s: str) -> None:
     # REG_SZ => t=1 in hivex
     h.node_set_value(node, {"key": key, "t": 1, "value": _reg_sz(s)})
+
+
+def _set_expand_sz(h, node, key: str, s: str) -> None:
+    # REG_EXPAND_SZ => t=2 in hivex
+    h.node_set_value(node, {"key": key, "t": 2, "value": _reg_sz(s)})
 
 
 def _set_dword(h, node, key: str, v: int) -> None:
@@ -226,6 +254,28 @@ def _hivex_read_dword(h, node, key: str) -> Optional[int]:
         if isinstance(raw, int):
             return raw
         return None
+    except Exception:
+        return None
+
+
+# ---------------------------
+# GuestFS helpers
+# ---------------------------
+
+def _guest_download_bytes(g: guestfs.GuestFS, guest_path: str, max_bytes: Optional[int] = None) -> bytes:
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "dl"
+        g.download(guest_path, str(lp))
+        b = lp.read_bytes()
+        if max_bytes is not None:
+            return b[:max_bytes]
+        return b
+
+
+def _guest_sha256(g: guestfs.GuestFS, guest_path: str) -> Optional[str]:
+    try:
+        b = _guest_download_bytes(g, guest_path)
+        return hashlib.sha256(b).hexdigest()
     except Exception:
         return None
 
@@ -299,8 +349,6 @@ def _find_windows_root(self, g: guestfs.GuestFS) -> Optional[str]:
         except Exception:
             continue
 
-    # If Windows is nested weirdly, do a minimal breadth guess.
-    # We avoid heavy globbing here to keep runtime reasonable.
     logger.debug("Windows root: no direct hit")
     return None
 
@@ -480,7 +528,7 @@ def _norm_arch_to_dir(arch: str) -> str:
 
 
 # ---------------------------
-# NEW: bucket fallback logic (Win11 support + ISO layout variation)
+# Bucket fallback logic (Win11 support + ISO layout variation)
 # ---------------------------
 
 def _bucket_candidates(edition: WindowsEdition) -> List[str]:
@@ -490,8 +538,6 @@ def _bucket_candidates(edition: WindowsEdition) -> List[str]:
       - Some only include w10/ (even for Windows 11)
       - Older ones include w8/ w7/ vista/ xp
     We therefore try a *sequence* of buckets, not just one.
-
-    The sequence below is "prefer most specific, then fall back".
     """
     if edition == WindowsEdition.WINDOWS_11:
         return ["w11", "w10", "w8", "w7"]
@@ -512,7 +558,7 @@ def _choose_driver_plan(self, win_info: Dict[str, Any]) -> WindowsVirtioPlan:
     """
     Determine which driver buckets to use and which driver types to inject.
 
-    IMPORTANT updates (additive, does not break your external API):
+    Updates:
       - Windows 11 gets an os_bucket *hint* of "w11" (but we still fall back).
       - We keep os_bucket primarily as a hint for "first attempt"; discovery tries candidates.
       - We do NOT choose one storage driver; discovery will attempt both viostor + vioscsi.
@@ -522,15 +568,13 @@ def _choose_driver_plan(self, win_info: Dict[str, Any]) -> WindowsVirtioPlan:
     edition = _detect_windows_edition(self, win_info)
     arch_dir = _norm_arch_to_dir(str(win_info.get("arch") or "amd64"))
 
-    # Keep your original mapping logic, but improve Windows 11.
-    # NOTE: os_bucket is now a "hint", not a hard constraint.
     edition_to_bucket = {
         WindowsEdition.SERVER_2022: "w10",
         WindowsEdition.SERVER_2019: "w10",
         WindowsEdition.SERVER_2016: "w10",
         WindowsEdition.SERVER_2012: "w8",
         WindowsEdition.SERVER_2008: "w7",
-        WindowsEdition.WINDOWS_11: "w11",  # <-- FIXED: was w10; now w11 first, with fallback in discovery
+        WindowsEdition.WINDOWS_11: "w11",
         WindowsEdition.WINDOWS_10: "w10",
         WindowsEdition.WINDOWS_8: "w8",
         WindowsEdition.WINDOWS_7: "w7",
@@ -557,7 +601,6 @@ def _choose_driver_plan(self, win_info: Dict[str, Any]) -> WindowsVirtioPlan:
         drivers_needed=drivers_needed,
     )
 
-    # Verbose plan logs (helps debug "why did it search w10 not w11?")
     logger.info(
         "Windows plan:"
         f" edition={plan.edition.value}"
@@ -571,8 +614,21 @@ def _choose_driver_plan(self, win_info: Dict[str, Any]) -> WindowsVirtioPlan:
 
 
 # ---------------------------
-# Driver discovery
+# Driver discovery (SYS + package (INF/CAT/...))
 # ---------------------------
+
+def _is_probably_driver_payload(p: Path) -> bool:
+    # conservative: copy only driver-ish payload files; avoid huge EXEs/MSIs unless user wants them
+    ext = p.suffix.lower()
+    if ext in (".inf", ".cat", ".sys", ".dll", ".exe", ".mui", ".dat", ".bin", ".ini"):
+        return True
+    return False
+
+
+def _find_package_dir_for_file(path: Path) -> Path:
+    # In virtio-win, sys/inf are typically in the same directory. Use parent.
+    return path.parent
+
 
 def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -> List[DriverFile]:
     """
@@ -580,18 +636,16 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
 
     IMPORTANT:
       - For STORAGE, we discover BOTH viostor and vioscsi (if present).
-      - Both will be set BOOT-start in registry edits, which prevents BSOD when controller differs.
-      - We now support Windows 11 by trying bucket fallbacks: w11 -> w10 -> w8 -> w7 -> ...
-      - We log *exactly* what we tried, so failures are diagnosable.
+      - Both will be set BOOT-start in registry edits.
+      - We support Win11 by trying bucket fallbacks.
+      - We *also* try to locate corresponding .inf in the same package directory.
     """
     logger = _safe_logger(self)
     drivers: List[DriverFile] = []
 
-    # Bucket candidates (Win11 fix): search multiple buckets rather than only plan.os_bucket
     buckets = _bucket_candidates(plan.edition)
 
-    # Common PCI IDs and class GUIDs for virtio devices.
-    # These are used in CriticalDeviceDatabase (boot-critical mapping).
+    # Common PCI IDs and class GUIDs for virtio devices (CDD mapping)
     storage_class_guid = "{4D36E967-E325-11CE-BFC1-08002BE10318}"  # SCSIAdapter
     net_class_guid = "{4D36E972-E325-11CE-BFC1-08002BE10318}"      # Net
     balloon_class_guid = "{4D36E97D-E325-11CE-BFC1-08002BE10318}"  # System
@@ -601,10 +655,10 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "viostor",
                 "pattern": "viostor/{bucket}/{arch}/viostor.sys",
+                "inf_hint": "viostor.inf",
                 "service": "viostor",
                 "start": DriverStartType.BOOT,
                 "pci_ids": [
-                    # virtio-blk variants
                     "pci#ven_1af4&dev_1001&subsys_00081af4",
                     "pci#ven_1af4&dev_1042&subsys_00081af4",
                 ],
@@ -613,10 +667,10 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "vioscsi",
                 "pattern": "vioscsi/{bucket}/{arch}/vioscsi.sys",
+                "inf_hint": "vioscsi.inf",
                 "service": "vioscsi",
                 "start": DriverStartType.BOOT,
                 "pci_ids": [
-                    # virtio-scsi variants
                     "pci#ven_1af4&dev_1004&subsys_00081af4",
                     "pci#ven_1af4&dev_1048&subsys_00081af4",
                 ],
@@ -627,6 +681,7 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "NetKVM",
                 "pattern": "NetKVM/{bucket}/{arch}/netkvm.sys",
+                "inf_hint": "netkvm.inf",
                 "service": "netkvm",
                 "start": DriverStartType.AUTO,
                 "pci_ids": [
@@ -640,6 +695,7 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "Balloon",
                 "pattern": "Balloon/{bucket}/{arch}/balloon.sys",
+                "inf_hint": "balloon.inf",
                 "service": "balloon",
                 "start": DriverStartType.AUTO,
                 "pci_ids": [
@@ -653,6 +709,7 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "viogpudo",
                 "pattern": "viogpudo/{bucket}/{arch}/viogpudo.sys",
+                "inf_hint": "viogpudo.inf",
                 "service": "viogpudo",
                 "start": DriverStartType.MANUAL,
                 "pci_ids": ["pci#ven_1af4&dev_1050&subsys_11001af4"],
@@ -663,6 +720,7 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "vioinput",
                 "pattern": "vioinput/{bucket}/{arch}/vioinput.sys",
+                "inf_hint": "vioinput.inf",
                 "service": "vioinput",
                 "start": DriverStartType.MANUAL,
                 "pci_ids": ["pci#ven_1af4&dev_1052&subsys_11001af4"],
@@ -673,6 +731,7 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             {
                 "name": "virtiofs",
                 "pattern": "virtiofs/{bucket}/{arch}/virtiofs.sys",
+                "inf_hint": "virtiofs.inf",
                 "service": "virtiofs",
                 "start": DriverStartType.SYSTEM,
                 "pci_ids": ["pci#ven_1af4&dev_105a&subsys_11001af4"],
@@ -681,14 +740,13 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
         ],
     }
 
-    # We try multiple layouts; virtio-win directory structures vary.
-    # Added patterns are additive and harmless.
+    # Layout variations (additive)
     search_patterns = [
         "{pattern}",                       # canonical
-        "{driver}/{bucket}/{arch}/*.sys",   # sometimes sys name differs, pick the first
+        "{driver}/{bucket}/{arch}/*.sys",   # sys name differs
         "{driver}/{arch}/*.sys",            # bucket-less
-        "{driver}/*/{arch}/*.sys",          # nested unknown bucket folder
-        "{driver}/*/*/{arch}/*.sys",        # deeper nesting seen in some packs
+        "{driver}/*/{arch}/*.sys",          # unknown bucket folder
+        "{driver}/*/*/{arch}/*.sys",        # deeper nesting
     ]
 
     logger.info("Discovering VirtIO drivers...")
@@ -697,20 +755,30 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
     logger.info(f"Bucket candidates: {buckets}")
     logger.debug(f"Driver types requested: {sorted([d.value for d in plan.drivers_needed])}")
 
-    # Helper: try a candidate path (direct or glob)
-    def _try_candidate(pat: str) -> Optional[Path]:
-        candidate = drivers_dir / pat
-        if "*" in pat:
-            try:
-                matches = sorted(candidate.parent.glob(candidate.name))
-                matches = [m for m in matches if m.is_file()]
-                if matches:
-                    return matches[0]
-            except Exception:
-                return None
+    def _try_candidate_glob(pat: str) -> Optional[Path]:
+        # pat is relative to drivers_dir
+        try:
+            matches = sorted(drivers_dir.glob(pat))
+            matches = [m for m in matches if m.is_file()]
+            if matches:
+                return matches[0]
+        except Exception:
             return None
-        if candidate.exists() and candidate.is_file():
-            return candidate
+        return None
+
+    def _find_inf_near_sys(sys_path: Path, inf_hint: Optional[str]) -> Optional[Path]:
+        pkg = sys_path.parent
+        try:
+            if inf_hint:
+                cand = pkg / inf_hint
+                if cand.exists() and cand.is_file():
+                    return cand
+            # fallback: first .inf in same directory
+            infs = sorted([p for p in pkg.glob("*.inf") if p.is_file()])
+            if infs:
+                return infs[0]
+        except Exception:
+            return None
         return None
 
     for driver_type in plan.drivers_needed:
@@ -724,13 +792,11 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             service = cfg["service"]
             found = False
 
-            # TRY BUCKETS IN ORDER (Win11 fix)
             for bucket in buckets:
                 if found:
                     break
 
                 for tmpl in search_patterns:
-                    # Render pattern with this bucket
                     canonical = cfg["pattern"].format(bucket=bucket, arch=plan.arch_dir)
                     pat = tmpl.format(
                         pattern=canonical,
@@ -739,10 +805,13 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
                         arch=plan.arch_dir,
                     )
 
-                    src = _try_candidate(pat)
+                    src = _try_candidate_glob(pat)
                     if src is None:
                         logger.debug(f"Not found: type={driver_type.value} name={driver_name} bucket={bucket} pat={pat}")
                         continue
+
+                    infp = _find_inf_near_sys(src, cfg.get("inf_hint"))
+                    pkg_dir = _find_package_dir_for_file(src)
 
                     drivers.append(
                         DriverFile(
@@ -754,14 +823,19 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
                             service_name=service,
                             pci_ids=list(cfg["pci_ids"]),
                             class_guid=cfg["class_guid"],
+                            package_dir=pkg_dir,
+                            inf_path=infp,
+                            bucket_used=bucket,
+                            match_pattern=pat,
                         )
                     )
                     logger.info(f"Found {driver_type.value} driver: {driver_name} bucket={bucket} -> {src}")
+                    if infp:
+                        logger.info(f" - INF: {infp}")
                     found = True
                     break
 
             if not found:
-                # IMPORTANT: storage missing means likely BSOD if VM switches controller types.
                 lvl = logging.WARNING if driver_type == DriverType.STORAGE else logging.INFO
                 logger.log(
                     lvl,
@@ -772,7 +846,6 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
                     f" buckets_tried={buckets}",
                 )
 
-    # Safety: log what we found, and warn if storage incomplete
     logger.info(f"Driver discovery complete: {len(drivers)} driver(s) found.")
     found_storage = sorted([d.service_name for d in drivers if d.type == DriverType.STORAGE])
     if not found_storage:
@@ -794,6 +867,7 @@ def _discover_virtio_drivers(self, drivers_dir: Path, plan: WindowsVirtioPlan) -
             f" dest={d.dest_name}"
             f" start={d.start_type.value}"
             f" pci_ids={len(d.pci_ids)}"
+            f" bucket={d.bucket_used}"
         )
 
     return drivers
@@ -815,10 +889,6 @@ def _edit_windows_registry(
       - Create Services\\<driver> keys with correct Types/Start/ImagePath/Group
       - Add CriticalDeviceDatabase entries for STORAGE drivers
       - Remove StartOverride keys that frequently disable boot drivers
-
-    Why this prevents BSOD:
-      - When Windows boots, it needs a working storage miniport *before* it can mount C:\\.
-      - CriticalDeviceDatabase + BOOT start ensures Windows binds the right driver early.
     """
     logger = _safe_logger(self)
     dry_run = getattr(self, "dry_run", False)
@@ -867,7 +937,15 @@ def _edit_windows_registry(
             if cur is None or "value" not in cur:
                 raise RuntimeError("SYSTEM hive missing Select\\Current value")
 
-            current_set = int.from_bytes(cur["value"], "little")
+            # IMPORTANT: slice to 4 bytes to avoid weirdness
+            cur_raw = cur["value"]
+            if isinstance(cur_raw, (bytes, bytearray)) and len(cur_raw) >= 4:
+                current_set = int.from_bytes(cur_raw[:4], "little", signed=False)
+            elif isinstance(cur_raw, int):
+                current_set = int(cur_raw)
+            else:
+                current_set = 1
+
             cs_name = f"ControlSet{current_set:03d}"
             logger.info(f"Using control set: {cs_name}")
 
@@ -883,11 +961,6 @@ def _edit_windows_registry(
             services = _ensure_child(h, control_set, "Services")
 
             # ---- Create / update Services\\<driver> entries ----
-            # More Windows-correct values than "minimal":
-            #   Type=1 (kernel driver)
-            #   Start=0 for storage (BOOT), others as requested
-            #   Group="SCSI miniport" for storage (more correct for miniports)
-            #   ImagePath uses system32\\drivers\\<sys> (REG_SZ UTF-16LE)
             for drv in drivers:
                 try:
                     svc = h.node_get_child(services, drv.service_name)
@@ -900,13 +973,11 @@ def _edit_windows_registry(
                     _set_dword(h, svc, "Type", 1)         # SERVICE_KERNEL_DRIVER
                     _set_dword(h, svc, "ErrorControl", 1) # normal error handling
 
-                    # Storage must be BOOT to avoid INACCESSIBLE_BOOT_DEVICE.
                     start = drv.start_type.value
                     if drv.type == DriverType.STORAGE:
                         start = DriverStartType.BOOT.value
                     _set_dword(h, svc, "Start", start)
 
-                    # Group: storage is a SCSI miniport, network is NDIS, others bus extender-ish.
                     if drv.type == DriverType.STORAGE:
                         group = "SCSI miniport"
                     elif drv.type == DriverType.NETWORK:
@@ -914,11 +985,11 @@ def _edit_windows_registry(
                     else:
                         group = "System Bus Extender"
 
+                    # Use canonical ImagePath style
                     _set_sz(h, svc, "Group", group)
-                    _set_sz(h, svc, "ImagePath", fr"system32\drivers\{drv.dest_name}")
+                    _set_sz(h, svc, "ImagePath", fr"\SystemRoot\System32\drivers\{drv.dest_name}")
                     _set_sz(h, svc, "DisplayName", drv.service_name)
 
-                    # StartOverride is a common reason boot drivers don't load.
                     removed = _delete_child_if_exists(h, svc, "StartOverride")
                     if removed:
                         logger.info(f"Removed StartOverride: Services\\{drv.service_name}\\StartOverride")
@@ -930,7 +1001,7 @@ def _edit_windows_registry(
                             "type": drv.type.value,
                             "start": start,
                             "group": group,
-                            "image": fr"system32\drivers\{drv.dest_name}",
+                            "image": fr"\SystemRoot\System32\drivers\{drv.dest_name}",
                             "action": action,
                         }
                     )
@@ -941,7 +1012,6 @@ def _edit_windows_registry(
                     results["errors"].append(msg)
 
             # ---- CriticalDeviceDatabase for storage ----
-            # Ensures boot-time binding of PCI device -> Service.
             control = _ensure_child(h, control_set, "Control")
             cdd = _ensure_child(h, control, "CriticalDeviceDatabase")
 
@@ -959,7 +1029,6 @@ def _edit_windows_registry(
                         _set_sz(h, node, "Service", drv.service_name)
                         _set_sz(h, node, "ClassGUID", drv.class_guid)
 
-                        # Optional helpers: not always required, but can assist older builds.
                         _set_sz(h, node, "Class", "SCSIAdapter")
                         _set_sz(h, node, "DeviceDesc", drv.name)
 
@@ -980,7 +1049,7 @@ def _edit_windows_registry(
                 logger.info(f"Uploading modified SYSTEM hive back to guest: {hive_path}")
                 g.upload(str(local_hive), hive_path)
 
-                # Verify change by hash
+                # Verify by hash
                 with tempfile.TemporaryDirectory() as verify_tmp:
                     verify_path = Path(verify_tmp) / "SYSTEM_verify"
                     g.download(hive_path, str(verify_path))
@@ -1014,6 +1083,126 @@ def _edit_windows_registry(
             logger.error(msg)
             results["errors"].append(msg)
             return results
+
+
+def _edit_software_devicepath(
+    self,
+    g: guestfs.GuestFS,
+    software_hive_path: str,
+    append_path: str,
+) -> Dict[str, Any]:
+    """
+    Add append_path to:
+      HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DevicePath
+
+    This helps PnP find your staged drivers on first boot (offline-friendly).
+    """
+    logger = _safe_logger(self)
+    dry_run = getattr(self, "dry_run", False)
+
+    out: Dict[str, Any] = {
+        "success": False,
+        "dry_run": bool(dry_run),
+        "hive_path": software_hive_path,
+        "modified": False,
+        "original": None,
+        "new": None,
+        "errors": [],
+        "notes": [],
+    }
+
+    try:
+        if not g.is_file(software_hive_path):
+            out["errors"].append(f"SOFTWARE hive not found: {software_hive_path}")
+            return out
+    except Exception as e:
+        out["errors"].append(f"Failed to stat hive {software_hive_path}: {e}")
+        return out
+
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / "SOFTWARE"
+        try:
+            g.download(software_hive_path, str(local))
+            orig_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+
+            h = g.hivex_open(str(local), write=(0 if dry_run else 1))
+            root = h.root()
+
+            microsoft = h.node_get_child(root, "Microsoft")
+            if microsoft is None:
+                out["errors"].append("SOFTWARE hive missing Microsoft key")
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                return out
+
+            windows = h.node_get_child(microsoft, "Windows")
+            if windows is None:
+                out["errors"].append("SOFTWARE hive missing Microsoft\\Windows key")
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                return out
+
+            cv = h.node_get_child(windows, "CurrentVersion")
+            if cv is None:
+                out["errors"].append("SOFTWARE hive missing Microsoft\\Windows\\CurrentVersion key")
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                return out
+
+            cur = _hivex_read_sz(h, cv, "DevicePath") or r"%SystemRoot%\inf"
+            out["original"] = cur
+
+            # normalize: ensure semicolon-separated
+            parts = [p.strip() for p in cur.split(";") if p.strip()]
+            if append_path not in parts:
+                parts.append(append_path)
+            new = ";".join(parts)
+            out["new"] = new
+
+            if new != cur:
+                logger.info(f"Updating DevicePath: +{append_path}")
+                # DevicePath is typically REG_EXPAND_SZ
+                _set_expand_sz(h, cv, "DevicePath", new)
+                out["modified"] = True
+            else:
+                logger.info("DevicePath already contains staging path; no change needed")
+
+            if not dry_run:
+                h.hivex_commit(None)
+                h.hivex_close()
+                g.upload(str(local), software_hive_path)
+
+                # verify
+                with tempfile.TemporaryDirectory() as vtd:
+                    vlocal = Path(vtd) / "SOFTWARE_verify"
+                    g.download(software_hive_path, str(vlocal))
+                    new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
+                if new_hash != orig_hash:
+                    out["success"] = True
+                else:
+                    out["success"] = not out["modified"]
+            else:
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                out["success"] = True
+
+            out["notes"] += [
+                "DevicePath updated to help Windows PnP discover staged INF packages on first boot.",
+                "Value written as REG_EXPAND_SZ (UTF-16LE).",
+            ]
+            return out
+
+        except Exception as e:
+            out["errors"].append(f"DevicePath update failed: {e}")
+            return out
 
 
 # ---------------------------
@@ -1076,20 +1265,34 @@ def windows_bcd_actual_fix(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         logger.warning("No BCD stores found")
         return {"windows": True, "bcd": "no_bcd_store", "stores": found}
 
+    # Lightweight firmware mismatch hinting (no BCD edits offline)
+    notes: List[str] = [
+        "Offline-safe: backups created where possible.",
+        "Deep BCD edits need Windows tools (bcdedit/bootrec) inside Windows RE.",
+    ]
+    try:
+        has_uefi = any(found.get(k, {}).get("exists") for k in ("uefi_standard", "uefi_alternative", "uefi_fallback", "uefi_root"))
+        has_bios = found.get("bios", {}).get("exists")
+        if has_uefi and not has_bios:
+            notes.append("Hint: UEFI-style BCD present; ensure you boot the converted VM in UEFI mode.")
+        if has_bios and not has_uefi:
+            notes.append("Hint: BIOS-style BCD present; ensure you boot the converted VM in legacy BIOS mode.")
+        if has_bios and has_uefi:
+            notes.append("Hint: Both BIOS and UEFI BCD stores found; boot mode must match the installed Windows mode.")
+    except Exception:
+        pass
+
     return {
         "windows": True,
         "bcd": "found",
         "stores": found,
         "backups": backups,
-        "notes": [
-            "Offline-safe: backups created where possible.",
-            "Deep BCD edits need Windows tools (bcdedit/bootrec) inside Windows RE.",
-        ],
+        "notes": notes,
     }
 
 
 # ---------------------------
-# Public: VirtIO injection (rewritten with detailed logs)
+# Public: VirtIO injection (enhanced: stage INF packages + DevicePath)
 # ---------------------------
 
 def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
@@ -1100,23 +1303,20 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
       1) Validate inputs
       2) Detect Windows + locate Windows root
       3) Identify version/edition/bucket/arch
-      4) Discover host driver files (NOW: tries bucket fallbacks, Win11-aware)
+      4) Discover host driver files (bucket fallbacks, Win11-aware)
       5) Copy .sys into guest System32\\drivers
-      6) Edit SYSTEM hive:
+      6) Stage full driver packages (INF/CAT/...) into guest (C:\\vmdk2kvm\\drivers\\virtio\\...)
+      7) Edit SYSTEM hive:
            - Services entries (boot-safe)
            - CriticalDeviceDatabase entries (boot binding)
            - remove StartOverride
-      7) Return structured report data
-
-    Why BSOD happens and how this fixes it:
-      - When moving VMware -> KVM, storage controller model changes.
-      - Windows must load the matching boot storage driver before it can mount C:\\.
-      - We inject BOTH viostor + vioscsi and force BOOT start + CDD mapping.
+      8) Optionally update SOFTWARE\\DevicePath to include staged drivers path
+      9) Return structured report data
     """
     logger = _safe_logger(self)
     dry_run = getattr(self, "dry_run", False)
+    force_overwrite = bool(getattr(self, "force_virtio_overwrite", False))
 
-    # ---- Validate configuration ----
     virtio_dir = getattr(self, "virtio_drivers_dir", None)
     if not virtio_dir:
         logger.info("VirtIO inject: virtio_drivers_dir not set -> skip")
@@ -1127,7 +1327,6 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         logger.error(f"VirtIO inject: virtio_drivers_dir invalid: {drivers_dir}")
         return {"injected": False, "reason": "virtio_drivers_dir_not_found", "path": str(drivers_dir)}
 
-    # ---- Detect Windows ----
     if not is_windows(self, g):
         logger.info("VirtIO inject: guest is not Windows -> skip")
         return {"injected": False, "reason": "not_windows"}
@@ -1141,7 +1340,6 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         logger.error("VirtIO inject: could not locate Windows directory")
         return {"injected": False, "reason": "no_windows_root"}
 
-    # ---- Determine plan ----
     win_info = _windows_version_info(self, g)
     plan = _choose_driver_plan(self, win_info)
 
@@ -1151,7 +1349,6 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         f"arch={plan.arch_dir} bucket_hint={plan.os_bucket} edition={plan.edition.value}"
     )
 
-    # ---- Discover driver files on host (Win11-safe) ----
     drivers = _discover_virtio_drivers(self, drivers_dir, plan)
     if not drivers:
         logger.error("VirtIO inject: no drivers found under virtio_drivers_dir (cannot inject)")
@@ -1164,22 +1361,25 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
             "buckets_tried": _bucket_candidates(plan.edition),
         }
 
-    # ---- Copy into guest ----
     result: Dict[str, Any] = {
         "injected": False,
         "success": False,
         "dry_run": bool(dry_run),
+        "force_overwrite": bool(force_overwrite),
         "windows": win_info,
         "plan": _plan_to_dict(plan),
         "virtio_dir": str(drivers_dir),
         "windows_root": windows_root,
         "drivers_found": [d.to_dict() for d in drivers],
         "files_copied": [],
+        "packages_staged": [],
         "registry_changes": {},
+        "devicepath_changes": {},
         "warnings": [],
         "notes": [],
     }
 
+    # ---- Copy SYS into System32\drivers ----
     drivers_target_dir = f"{windows_root}/System32/drivers"
     logger.info(f"VirtIO inject: target dir inside guest: {drivers_target_dir}")
 
@@ -1195,31 +1395,33 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     for drv in drivers:
         dest_path = f"{drivers_target_dir}/{drv.dest_name}"
         try:
-            # If file already exists with same size, skip
+            src_size = drv.src_path.stat().st_size
+
             if g.is_file(dest_path):
-                try:
-                    existing_size = g.filesize(dest_path)
-                except Exception:
-                    existing_size = None
-                source_size = drv.src_path.stat().st_size
+                # Compare by sha256 (best-effort) unless force_overwrite
+                if not force_overwrite:
+                    try:
+                        guest_hash = _guest_sha256(g, dest_path)
+                        host_hash = hashlib.sha256(drv.src_path.read_bytes()).hexdigest()
+                        if guest_hash and guest_hash == host_hash:
+                            logger.info(f"VirtIO inject: already present: {drv.dest_name} (hash match), skipping")
+                            result["files_copied"].append(
+                                {
+                                    "name": drv.dest_name,
+                                    "action": "skipped",
+                                    "reason": "already_exists_same_hash",
+                                    "source": str(drv.src_path),
+                                    "destination": dest_path,
+                                    "size": src_size,
+                                    "type": drv.type.value,
+                                    "service": drv.service_name,
+                                }
+                            )
+                            continue
+                    except Exception:
+                        pass
 
-                if existing_size is not None and existing_size == source_size:
-                    logger.info(f"VirtIO inject: already present: {drv.dest_name} (size match), skipping")
-                    result["files_copied"].append(
-                        {
-                            "name": drv.dest_name,
-                            "action": "skipped",
-                            "reason": "already_exists_same_size",
-                            "source": str(drv.src_path),
-                            "destination": dest_path,
-                            "size": source_size,
-                        }
-                    )
-                    continue
-
-                logger.warning(
-                    f"VirtIO inject: overwriting {drv.dest_name}: guest_size={existing_size} host_size={source_size}"
-                )
+                logger.warning(f"VirtIO inject: overwriting {drv.dest_name} (force={force_overwrite})")
 
             if not dry_run:
                 g.upload(str(drv.src_path), dest_path)
@@ -1231,9 +1433,11 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
                     "action": "copied" if not dry_run else "dry_run",
                     "source": str(drv.src_path),
                     "destination": dest_path,
-                    "size": drv.src_path.stat().st_size,
+                    "size": src_size,
                     "type": drv.type.value,
                     "service": drv.service_name,
+                    "bucket_used": drv.bucket_used,
+                    "match_pattern": drv.match_pattern,
                 }
             )
 
@@ -1247,40 +1451,136 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         result["reason"] = "no_files_copied"
         return result
 
-    # ---- Registry edit ----
+    # ---- Stage full driver packages (INF/CAT/...) ----
+    # Guest path: C:\vmdk2kvm\drivers\virtio\<service>\...
+    staging_root = f"{windows_root}/vmdk2kvm/drivers/virtio"
+    # For DevicePath, use Windows-style variable
+    devicepath_append = r"%SystemRoot%\vmdk2kvm\drivers\virtio"
+
+    def _guest_mkdir_p(path: str) -> None:
+        try:
+            if not g.is_dir(path):
+                if not dry_run:
+                    g.mkdir_p(path)
+        except Exception:
+            if not dry_run:
+                g.mkdir_p(path)
+
+    logger.info(f"VirtIO stage: staging root: {staging_root}")
+    try:
+        _guest_mkdir_p(staging_root)
+    except Exception as e:
+        msg = f"VirtIO stage: failed to create staging root: {e}"
+        logger.warning(msg)
+        result["warnings"].append(msg)
+
+    for drv in drivers:
+        if not drv.package_dir or not drv.package_dir.exists():
+            continue
+
+        # Put each driver package under its service name to avoid collisions
+        guest_pkg_dir = f"{staging_root}/{drv.service_name}"
+        try:
+            _guest_mkdir_p(guest_pkg_dir)
+        except Exception as e:
+            msg = f"VirtIO stage: cannot create {guest_pkg_dir}: {e}"
+            logger.warning(msg)
+            result["warnings"].append(msg)
+            continue
+
+        staged_files: List[Dict[str, Any]] = []
+        try:
+            # Copy only driver-ish payload; keep it small & relevant
+            payload = sorted([p for p in drv.package_dir.iterdir() if p.is_file() and _is_probably_driver_payload(p)])
+            if not payload:
+                continue
+
+            for p in payload:
+                gp = f"{guest_pkg_dir}/{p.name}"
+                try:
+                    if not dry_run:
+                        g.upload(str(p), gp)
+                    staged_files.append({"name": p.name, "source": str(p), "dest": gp, "size": p.stat().st_size})
+                except Exception as e:
+                    result["warnings"].append(f"VirtIO stage: upload failed {p} -> {gp}: {e}")
+
+            if staged_files:
+                logger.info(f"VirtIO stage: staged {len(staged_files)} file(s) for {drv.service_name} -> {guest_pkg_dir}")
+                result["packages_staged"].append(
+                    {
+                        "service": drv.service_name,
+                        "type": drv.type.value,
+                        "package_dir": str(drv.package_dir),
+                        "inf": str(drv.inf_path) if drv.inf_path else None,
+                        "guest_dir": guest_pkg_dir,
+                        "files": staged_files,
+                    }
+                )
+
+        except Exception as e:
+            result["warnings"].append(f"VirtIO stage: failed staging package for {drv.service_name}: {e}")
+
+    # ---- Registry edit (SYSTEM) ----
     registry_path = f"{windows_root}/System32/config/SYSTEM"
     logger.info(f"VirtIO inject: editing registry hive: {registry_path}")
 
     try:
         reg_res = _edit_windows_registry(self, g, registry_path, drivers, plan)
         result["registry_changes"] = reg_res
-
-        if reg_res.get("success"):
-            result["injected"] = True
-            result["success"] = True
-            logger.info("VirtIO inject: SUCCESS (files + registry)")
-        else:
-            result["injected"] = False
-            result["success"] = False
-            result["reason"] = "registry_update_failed"
-            logger.warning("VirtIO inject: files copied but registry update failed")
-
     except Exception as e:
         msg = f"VirtIO inject: registry exception: {e}"
         logger.error(msg)
-        result["injected"] = False
-        result["success"] = False
-        result["reason"] = "registry_exception"
-        result["registry_changes"] = {"error": str(e)}
+        result["registry_changes"] = {"success": False, "error": str(e)}
         result["warnings"].append(msg)
 
+    # ---- DevicePath update (SOFTWARE) to help PnP find staged INFs ----
+    # This is additive; failures shouldn't block storage boot.
+    try:
+        software_hive = f"{windows_root}/System32/config/SOFTWARE"
+        # Only attempt if we staged anything
+        if result["packages_staged"]:
+            logger.info(f"VirtIO inject: updating SOFTWARE DevicePath to include: {devicepath_append}")
+            dp_res = _edit_software_devicepath(self, g, software_hive, devicepath_append)
+            result["devicepath_changes"] = dp_res
+        else:
+            result["devicepath_changes"] = {"skipped": True, "reason": "no_packages_staged"}
+    except Exception as e:
+        result["devicepath_changes"] = {"success": False, "error": str(e)}
+        result["warnings"].append(f"DevicePath update failed: {e}")
+
+    # ---- Success criteria ----
+    sys_ok = any(x.get("action") in ("copied", "dry_run", "skipped") for x in result["files_copied"])
+    reg_ok = bool(result.get("registry_changes", {}).get("success"))
+    if sys_ok and reg_ok:
+        result["injected"] = True
+        result["success"] = True
+        logger.info("VirtIO inject: SUCCESS (SYS + registry); packages staged for PnP assist")
+    else:
+        result["injected"] = False
+        result["success"] = False
+        if not reg_ok:
+            result["reason"] = "registry_update_failed"
+            logger.warning("VirtIO inject: SYS copied but registry update failed")
+        else:
+            result["reason"] = "sys_copy_failed"
+            logger.warning("VirtIO inject: registry ok but sys copy did not succeed")
+
     # ---- Final notes / guidance ----
+    storage_found = sorted({d.service_name for d in drivers if d.type == DriverType.STORAGE})
+    storage_missing: List[str] = []
+    if "viostor" not in storage_found:
+        storage_missing.append("viostor")
+    if "vioscsi" not in storage_found:
+        storage_missing.append("vioscsi")
+
     result["notes"] += [
         "Storage: attempts to inject BOTH viostor + vioscsi (if present) and force BOOT start.",
-        "Registry: strings written as UTF-16LE REG_SZ (Windows-correct).",
+        "Registry: strings written as UTF-16LE; ImagePath set to \\SystemRoot\\System32\\drivers\\<sys>.",
         "Registry: StartOverride removed when found (can silently disable boot drivers).",
         "CDD: CriticalDeviceDatabase populated for virtio storage PCI IDs to ensure early binding.",
         f"Driver discovery bucket candidates: {_bucket_candidates(plan.edition)}",
+        f"Storage drivers found: {storage_found} missing: {storage_missing}",
+        "Staging: INF/CAT/etc staged under %SystemRoot%\\vmdk2kvm\\drivers\\virtio to help PnP on first boot.",
         "Best practice: attach virtio-win ISO for first boot so Windows can stage INFs properly.",
         "If BSOD persists, ensure the VM disk/controller model matches injected drivers (virtio-blk vs virtio-scsi).",
         "Also ensure firmware mode matches install (BIOS vs UEFI) and BCD points to the right loader.",
