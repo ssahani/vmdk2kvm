@@ -1,8 +1,8 @@
-### Comprehensive CLI Reference for `vmdk2kvm.py`
+### Comprehensive CLI Reference 
 
-`vmdk2kvm.py` is a practical, production-minded tool for converting VMware VMDK images into KVM/QEMU-friendly formats (qcow2/raw/vdi) while applying the *real fixes that usually break migrations*: unstable `/etc/fstab` by-path entries, bootloader root= mismatches, initramfs regeneration needs, VMware tools removal, Windows virtio enablement, and “prove it boots” smoke tests.
+`vmdk2kvm.py` is a production-minded tool for converting VMware workloads into KVM/QEMU-friendly disk images (qcow2/raw/vdi) while applying the fixes that actually make migrations succeed: stable `/etc/fstab`, bootloader/root= alignment, initramfs regeneration, VMware tools cleanup, Windows virtio enablement, plus “prove it boots” smoke tests.
 
-This document is an **interface contract** for the CLI as implemented by `build_parser()`. It **keeps the existing arguments exactly** (no new flags invented), but improves clarity, structure, and correctness.
+This document is the **interface contract** for the CLI as implemented by your **current `build_parser()` + YAML-driven validator**. It **does not add new flags**. It’s written fresh for the new model: **config selects the operation**, CLI optionally overrides.
 
 ---
 
@@ -10,307 +10,406 @@ This document is an **interface contract** for the CLI as implemented by `build_
 
 ### Config-first, automation-friendly
 
-* **Two-phase parse**: config files can satisfy required args (because defaults are applied before the final parse).
-* **Repeatable `--config` merge**: later files override earlier files, enabling clean “base + override” patterns.
+* **Operation selection lives in config**: `cmd` determines what the run does.
+* **Two-phase parse**: configs are loaded/merged first, applied as argparse defaults, then the final parse happens.
+* **Repeatable `--config` merge**: later files override earlier files cleanly (base + overrides).
 
-### Safety is a feature, not a footnote
+### Safety is a feature
 
-* **Dry-run** to preview behavior without writes.
-* **Backups** (unless explicitly disabled) to reduce “one bad run ruined the guest” risk.
-* **Recovery checkpoints** for long-running operations.
-* **Reports** for auditability and repeatable migrations.
+* Dry-run support.
+* Backups (unless explicitly disabled).
+* Recovery checkpoints for long operations.
+* Reports for auditability.
 
-### “Works in the mess”
+### Works in the mess
 
-* Designed around real VMware → KVM pain: snapshot chains, by-path device naming, mixed filesystems, boot plumbing, Windows storage drivers, and verification.
-
----
-
-## Quick Start
-
-### Local VMDK → qcow2 with fixes + compression
-
-```bash
-sudo ./vmdk2kvm.py -v --output-dir ./out local \
-  --vmdk /path/to/vm.vmdk \
-  --flatten \
-  --to-output vm-fixed.qcow2 \
-  --compress --compress-level 6 \
-  --checksum \
-  --fstab-mode stabilize-all \
-  --regen-initramfs \
-  --remove-vmware-tools
-```
-
-### Dry-run preview (no writes)
-
-```bash
-sudo ./vmdk2kvm.py -vv --dry-run --print-fstab local \
-  --vmdk /path/to/vm.vmdk \
-  --flatten
-```
-
-### Config-driven run (merging base + overrides)
-
-```bash
-sudo ./vmdk2kvm.py --config base.yaml --config overrides.yaml local
-```
+Designed for real VMware → KVM pain: snapshot chains, unstable by-path naming, boot plumbing, mixed distros, Windows storage enablement, and verification.
 
 ---
 
-## Global Options
+## How to Run (New Model)
 
-These apply across all subcommands unless otherwise noted.
+### Standard run (config chooses operation)
+
+```bash
+sudo python vmdk2kvm.py --config job.yaml
+```
+
+### Merge configs (base + overrides)
+
+```bash
+sudo python vmdk2kvm.py --config base.yaml --config override.yaml
+```
+
+### Override a knob from CLI (config still drives the run)
+
+```bash
+sudo python vmdk2kvm.py --config job.yaml --output-dir /var/tmp/out -vv
+```
+
+### Inspect merged config (does not require cmd)
+
+```bash
+sudo python vmdk2kvm.py --config job.yaml --dump-config
+```
+
+### Inspect final parsed args (requires cmd because validation runs)
+
+```bash
+sudo python vmdk2kvm.py --config job.yaml --dump-args
+```
+
+---
+
+## Required Config Keys
+
+### `cmd`
+
+Every run must specify a command via config (or via CLI `--cmd` override):
+
+* **Config key:** `cmd`
+* **CLI override:** `--cmd`
+
+Supported `cmd` values enforced by `validate_args()`:
+
+* `local`
+* `fetch-and-fix`
+* `ova`
+* `ovf`
+* `vhd`
+* `ami`
+* `live-fix`
+* `vsphere`
+* `daemon`
+* `generate-systemd`
+
+### `vs_action` (only when `cmd: vsphere`)
+
+vSphere mode requires:
+
+* **Config key:** `vs_action`
+* **CLI override:** `--vs-action`
+
+---
+
+## Quick Start Examples (Config-Driven)
+
+### 1) Local VMDK → qcow2 with fixes + compression (recommended)
+
+**job.yaml**
+
+```yaml
+cmd: local
+vmdk: /path/to/vm.vmdk
+
+output_dir: ./out
+flatten: true
+to_output: vm-fixed.qcow2
+out_format: qcow2
+compress: true
+compress_level: 6
+checksum: true
+
+fstab_mode: stabilize-all
+regen_initramfs: true
+remove_vmware_tools: true
+print_fstab: true
+
+verbose: 1
+report: ./out/report.md
+```
+
+Run:
+
+```bash
+sudo python vmdk2kvm.py --config job.yaml
+```
+
+### 2) Dry-run preview (no writes)
+
+```bash
+sudo python vmdk2kvm.py --config job.yaml --dry-run -vv
+```
+
+### 3) Base + override
+
+```bash
+sudo python vmdk2kvm.py --config base.yaml --config rhel10.yaml
+```
+
+---
+
+## Global Options (CLI flags)
+
+These flags exist on the CLI and can also be supplied via config using their argparse dest names (same spelling with underscores).
 
 ### Configuration & introspection
 
-* `--config` *(repeatable, default: `[]`)*
-  YAML/JSON config file(s). Later files override earlier files.
-  Example: `--config base.yaml --config overrides.yaml`
+* `--config` *(repeatable, default `[]`)*
+  One or more YAML/JSON config files. Later overrides earlier.
 
 * `--dump-config` *(store_true)*
-  Print merged normalized config as JSON and exit.
+  Print merged normalized config and exit.
 
 * `--dump-args` *(store_true)*
-  Print final parsed args as JSON and exit.
+  Print parsed args and exit.
 
 * `--version`
-  Print tool version and exit.
+  Print version and exit.
 
 ### Logging & verbosity
 
-* `-v, --verbose` *(count, default: 0)*
-  Increase verbosity (`-v` / `-vv`).
+* `-v, --verbose` *(count, default 0)*
+  Increase verbosity (`-v`, `-vv`).
 
-* `--log-file` *(default: None)*
+* `--log-file` *(default None)*
   Write logs to a file.
 
-### Paths & general behavior
+### Operation selection (new project control)
 
-* `--output-dir` *(default: `./out`)*
-  Root output directory for generated artifacts and outputs.
+* `--cmd` *(default None)*
+  Operation mode. Normally comes from config `cmd`.
 
-* `--workdir` *(default: None)*
-  Intermediate working directory (defaults to `<output-dir>/work`).
+* `--vs-action` *(default None)*
+  vSphere action. Normally comes from config `vs_action`.
+
+### Paths & behavior
+
+* `--output-dir` *(default `./out`)*
+  Root output directory.
+
+* `--workdir` *(default None)*
+  Working directory (implementation uses `<output-dir>/work` if unset).
 
 * `--dry-run` *(store_true)*
-  Preview actions without making modifications.
-
-### Safety controls
+  Do not modify guest/convert output.
 
 * `--no-backup` *(store_true)*
-  Skip backups of critical guest files (dangerous).
+  Skip backups inside guest.
 
 * `--print-fstab` *(store_true)*
-  Print `/etc/fstab` before/after (useful with dry-run).
+  Print `/etc/fstab` before+after.
 
-### Flatten & conversion outputs
+---
+
+## Flatten & Conversion Outputs
 
 * `--flatten` *(store_true)*
-  Flatten snapshot chains into a single working image first.
+  Flatten snapshot chain into a single working image first.
 
-* `--flatten-format` *(default: `qcow2`, choices: `qcow2|raw`)*
-  Format for the flattened intermediate image.
+* `--flatten-format` *(default `qcow2`, choices: `qcow2|raw`)*
+  Flatten output format.
 
-* `--to-output` *(default: None)*
-  Final output path (relative to `output_dir` if not absolute).
+* `--to-output` *(default None)*
+  Convert final working image to this path (relative to output-dir if not absolute).
 
-* `--out-format` *(default: `qcow2`, choices: `qcow2|raw|vdi`)*
-  Output image format.
+* `--out-format` *(default `qcow2`, choices: `qcow2|raw|vdi`)*
+  Final output format.
 
 * `--compress` *(store_true)*
-  Enable compression (qcow2 only).
+  Enable qcow2 compression.
 
-* `--compress-level` *(int 1–9, default: None)*
-  Compression level. (If your implementation defaults to 6 when unset, note that in code/docs consistently.)
+* `--compress-level` *(int 1–9, default None)*
+  Compression level.
 
 * `--checksum` *(store_true)*
-  Compute SHA256 checksum of output image.
+  Compute SHA256 checksum of output.
 
-### Guest fixes & policy knobs
+---
 
-* `--fstab-mode` *(default: `stabilize-all`, choices: `stabilize-all|bypath-only|noop`)*
-  How `/etc/fstab` is rewritten:
+## Fixing Behavior
 
-  * `stabilize-all`: rewrite mounts to stable identifiers (UUID/PARTUUID/LABEL)
-  * `bypath-only`: only fix `/dev/disk/by-path/*` style entries
-  * `noop`: do not modify
+* `--fstab-mode` *(choices from `FstabMode`, default `stabilize-all`)*
+  How `/etc/fstab` is rewritten.
 
 * `--no-grub` *(store_true)*
   Skip GRUB root= update and device.map cleanup.
 
-* `--regen-initramfs` / `--no-regen-initramfs` *(default: True)*
-  Enable/disable initramfs + grub regen (best-effort).
+* `--regen-initramfs` / `--no-regen-initramfs` *(default True)*
+  Enable/disable initramfs + grub regen (best effort).
 
 * `--remove-vmware-tools` *(store_true)*
-  Remove VMware tools (Linux guests only).
+  Remove VMware tools (Linux only).
 
-* `--cloud-init-config` *(default: None)*
-  Inject cloud-init config (YAML/JSON).
+* `--cloud-init-config` *(default None)*
+  Cloud-init config (YAML/JSON) to inject.
 
-* `--virtio-drivers-dir` *(default: None)*
-  Path to virtio-win drivers directory (Windows injection).
+* `--virtio-drivers-dir` *(default None)*
+  Path to virtio-win drivers directory for Windows injection.
 
-### Recovery, performance, and orchestration
+* `--resize` *(default None)*
+  Resize root filesystem (enlarge only, e.g. `+10G` or `50G`).
 
-* `--enable-recovery` *(store_true)*
-  Enable checkpoint recovery for long operations.
-
-* `--parallel-processing` *(store_true)*
-  Process multiple disks in parallel (implementation decides worker count).
-
-* `--resize` *(default: None)*
-  Resize root filesystem (enlarge only): `+10G` or `50G`.
-
-* `--report` *(default: None)*
-  Write Markdown report (relative to `output_dir` if not absolute).
-
-* `--use-v2v` *(store_true)*
-  Prefer virt-v2v conversion if available.
-
-* `--post-v2v` *(store_true)*
-  Run virt-v2v after internal fixes (workflow-dependent).
-
-### Testing knobs
-
-* `--libvirt-test` *(store_true)*
-  Libvirt smoke test after conversion.
-
-* `--qemu-test` *(store_true)*
-  QEMU smoke test after conversion.
-
-* `--vm-name` *(default: `converted-vm`)*
-  Libvirt VM name for test.
-
-* `--memory` *(int, default: 2048)*
-  Memory MiB for tests.
-
-* `--vcpus` *(int, default: 2)*
-  vCPU count for tests.
-
-* `--uefi` *(store_true)*
-  Use UEFI mode for tests (default BIOS otherwise).
-
-* `--timeout` *(int, default: 60)*
-  Timeout for libvirt state checks.
-
-* `--keep-domain` *(store_true)*
-  Keep libvirt domain after test.
-
-* `--headless` *(store_true)*
-  No graphics device for the libvirt test domain.
-
-### Daemon mode
-
-* `--daemon` *(store_true)*
-  Run in daemon mode.
-
-* `--watch-dir` *(default: None)*
-  Directory to watch in daemon mode.
+* `--report` *(default None)*
+  Write Markdown report.
 
 ---
 
-## Subcommands
+## Recovery, Performance, virt-v2v Knobs
 
-Subcommands define the top-level operation mode (`cmd`).
+* `--enable-recovery` *(store_true)*
+  Enable checkpoint recovery.
 
-### 1) `local` — Offline local VMDK conversion
+* `--parallel-processing` *(store_true)*
+  Process multiple disks in parallel.
 
-* `--vmdk` *(required)*
-  Local VMDK path (descriptor or monolithic/binary).
+* `--use-v2v` *(store_true)*
+  Use virt-v2v for conversion if available.
+
+* `--post-v2v` *(store_true)*
+  Run virt-v2v after internal fixes.
+
+* `--v2v-parallel` *(store_true)*
+  Run multiple virt-v2v jobs in parallel (experimental).
+
+* `--v2v-concurrency` *(int, default 2)*
+  Max concurrent virt-v2v jobs when `--v2v-parallel` is set.
+
+---
+
+## LUKS Knobs
+
+* `--luks-passphrase` *(default: env `VMDK2KVM_LUKS_PASSPHRASE`)*
+* `--luks-passphrase-env` *(default None)*
+* `--luks-keyfile` *(default None)*
+* `--luks-mapper-prefix` *(default `vmdk2kvm-crypt`)*
+* `--luks-enable` *(store_true)*
+
+---
+
+## Smoke Tests
+
+* `--libvirt-test` *(store_true)*
+* `--qemu-test` *(store_true)*
+* `--vm-name` *(default `converted-vm`)*
+* `--memory` *(int, default 2048 MiB)*
+* `--vcpus` *(int, default 2)*
+* `--uefi` *(store_true)*
+* `--timeout` *(int, default 60)*
+* `--keep-domain` *(store_true)*
+* `--headless` *(store_true)*
+
+---
+
+## Daemon Mode
+
+* `--daemon` *(store_true)*
+* `--watch-dir` *(default None)*
+
+(When running daemon-style, `cmd: daemon` should be set in config.)
+
+---
+
+## OVA/OVF Helper Knobs
+
+* `--log-virt-filesystems` *(store_true)*
+* `--ova-convert-to-qcow2` *(store_true)*
+* `--ova-qcow2-dir` *(default None)*
+* `--ova-convert-compress` *(store_true)*
+* `--ova-convert-compress-level` *(int 1–9, default None)*
+
+---
+
+## AMI / Cloud Tarball Helper Knobs
+
+* `--extract-nested-tar` / `--no-extract-nested-tar` *(default True)*
+* `--convert-payload-to-qcow2` *(store_true)*
+* `--payload-qcow2-dir` *(default None)*
+* `--payload-convert-compress` *(store_true)*
+* `--payload-convert-compress-level` *(int 1–9, default None)*
+
+---
+
+## Inputs (Selected by `cmd`)
+
+These are available globally and expected depending on `cmd`:
+
+### `cmd: local`
+
+* `--vmdk` *(required via config or CLI)*
 
 Example:
 
 ```bash
-sudo ./vmdk2kvm.py local --vmdk /path/to/vm.vmdk --flatten --to-output vm.qcow2
+sudo python vmdk2kvm.py --config job.yaml --vmdk /path/to/vm.vmdk
 ```
 
-### 2) `fetch-and-fix` — Fetch from ESXi over SSH/SCP + offline fix
-
-* `--host` *(required)*
-* `--user` *(default: root)*
-* `--port` *(default: 22)*
-* `--identity` *(default: None)*
-* `--ssh-opt` *(repeatable, default: None)*
-* `--remote` *(required)* Remote VMDK descriptor path
-* `--fetch-dir` *(default: None)* download destination
-* `--fetch-all` *(store_true)* fetch full snapshot descriptor chain
-
-Example:
-
-```bash
-sudo ./vmdk2kvm.py fetch-and-fix \
-  --host esxi.example.com --user root --remote /vmfs/volumes/ds/vm/vm.vmdk \
-  --fetch-all --flatten --to-output vm-fixed.qcow2
-```
-
-### 3) `ova` — Extract from OVA
+### `cmd: ova`
 
 * `--ova` *(required)*
 
-Example:
-
-```bash
-sudo ./vmdk2kvm.py ova --ova /path/to/appliance.ova --flatten --to-output appliance.qcow2
-```
-
-### 4) `ovf` — Parse OVF (disks in same directory)
+### `cmd: ovf`
 
 * `--ovf` *(required)*
 
-Example:
+### `cmd: vhd`
 
-```bash
-sudo ./vmdk2kvm.py ovf --ovf /path/to/appliance.ovf --flatten --to-output appliance.qcow2
-```
+* `--vhd` *(required)*
 
-### 5) `live-fix` — Apply fixes to a running VM over SSH
+### `cmd: ami`
+
+* `--ami` *(required)*
+
+### `cmd: fetch-and-fix`
+
+Requires SSH/SCP source:
 
 * `--host` *(required)*
-* `--user` *(default: root)*
-* `--port` *(default: 22)*
-* `--identity` *(default: None)*
-* `--ssh-opt` *(repeatable, default: None)*
-* `--sudo` *(store_true)* run remote commands with `sudo -n`
+* `--remote` *(required)*
 
-Example:
+Additional knobs:
 
-```bash
-sudo ./vmdk2kvm.py live-fix \
-  --host vm.example.com --user root --sudo \
-  --fstab-mode stabilize-all --regen-initramfs
-```
+* `--user` *(default root)*
+* `--port` *(default 22)*
+* `--identity`
+* `--ssh-opt` *(repeatable)*
+* `--fetch-dir`
+* `--fetch-all`
 
-### 6) `daemon` — Watch directory for new VMDKs
+### `cmd: live-fix`
 
-No extra subcommand args (uses globals like `--daemon`, `--watch-dir`, config).
+* `--host` *(required)*
 
-Example:
+Additional knobs:
 
-```bash
-sudo ./vmdk2kvm.py --daemon --watch-dir /incoming --config daemon.yaml daemon
-```
+* `--user` *(default root)*
+* `--port` *(default 22)*
+* `--identity`
+* `--ssh-opt` *(repeatable)*
+* `--sudo` *(store_true)*
 
-### 7) `generate-systemd` — Emit a systemd unit file
+---
 
-* `--output` *(default: None)* write to file or stdout
+## `cmd: generate-systemd`
 
-Example:
+* `--systemd-output` *(default None)*
+  Write unit file to path instead of stdout.
 
-```bash
-./vmdk2kvm.py generate-systemd --output /etc/systemd/system/vmdk2kvm.service
-```
+---
 
-### 8) `vsphere` — vSphere/vCenter actions (pyvmomi)
+## vSphere / vCenter (`cmd: vsphere`)
 
-**Important correctness note:** your current `build_parser()` uses a **nested subparser** (`vs_action`) under `vsphere`.
-That means the CLI shape is:
+### Connection flags (required)
 
-```bash
-vmdk2kvm.py vsphere [vCenter flags...] <vs_action> [action flags...]
-```
+* `--vcenter` *(required)*
+* `--vc-user` *(required)*
 
-…and the actions defined in the code you posted are:
+Credentials:
+
+* `--vc-password` *(optional)*
+* `--vc-password-env` *(optional)*
+
+TLS / URL:
+
+* `--vc-port` *(default 443)*
+* `--vc-insecure` *(store_true)*
+* `--dc-name` *(default `ha-datacenter`)*
+
+### Action selection
+
+In the new model, `vs_action` comes from config (or `--vs-action` override).
+
+Supported `vs_action` values in your parser:
 
 * `list_vm_names`
 * `get_vm_by_name`
@@ -322,125 +421,120 @@ vmdk2kvm.py vsphere [vCenter flags...] <vs_action> [action flags...]
 * `enable_cbt`
 * `query_changed_disk_areas`
 * `cbt_sync`
+* `download_only_vm`
+* `vddk_download_disk`
 
-vCenter connection flags:
+### Action-scoped flags (available globally)
 
-* `--vcenter` *(required)*
-* `--vc-user` *(required)*
-* `--vc-password` *(optional)*
-* `--vc-password-env` *(optional)*
-* `--vc-port` *(default 443)*
-* `--vc-insecure` *(store_true)*
-* `--dc-name` *(default: ha-datacenter)*
+* `--json` *(store_true)*
+* `--vm_name` → **mapped to dest `vm_name_vsphere`** in parser
+* `--name` → dest `name_vsphere`
+* `--label_or_index`
+* `--datastore`
+* `--ds_path`
+* `--local_path`
+* `--chunk_size`
 
-Examples:
+Snapshot/CBT:
 
-List VM names:
+* `--snapshot_name`
+* `--quiesce` / `--no_quiesce`
+* `--snapshot_memory`
+* `--description` → dest `snapshot_description`
+* `--enable_cbt`
+* `--device_key`
+* `--disk`
+* `--start_offset`
+* `--change_id`
 
-```bash
-./vmdk2kvm.py vsphere \
-  --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure \
-  list_vm_names --json
+Download-only:
+
+* `--vs_output_dir`
+
+### Required fields by action (enforced by validator)
+
+* Actions requiring a VM name:
+  `vm_disks`, `select_disk`, `download_vm_disk`, `cbt_sync`, `create_snapshot`,
+  `enable_cbt`, `query_changed_disk_areas`, `download_only_vm`, `vddk_download_disk`
+
+  * require `vm_name` (config or CLI `--vm_name`)
+
+* `get_vm_by_name`
+
+  * requires `name`
+
+* `select_disk`
+
+  * requires `label_or_index`
+
+* `download_datastore_file`
+
+  * requires `datastore`, `ds_path`, `local_path`
+
+* `download_vm_disk` / `vddk_download_disk` / `cbt_sync`
+
+  * requires `local_path`
+
+* `query_changed_disk_areas`
+
+  * requires `device_key` **or** `disk`
+
+### Example: list VM names (config-driven)
+
+**vs-list.yaml**
+
+```yaml
+cmd: vsphere
+vs_action: list_vm_names
+
+vcenter: vcenter.example.com
+vc_user: administrator@vsphere.local
+vc_password_env: VC_PASSWORD
+vc_insecure: true
+
+json: true
+verbose: 1
 ```
 
-Download a VM disk by index:
+Run:
 
 ```bash
-./vmdk2kvm.py vsphere \
-  --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure \
-  download_vm_disk --vm_name myVM --disk 0 --local_path ./downloads/myVM-disk0.vmdk
+sudo python vmdk2kvm.py --config vs-list.yaml
 ```
 
-Create a quiesced snapshot:
+### Example: download a VM disk
 
-```bash
-./vmdk2kvm.py vsphere \
-  --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure \
-  create_snapshot --vm_name myVM --name vmdk2kvm-pre-migration --quiesce --description "Created by vmdk2kvm"
+**vs-dl.yaml**
+
+```yaml
+cmd: vsphere
+vs_action: download_vm_disk
+
+vcenter: vcenter.example.com
+vc_user: administrator@vsphere.local
+vc_password_env: VC_PASSWORD
+vc_insecure: true
+
+vm_name: myVM
+disk: "0"
+local_path: ./downloads/myVM-disk0.vmdk
+chunk_size: 1048576
+json: true
 ```
 
-Query CBT changed areas:
+Run:
 
 ```bash
-./vmdk2kvm.py vsphere \
-  --vcenter vcenter.example.com --vc-user administrator@vsphere.local --vc-password-env VC_PASSWORD --vc-insecure \
-  query_changed_disk_areas --vm_name myVM --snapshot_name vmdk2kvm-cbt --disk 0 --start_offset 0 --change_id "*" --json
-```
-
----
-
-## Complete Example Use Cases
-
-### Basic local conversion + safety + report
-
-```bash
-sudo ./vmdk2kvm.py -v --output-dir ./out --report report.md local \
-  --vmdk /path/to/vm.vmdk \
-  --flatten \
-  --to-output vm-fixed.qcow2 \
-  --compress --compress-level 6 \
-  --checksum \
-  --fstab-mode stabilize-all \
-  --regen-initramfs \
-  --remove-vmware-tools
-```
-
-### Dry-run inspection
-
-```bash
-sudo ./vmdk2kvm.py -vv --dry-run --print-fstab local --vmdk /path/to/vm.vmdk
-```
-
-### Fetch from ESXi + full chain flatten + test
-
-```bash
-sudo ./vmdk2kvm.py -vv fetch-and-fix \
-  --host esxi.example.com --user root --remote /vmfs/volumes/ds/vm/vm.vmdk --fetch-all \
-  --flatten --to-output esxi-fixed.qcow2 \
-  --libvirt-test --vm-name esxi-test --uefi --timeout 120 --headless
-```
-
-### Live-fix over SSH (sudo)
-
-```bash
-sudo ./vmdk2kvm.py -v live-fix \
-  --host vm.example.com --user root --sudo \
-  --fstab-mode stabilize-all --regen-initramfs --remove-vmware-tools
-```
-
-### OVA / OVF extraction
-
-```bash
-sudo ./vmdk2kvm.py ova --ova /path/to/appliance.ova --flatten --to-output appliance.qcow2
-sudo ./vmdk2kvm.py ovf --ovf /path/to/appliance.ovf --flatten --to-output appliance.qcow2
-```
-
-### Daemon mode (watch directory)
-
-```bash
-sudo ./vmdk2kvm.py --daemon --watch-dir /incoming --config daemon.yaml daemon
-```
-
-### Post-conversion verification with QEMU
-
-```bash
-sudo ./vmdk2kvm.py local --vmdk /path/to/vm.vmdk --to-output vm.qcow2 --qemu-test --memory 4096 --vcpus 4 --uefi
+sudo python vmdk2kvm.py --config vs-dl.yaml
 ```
 
 ---
 
 ## Dependency Notes (practical)
 
-* Core runtime expectations: Python 3, `qemu-img`, `libguestfs`
-* Config: PyYAML (if YAML configs used)
-* Daemon mode: watchdog
-* vSphere: pyvmomi (and possibly requests for certain download flows depending on implementation)
+* Needs Python 3
+* Conversion pipeline typically expects: `qemu-img`, `libguestfs`
+* YAML configs require PyYAML
+* vSphere mode requires pyvmomi (and any HTTP libs your implementation uses)
 
 ---
-
-## Small doc hygiene tweaks you should keep
-
-* Fix the typo in the option list: `--uefi"` → `--uefi`
-* Keep the vSphere section aligned with your actual argparse shape (**nested `vs_action` subcommands**, not a single `--action` flag)
-
-This doc is now “ship it” quality: structured like a real CLI reference, consistent terminology, and—crucially—aligned with the code you posted so users don’t get betrayed by the interface.
