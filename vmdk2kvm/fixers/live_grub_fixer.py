@@ -1,48 +1,39 @@
+# vmdk2kvm/fixers/live_fixer.py
 from __future__ import annotations
 
 import logging
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.utils import U
 from ..ssh.ssh_client import SSHClient
+from .live_grub_fixer import LiveGrubFixer
 
 
-@dataclass
-class LiveGrubFixReport:
-    distro: str = ""
-    root_source: str = ""
-    stable_root: str = ""
-    removed_device_maps: List[str] = None  # type: ignore
-    updated_default_grub: bool = False
-    updated_files: List[str] = None  # type: ignore
-    commands_ran: List[Dict[str, str]] = None  # type: ignore
-    warnings: List[str] = None  # type: ignore
-    errors: List[str] = None  # type: ignore
-
-    def __post_init__(self) -> None:
-        if self.removed_device_maps is None:
-            self.removed_device_maps = []
-        if self.updated_files is None:
-            self.updated_files = []
-        if self.commands_ran is None:
-            self.commands_ran = []
-        if self.warnings is None:
-            self.warnings = []
-        if self.errors is None:
-            self.errors = []
+@dataclass(frozen=True)
+class LiveFixerOptions:
+    dry_run: bool
+    no_backup: bool
+    print_fstab: bool
+    update_grub: bool
+    regen_initramfs: bool
+    remove_vmware_tools: bool = False
 
 
-class LiveGrubFixer:
+class LiveFixer:
     """
-    LIVE GRUB fix via SSH (enhanced, safer, more distro-aware):
+    Live fix via SSH:
 
-      - remove stale device.map (only if it contains legacy disk names like sda/vda/hda)
-      - update root= in /etc/default/grub (best effort; handles root=UUID=/PARTUUID=/LABEL= or /dev/*)
-      - regen initramfs + grub config with distro detection + fallbacks
-      - optional post-checks: verify grub.cfg contains root=stable_root (best effort)
+      - Rewrite /etc/fstab: /dev/disk/by-path/* -> UUID=/PARTUUID=/LABEL=/PARTLABEL= (best-effort)
+      - Optionally remove VMware tools (best-effort across distros)
+      - Optionally run LiveGrubFixer (preferred) to stabilize root= + regen initramfs/bootloader
+
+    Design goals:
+      - Safe defaults + best-effort behavior
+      - Minimal assumptions about distro/tooling
+      - Deterministic edits: atomic writes + timestamped backups (unless disabled)
     """
 
     def __init__(
@@ -52,363 +43,297 @@ class LiveGrubFixer:
         *,
         dry_run: bool,
         no_backup: bool,
+        print_fstab: bool,
         update_grub: bool,
         regen_initramfs: bool,
-        prefer: Tuple[str, ...] = ("UUID", "PARTUUID", "LABEL", "PARTLABEL"),
+        remove_vmware_tools: bool = False,
     ):
         self.logger = logger
         self.sshc = sshc
-        self.dry_run = dry_run
-        self.no_backup = no_backup
-        self.update_grub = update_grub
-        self.regen_initramfs = regen_initramfs
-        self.prefer = prefer
-        self.report = LiveGrubFixReport()
+        self.opts = LiveFixerOptions(
+            dry_run=dry_run,
+            no_backup=no_backup,
+            print_fstab=print_fstab,
+            update_grub=update_grub,
+            regen_initramfs=regen_initramfs,
+            remove_vmware_tools=remove_vmware_tools,
+        )
 
-    # ---------------------------
-    # ssh helpers
-    # ---------------------------
+    # ---------------------------------------------------------------------
+    # SSH helpers
+    # ---------------------------------------------------------------------
+
     def _ssh(self, cmd: str) -> str:
         self.logger.debug("SSH: %s", cmd)
-        out = self.sshc.ssh(cmd) or ""
-        return out
+        return self.sshc.ssh(cmd) or ""
 
-    def _sh(self, cmd: str, *, allow_fail: bool = True) -> Tuple[int, str]:
-        """
-        Run command via ssh with explicit rc.
-        We avoid assuming SSHClient supports rc directly; instead we wrap shell.
-        """
-        wrapped = (
-            "sh -lc "
-            + shlex.quote(
-                f"""
-set -o pipefail
-{cmd}
-rc=$?
-echo __VMDK2KVM_RC__=$rc
-exit 0
-""".strip()
-            )
+    def _has(self, cmd: str) -> bool:
+        return (
+            self._ssh(f"command -v {shlex.quote(cmd)} >/dev/null 2>&1 && echo YES || echo NO").strip()
+            == "YES"
         )
-        out = self._ssh(wrapped)
-        rc = 0
-        m = re.search(r"__VMDK2KVM_RC__=(\d+)", out)
-        if m:
-            rc = int(m.group(1))
-            out = re.sub(r"\n?__VMDK2KVM_RC__=\d+\s*$", "", out, flags=re.M)
-        else:
-            # cannot determine; treat as success-ish
-            rc = 0
-
-        self.report.commands_ran.append({"cmd": cmd, "rc": str(rc)})
-        if rc != 0 and not allow_fail:
-            raise RuntimeError(f"Remote command failed rc={rc}: {cmd}")
-        return rc, out
 
     def _remote_exists(self, path: str) -> bool:
-        rc, out = self._sh(f"test -e {shlex.quote(path)} && echo OK || echo NO")
-        return out.strip() == "OK"
+        out = self._ssh(f"test -e {shlex.quote(path)} && echo OK || echo NO").strip()
+        return out == "OK"
 
     def _read_remote_file(self, path: str) -> str:
-        _, out = self._sh(f"cat {shlex.quote(path)} 2>/dev/null || true")
-        return out
+        return self._ssh(f"cat {shlex.quote(path)} 2>/dev/null || true")
 
     def _write_remote_file_atomic(self, path: str, content: str, mode: str = "0644") -> None:
-        if self.dry_run:
+        """
+        Atomic-ish update:
+          - mktemp
+          - write content
+          - chmod
+          - mv over target
+        """
+        if self.opts.dry_run:
             self.logger.info("DRY-RUN: would write %s (%d bytes)", path, len(content))
             return
 
-        # mktemp may fail if /tmp is noexec? rare. Use /run if exists.
-        _, tmp = self._sh("mktemp /tmp/vmdk2kvm.grubfix.XXXXXX 2>/dev/null || mktemp /run/vmdk2kvm.grubfix.XXXXXX", allow_fail=True)
-        tmp = tmp.strip()
+        tmp = self._ssh("mktemp /tmp/vmdk2kvm.livefix.XXXXXX 2>/dev/null || mktemp /run/vmdk2kvm.livefix.XXXXXX").strip()
         if not tmp:
             raise RuntimeError("mktemp failed on remote host")
 
-        # Write via heredoc safely
-        self._sh(
-            "sh -lc "
-            + shlex.quote(
-                f"cat > {shlex.quote(tmp)} <<'EOF'\n{content}\nEOF\nchmod {mode} {shlex.quote(tmp)} || true\n"
-            ),
-            allow_fail=False,
+        payload = (
+            f"cat > {shlex.quote(tmp)} <<'EOF'\n"
+            f"{content}\n"
+            "EOF\n"
+            f"chmod {shlex.quote(mode)} {shlex.quote(tmp)} || true\n"
         )
-        self._sh(f"mv -f {shlex.quote(tmp)} {shlex.quote(path)}", allow_fail=False)
-        self._sh("sync || true", allow_fail=True)
+        self._ssh("sh -lc " + shlex.quote(payload))
+        self._ssh(f"mv -f {shlex.quote(tmp)} {shlex.quote(path)}")
+        self._ssh("sync || true")
 
-    def _backup_remote_file(self, path: str) -> Optional[str]:
-        if self.no_backup or self.dry_run:
+    def _readlink_f(self, path: str) -> Optional[str]:
+        out = self._ssh(f"readlink -f -- {shlex.quote(path)} 2>/dev/null || true").strip()
+        return out or None
+
+    def _is_remote_blockdev(self, dev: str) -> bool:
+        return self._ssh(f"test -b {shlex.quote(dev)} && echo OK || echo NO").strip() == "OK"
+
+    def _blkid(self, dev: str, key: str) -> Optional[str]:
+        out = self._ssh(
+            f"blkid -s {shlex.quote(key)} -o value -- {shlex.quote(dev)} 2>/dev/null || true"
+        ).strip()
+        return out or None
+
+    def _run_best_effort(self, cmds: List[str]) -> None:
+        for c in cmds:
+            if not c.strip():
+                continue
+            self._ssh(c)
+
+    def _backup(self, path: str) -> Optional[str]:
+        if self.opts.no_backup or self.opts.dry_run:
             return None
         b = f"{path}.bak.vmdk2kvm.{U.now_ts()}"
-        self._sh(f"cp -a {shlex.quote(path)} {shlex.quote(b)} 2>/dev/null || true")
+        self._ssh(f"cp -a {shlex.quote(path)} {shlex.quote(b)} 2>/dev/null || true")
         self.logger.info("Backup: %s -> %s", path, b)
         return b
 
-    def _remove_remote_file(self, path: str) -> None:
-        if self.dry_run:
-            self.logger.info("DRY-RUN: would remove %s", path)
-            return
-        self._sh(f"rm -f {shlex.quote(path)} 2>/dev/null || true")
-        self.logger.info("Removed %s (if existed)", path)
-
-    # ---------------------------
-    # detection helpers
-    # ---------------------------
-    def _detect_distro_id(self) -> str:
-        _, out = self._sh(". /etc/os-release 2>/dev/null; echo ${ID:-} || true")
-        return out.strip().lower()
-
-    def _readlink_f(self, path: str) -> Optional[str]:
-        _, out = self._sh(f"readlink -f -- {shlex.quote(path)} 2>/dev/null || true")
-        s = out.strip()
-        return s or None
-
-    def _is_remote_blockdev(self, dev: str) -> bool:
-        _, out = self._sh(f"test -b {shlex.quote(dev)} && echo OK || echo NO")
-        return out.strip() == "OK"
-
-    def _blkid(self, dev: str, key: str) -> Optional[str]:
-        _, out = self._sh(f"blkid -s {shlex.quote(key)} -o value -- {shlex.quote(dev)} 2>/dev/null || true")
-        v = out.strip()
-        return v or None
-
-    def _findmnt_root_source(self) -> str:
-        # Try SOURCE first; if it's overlay or weird, try TARGET=/
-        cmds = [
-            "findmnt -n -o SOURCE / 2>/dev/null || true",
-            "findmnt -n -o SOURCE -T / 2>/dev/null || true",
-            "awk '$2==\"/\"{print $1; exit}' /proc/mounts 2>/dev/null || true",
-        ]
-        for c in cmds:
-            _, out = self._sh(c)
-            s = out.strip()
-            if s:
-                return s
-        return ""
+    # ---------------------------------------------------------------------
+    # fstab rewrite
+    # ---------------------------------------------------------------------
 
     def _convert_spec_to_stable(self, spec: str) -> str:
         """
-        Convert a root source spec into a stable ID string if possible.
-
-        Handles:
-          - /dev/disk/by-path/* -> UUID=/PARTUUID=/LABEL=
-          - /dev/sdXn, /dev/vdXn, /dev/nvme0n1pX -> UUID=/PARTUUID=/LABEL=
-          - /dev/mapper/*: try to resolve to underlying block dev if possible; otherwise keep
-          - already stable specs are returned unchanged
+        Convert /dev/disk/by-path/* to a stable spec, preferring:
+          UUID=, PARTUUID=, LABEL=, PARTLABEL=
         """
-        # Already stable?
-        if re.match(r"^(UUID|PARTUUID|LABEL|PARTLABEL)=.+", spec):
-            return spec
-
-        resolved = spec
-
-        # Follow symlinks if it's a by-* path
-        if spec.startswith("/dev/disk/by-"):
-            rp = self._readlink_f(spec)
-            if rp:
-                resolved = rp
-
-        # LVM/crypt mapper is block dev but blkid may return nothing; still try.
-        if resolved.startswith("/dev/mapper/"):
-            # Sometimes there's a dm-* behind it
-            rp = self._readlink_f(resolved)
-            if rp and rp.startswith("/dev/"):
-                resolved = rp
-
-        if not resolved.startswith("/dev/"):
+        resolved = self._readlink_f(spec)
+        if not resolved:
+            self.logger.debug("fstab: readlink -f failed for %s", spec)
             return spec
 
         if not self._is_remote_blockdev(resolved):
+            self.logger.debug("fstab: resolved path is not a block dev: %s -> %s", spec, resolved)
             return spec
 
-        for key in self.prefer:
+        for key, prefix in (
+            ("UUID", "UUID="),
+            ("PARTUUID", "PARTUUID="),
+            ("LABEL", "LABEL="),
+            ("PARTLABEL", "PARTLABEL="),
+        ):
             v = self._blkid(resolved, key)
             if v:
-                return f"{key}={v}"
+                return prefix + v
 
-        # last-resort: keep as-is
         return spec
 
-    # ---------------------------
-    # operations
-    # ---------------------------
-    def remove_stale_device_map(self) -> int:
-        removed = 0
-        # include more candidates; distros differ
-        paths = [
-            "/boot/grub2/device.map",
-            "/boot/grub/device.map",
-            "/etc/grub2-device.map",
-            "/etc/grub/device.map",
+    @staticmethod
+    def _split_comment(line: str) -> Tuple[str, str]:
+        s = line.rstrip("\n")
+        if not s.strip():
+            return s, ""
+        if s.lstrip().startswith("#"):
+            return s, ""
+        m = re.search(r"\s#", s)
+        if not m:
+            return s, ""
+        i = m.start()
+        return s[:i].rstrip(), s[i:].lstrip()
+
+    def _rewrite_fstab(self, content: str) -> Tuple[str, int]:
+        changed = 0
+        out_lines: List[str] = []
+
+        for line in content.splitlines(keepends=False):
+            if not line.strip() or line.lstrip().startswith("#"):
+                out_lines.append(line + "\n")
+                continue
+
+            data, comment = self._split_comment(line)
+            parts = data.split()
+            if len(parts) < 2:
+                out_lines.append(line + "\n")
+                continue
+
+            spec = parts[0]
+            if spec.startswith("/dev/disk/by-path/"):
+                new_spec = self._convert_spec_to_stable(spec)
+                if new_spec != spec:
+                    parts[0] = new_spec
+                    changed += 1
+
+            rebuilt = "\t".join(parts)
+            if comment:
+                if not comment.startswith("#"):
+                    comment = "# " + comment
+                rebuilt = rebuilt + "\t" + comment
+
+            out_lines.append(rebuilt.rstrip() + "\n")
+
+        return "".join(out_lines), changed
+
+    # ---------------------------------------------------------------------
+    # VMware tools removal (multi-distro best-effort)
+    # ---------------------------------------------------------------------
+
+    def _remove_vmware_tools(self) -> None:
+        self.logger.info("Removing VMware tools (live)...")
+
+        pkgs = [
+            "open-vm-tools",
+            "open-vm-tools-desktop",
+            "vmware-tools",
+            "vmware-tools-desktop",
+            "vmtoolsd",
         ]
-        # match common legacy disk names
-        stale_re = re.compile(r"\b(sd[a-z]|vd[a-z]|hd[a-z])\b")
 
-        for p in paths:
-            if not self._remote_exists(p):
-                continue
-            txt = self._read_remote_file(p)
-            if stale_re.search(txt):
-                self.logger.info("GRUB: removing stale device.map: %s", p)
-                if not self.dry_run:
-                    self._backup_remote_file(p)
-                self._remove_remote_file(p)
-                self.report.removed_device_maps.append(p)
-                removed += 1
-
-        return removed
-
-    def update_grub_root(self) -> bool:
-        if not self.update_grub:
-            return False
-
-        root_src = self._findmnt_root_source()
-        self.report.root_source = root_src
-
-        if not root_src:
-            msg = "GRUB root=: could not detect root source; skipping."
-            self.logger.warning(msg)
-            self.report.warnings.append(msg)
-            return False
-
-        stable = self._convert_spec_to_stable(root_src)
-        self.report.stable_root = stable
-
-        # If no improvement, keep quiet-ish
-        if stable == root_src:
-            self.logger.info("GRUB root=: already stable (or could not improve): %s", root_src)
-            return False
-
-        path = "/etc/default/grub"
-        if not self._remote_exists(path):
-            msg = f"GRUB root=: {path} not found; skipping."
-            self.logger.warning(msg)
-            self.report.warnings.append(msg)
-            return False
-
-        old = self._read_remote_file(path)
-        if not old.strip():
-            msg = f"GRUB root=: {path} unreadable/empty; skipping."
-            self.logger.warning(msg)
-            self.report.warnings.append(msg)
-            return False
-
-        # Patch both GRUB_CMDLINE_LINUX and GRUB_CMDLINE_LINUX_DEFAULT if present
-        # - preserve quotes
-        cmdline_re = re.compile(r'^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?)=(["\'])(.*)\2\s*$')
-
-        def patch_line(line: str) -> str:
-            m = cmdline_re.match(line)
-            if not m:
-                return line
-            key, quote, val = m.group(1), m.group(2), m.group(3)
-
-            # replace any existing root=... token
-            if re.search(r"\broot=", val):
-                val2 = re.sub(r"\broot=[^\s\"']+", f"root={stable}", val)
-            else:
-                val2 = (val + f" root={stable}").strip()
-
-            return f"{key}={quote}{val2}{quote}"
-
-        new_lines = [patch_line(l) for l in old.splitlines()]
-        new = "\n".join(new_lines) + "\n"
-
-        if new == old:
-            self.logger.info("GRUB root=: no change needed.")
-            return False
-
-        if self.dry_run:
-            self.logger.info("DRY-RUN: would update %s (root=%s).", path, stable)
-            self.report.updated_default_grub = True
-            self.report.updated_files.append(path)
-            return True
-
-        self._backup_remote_file(path)
-        self._write_remote_file_atomic(path, new, mode="0644")
-        self.logger.info("GRUB root=: updated %s (root=%s).", path, stable)
-        self.report.updated_default_grub = True
-        self.report.updated_files.append(path)
-        return True
-
-    def regen_initramfs_and_grub(self) -> None:
-        if not self.regen_initramfs:
-            return
-
-        distro = self._detect_distro_id()
-        self.report.distro = distro
-
-        if self.dry_run:
-            self.logger.info("DRY-RUN: would regenerate initramfs + grub (distro=%s).", distro)
-            return
-
-        # initramfs
-        if distro in ("debian", "ubuntu"):
-            self._sh("update-initramfs -u -k all 2>/dev/null || update-initramfs -u 2>/dev/null || true")
-            self._sh("update-grub 2>/dev/null || grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true")
-        elif distro in ("arch", "manjaro"):
-            self._sh("mkinitcpio -P 2>/dev/null || true")
-            self._sh("grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true")
-        else:
-            # rhel/fedora/suse
-            self._sh("dracut -f 2>/dev/null || dracut -f --regenerate-all 2>/dev/null || true")
-            self._sh(
-                "grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || "
-                "grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true"
+        if self._has("apt-get"):
+            self._run_best_effort(
+                [
+                    "DEBIAN_FRONTEND=noninteractive apt-get remove -y "
+                    + " ".join(map(shlex.quote, pkgs))
+                    + " 2>/dev/null || true",
+                    "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true",
+                ]
             )
+        elif self._has("dnf"):
+            self._run_best_effort(
+                ["dnf remove -y " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"]
+            )
+        elif self._has("yum"):
+            self._run_best_effort(
+                ["yum remove -y " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"]
+            )
+        elif self._has("zypper"):
+            self._run_best_effort(
+                ["zypper -n rm " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"]
+            )
+        elif self._has("pacman"):
+            self._run_best_effort(
+                ["pacman -Rns --noconfirm " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"]
+            )
+        elif self._has("apk"):
+            self._run_best_effort(["apk del " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"])
+        elif self._has("xbps-remove"):
+            self._run_best_effort(
+                ["xbps-remove -Ry " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"]
+            )
+        elif self._has("emerge"):
+            self._run_best_effort(["emerge -C " + " ".join(map(shlex.quote, pkgs)) + " 2>/dev/null || true"])
+        else:
+            self.logger.warning("No known package manager found; skipping package removal.")
 
-        self.logger.info("Live regen done.")
+        # Service cleanup (systemd/OpenRC best-effort)
+        self._run_best_effort(
+            [
+                "systemctl disable --now vmware-tools 2>/dev/null || true",
+                "systemctl disable --now vmtoolsd 2>/dev/null || true",
+                "rc-service vmware-tools stop 2>/dev/null || true",
+                "rc-service vmtoolsd stop 2>/dev/null || true",
+                "rc-update del vmware-tools default 2>/dev/null || true",
+                "rc-update del vmtoolsd default 2>/dev/null || true",
+                "rm -f /etc/init.d/vmware-tools /etc/init.d/vmtoolsd 2>/dev/null || true",
+                "rm -f /etc/systemd/system/vmware-tools.service /etc/systemd/system/vmtoolsd.service 2>/dev/null || true",
+            ]
+        )
 
-    def postcheck_grubcfg(self) -> None:
-        """
-        Best-effort sanity: does grub.cfg contain our stable root=?
-        We don't fail the run on this; it's a warning signal.
-        """
-        stable = self.report.stable_root or ""
-        if not stable:
-            return
-        candidates = ["/boot/grub2/grub.cfg", "/boot/grub/grub.cfg"]
-        found_any = False
-        for p in candidates:
-            if not self._remote_exists(p):
-                continue
-            txt = self._read_remote_file(p)
-            if stable in txt:
-                found_any = True
-                break
-        if not found_any:
-            msg = f"Postcheck: stable root '{stable}' not found in grub.cfg (may still be OK; grub may source /etc/default/grub later)."
-            self.logger.warning(msg)
-            self.report.warnings.append(msg)
+        uninstaller = "/usr/bin/vmware-uninstall-tools.pl"
+        if self._remote_exists(uninstaller):
+            self._run_best_effort([f"{shlex.quote(uninstaller)} 2>/dev/null || true"])
+
+        self.logger.info("VMware tools removal attempted.")
+
+    # ---------------------------------------------------------------------
+    # Entrypoint
+    # ---------------------------------------------------------------------
 
     def run(self) -> Dict[str, Any]:
-        U.banner(self.logger, "GRUB fix (SSH)")
+        U.banner(self.logger, "Live fix (SSH)")
+        self.sshc.check()
 
-        removed = self.remove_stale_device_map()
-        updated = self.update_grub_root()
+        # ---- fstab rewrite
+        fstab = self._read_remote_file("/etc/fstab")
+        if self.opts.print_fstab:
+            print("\n--- /etc/fstab (live before) ---\n" + (fstab or ""))
 
-        # Regen if requested OR if we changed /etc/default/grub (common expectation)
-        if self.regen_initramfs or updated:
-            self.regen_initramfs_and_grub()
+        new_fstab, changed = self._rewrite_fstab(fstab or "")
+        self.logger.info("fstab (live): changed_entries=%d", changed)
 
-        # Best-effort postcheck
-        try:
-            self.postcheck_grubcfg()
-        except Exception as e:
-            self.logger.debug("Postcheck failed: %s", e)
+        if self.opts.print_fstab:
+            print("\n--- /etc/fstab (live after) ---\n" + (new_fstab or ""))
 
-        self.logger.info("GRUB fix: removed_device_maps=%d, updated_grub_root=%s", removed, updated)
-        self.logger.info("GRUB fix completed.")
+        if changed > 0:
+            if self.opts.dry_run:
+                self.logger.info("DRY-RUN: would update /etc/fstab (live).")
+            else:
+                if not self.opts.no_backup:
+                    self._backup("/etc/fstab")
+                self._write_remote_file_atomic("/etc/fstab", new_fstab, mode="0644")
+                self.logger.info("/etc/fstab updated (live).")
 
-        # return a JSON-friendly dict
+        # ---- optional VMware tools removal
+        if self.opts.remove_vmware_tools:
+            if self.opts.dry_run:
+                self.logger.info("DRY-RUN: would remove VMware tools (live).")
+            else:
+                self._remove_vmware_tools()
+
+        # ---- GRUB fixer (now owns distro detection + regen logic)
+        grub_report: Optional[Dict[str, Any]] = None
+        if self.opts.update_grub or self.opts.regen_initramfs:
+            self.logger.info("Running LiveGrubFixer...")
+            gf = LiveGrubFixer(
+                logger=self.logger,
+                sshc=self.sshc,
+                dry_run=self.opts.dry_run,
+                no_backup=self.opts.no_backup,
+                update_grub=self.opts.update_grub,
+                regen_initramfs=self.opts.regen_initramfs,
+            )
+            grub_report = gf.run()
+
+        self.logger.info("Live fix completed.")
         return {
-            "distro": self.report.distro,
-            "root_source": self.report.root_source,
-            "stable_root": self.report.stable_root,
-            "removed_device_maps": self.report.removed_device_maps,
-            "updated_default_grub": self.report.updated_default_grub,
-            "updated_files": self.report.updated_files,
-            "commands_ran": self.report.commands_ran,
-            "warnings": self.report.warnings,
-            "errors": self.report.errors,
-            "dry_run": self.dry_run,
+            "dry_run": self.opts.dry_run,
+            "fstab_changed": changed,
+            "update_grub": self.opts.update_grub,
+            "regen_initramfs": self.opts.regen_initramfs,
+            "remove_vmware_tools": self.opts.remove_vmware_tools,
+            "grub_report": grub_report,
         }
