@@ -1,0 +1,8 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 50-daemon/generate-systemd.yaml
+
+output_dir: /var/lib/vmdk2kvm/out
+watch_dir: /var/lib/vmdk2kvm/incoming
+workdir: /var/lib/vmdk2kvm/work
+verbose: 1
+log_file: /var/log/vmdk2kvm.log

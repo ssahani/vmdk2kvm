@@ -1,0 +1,8 @@
+{
+  "command": "local",
+  "vmdk": "/path/to/vm.vmdk",
+  "use_v2v": true,
+  "post_v2v": false,
+  "to_output": "vm-v2v.qcow2",
+  "report": "local-v2v.md"
+}

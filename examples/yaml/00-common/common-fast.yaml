@@ -1,0 +1,11 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 00-common/common-fast.yaml
+
+output_dir: ./out
+workdir: ./out/work
+verbose: 1
+regen_initramfs: false
+remove_vmware_tools: false
+flatten: false
+libvirt_test: false
+qemu_test: false

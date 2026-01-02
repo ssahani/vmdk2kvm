@@ -1,0 +1,9 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 40-ova-ovf/ovf-basic.yaml
+
+command: ovf
+ovf: /path/to/appliance.ovf
+flatten: true
+to_output: appliance.qcow2
+out_format: qcow2
+compress: true

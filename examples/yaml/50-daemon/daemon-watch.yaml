@@ -1,0 +1,13 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 50-daemon/daemon-watch.yaml
+
+command: daemon
+daemon: true
+watch_dir: /incoming
+output_dir: /out
+workdir: /out/work
+verbose: 1
+flatten: true
+out_format: qcow2
+compress: true
+enable_recovery: true

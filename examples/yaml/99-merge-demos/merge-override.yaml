@@ -1,0 +1,7 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 99-merge-demos/merge-override.yaml
+
+verbose: 2
+dry_run: true
+flatten: false
+regen_initramfs: false

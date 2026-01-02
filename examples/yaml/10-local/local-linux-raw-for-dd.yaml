@@ -1,0 +1,11 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 10-local/local-linux-raw-for-dd.yaml
+
+command: local
+vmdk: /path/to/linux.vmdk
+flatten: true
+flatten_format: raw
+to_output: linux.raw
+out_format: raw
+compress: false
+checksum: true

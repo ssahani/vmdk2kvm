@@ -1,9 +1,0 @@
-command: local
-vmdk: /path/to/linux.vmdk
-to_output: linux-qemu-test.qcow2
-
-qemu_test: true
-memory: 2048
-vcpus: 2
-uefi: false
-timeout: 60

@@ -1,7 +1,0 @@
-# Example config values you might want to bake into a systemd unit environment file.
-# Your "generate-systemd" subcommand can read config and emit a unit using SYSTEMD_UNIT_TEMPLATE.
-output_dir: /var/lib/vmdk2kvm/out
-watch_dir: /var/lib/vmdk2kvm/incoming
-workdir: /var/lib/vmdk2kvm/work
-verbose: 1
-log_file: /var/log/vmdk2kvm.log

@@ -1,0 +1,7 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 99-merge-demos/merge-run-local.yaml
+
+command: local
+vmdk: /path/to/vm.vmdk
+to_output: merged-out.qcow2
+report: merged.md

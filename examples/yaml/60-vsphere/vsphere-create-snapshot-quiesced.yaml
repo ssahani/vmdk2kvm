@@ -1,0 +1,15 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 60-vsphere/vsphere-create-snapshot-quiesced.yaml
+
+command: vsphere
+vcenter: vcenter.example.com
+vc_user: administrator@vsphere.local
+vc_password_env: VC_PASSWORD
+vc_insecure: true
+vs_action: create_snapshot
+vm_name: myVM
+name: vmdk2kvm-pre-migration
+quiesce: true
+memory: false
+description: Created by vmdk2kvm for offline migration
+json: true

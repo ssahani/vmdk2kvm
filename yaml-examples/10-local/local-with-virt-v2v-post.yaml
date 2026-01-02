@@ -1,9 +1,0 @@
-command: local
-vmdk: /path/to/vm.vmdk
-
-# Do internal fixes, then run virt-v2v afterwards
-use_v2v: false
-post_v2v: true
-
-to_output: vm-post-v2v.qcow2
-report: local-post-v2v.md

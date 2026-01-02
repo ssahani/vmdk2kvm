@@ -1,0 +1,9 @@
+# Modernized example (config-driven): run with
+#   sudo python vmdk2kvm.py --config 10-local/local-with-virt-v2v-post.yaml
+
+command: local
+vmdk: /path/to/vm.vmdk
+use_v2v: false
+post_v2v: true
+to_output: vm-post-v2v.qcow2
+report: local-post-v2v.md

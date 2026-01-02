@@ -1,5 +1,0 @@
-# Example that relies on merging base+override, plus local required arg.
-command: local
-vmdk: /path/to/vm.vmdk
-to_output: merged-out.qcow2
-report: merged.md
