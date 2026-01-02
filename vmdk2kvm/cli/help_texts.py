@@ -429,6 +429,12 @@ verbose: 1
 # quiesce: true
 # memory: false
 #
+# vs_control_plane: govc
+# govc_url: "https://10.73.213.134/sdk"
+# govc_password_env: VC_PASSWORD   # (or govc_password:)
+# govc_insecure: true
+# govc_datacenter: data
+
 # Enable CBT (Changed Block Tracking):
 # command: vsphere
 # vcenter: vcenter.example.com

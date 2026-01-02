@@ -6,23 +6,177 @@ import fnmatch
 import json
 import logging
 import os
+import sys
+import threading
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
 from pyVmomi import vim, vmodl
 
+# Optional: Rich progress UI (TTY friendly). Falls back to plain logs if Rich not available.
+try:  # pragma: no cover
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TransferSpeedColumn,
+    )
+except Exception:  # pragma: no cover
+    Progress = None  # type: ignore
+    SpinnerColumn = BarColumn = TextColumn = TimeElapsedColumn = TransferSpeedColumn = None  # type: ignore
+
+# Optional: silence urllib3 TLS warnings when verify=False
+try:  # pragma: no cover
+    import urllib3  # type: ignore
+except Exception:  # pragma: no cover
+    urllib3 = None  # type: ignore
+
+
 from ..core.exceptions import Fatal, VMwareError
 from .vmware_client import REQUESTS_AVAILABLE, VMwareClient
+from .govc_common import GovcRunner, extract_paths_from_datastore_ls_json, normalize_ds_path
 
 
+class GovmomiCLI(GovcRunner):
+    """
+    Thin wrapper around govmomi tooling via `govc` (recommended).
+
+    This is intentionally best-effort + additive: if govc isn't present or not configured,
+    callers should fall back to pyvmomi.
+
+    Compared to the older in-file implementation, this version:
+      - Centralizes GOVC_* env seeding + JSON parsing in govc_common.py
+      - Supports newer govc JSON output shapes for datastore.ls (e.g. the `file:[{path:...}]` form)
+    """
+
+    def __init__(self, logger: logging.Logger, args: argparse.Namespace):
+        super().__init__(logger=logger, args=args)
+
+    # -------------------------
+    # govc helpers we use
+    # -------------------------
+
+    def list_vm_names(self) -> List[Dict[str, Any]]:
+        """
+        Returns list of VM dicts.
+
+        Uses:
+          - govc find -type m -json .
+          - govc vm.info -json per vm (bounded by govc_max_detail)
+
+        If inventory is too large, returns only names + inventory paths.
+        """
+        found = self.run_json(["find", "-type", "m", "-json", "."]) or {}
+        vms = (found.get("Elements") or [])
+        if not isinstance(vms, list):
+            vms = []
+
+        max_detail = int(getattr(self.args, "govc_max_detail", 500) or 500)
+        if len(vms) > max_detail:
+            try:
+                self.logger.info(
+                    f"govc: inventory has {len(vms)} VMs; returning names only (govc_max_detail={max_detail})"
+                )
+            except Exception:
+                pass
+            out = [{"name": str(p).split("/")[-1], "path": p} for p in vms]
+            return sorted(out, key=lambda x: x.get("name", ""))
+
+        detailed: List[Dict[str, Any]] = []
+        for pth in vms:
+            try:
+                info = self.run_json(["vm.info", "-json", str(pth)]) or {}
+                arr = info.get("VirtualMachines") or []
+                if not arr:
+                    continue
+                vm = arr[0]
+                cfg = (vm.get("Config") or {})
+                runtime = (vm.get("Runtime") or {})
+                guest = (vm.get("Guest") or {})
+                summary = (vm.get("Summary") or {})
+                detailed.append(
+                    {
+                        "name": cfg.get("Name") or str(pth).split("/")[-1],
+                        "runtime.powerState": runtime.get("PowerState"),
+                        "summary.overallStatus": (summary.get("OverallStatus") or ""),
+                        "summary.guest.guestFullName": (cfg.get("GuestFullName") or ""),
+                        "summary.config.memorySizeMB": cfg.get("MemoryMB"),
+                        "summary.config.numCpu": cfg.get("NumCPU"),
+                        "summary.config.vmPathName": (cfg.get("VmPathName") or ""),
+                        "summary.config.instanceUuid": cfg.get("InstanceUuid"),
+                        "summary.config.uuid": cfg.get("Uuid"),
+                        "guest.guestState": guest.get("GuestState"),
+                        "path": pth,
+                    }
+                )
+            except Exception as e:
+                try:
+                    self.logger.debug(f"govc: vm.info failed for {pth}: {e}")
+                except Exception:
+                    pass
+                detailed.append({"name": str(pth).split("/")[-1], "path": pth, "error": str(e)})
+
+        return sorted(detailed, key=lambda x: x.get("name", ""))
+
+    def datastore_ls(self, datastore: str, folder: str) -> List[str]:
+        """
+        List files under a datastore folder via govc.
+
+        Returns:
+          Filenames/relative paths under `folder` (no leading slash).
+
+        Notes:
+          - We call `govc datastore.ls -json -ds <ds> <folder/>` and then parse defensively.
+          - govc output shapes vary by version (some return `file:[{path:...}]`).
+        """
+        ds, rel = normalize_ds_path(datastore, folder or "")
+        rel = rel.strip().lstrip("/")  # govc wants no leading slash
+        rel = rel.rstrip("/")  # we'll add slash for directory
+        rel_dir = (rel + "/") if rel else ""
+
+        candidates: List[str]
+        if rel_dir:
+            candidates = [rel_dir, "/" + rel_dir]
+        else:
+            candidates = ["", "/"]
+
+        base = rel_dir.lstrip("/")  # used to strip prefixes when govc returns full paths
+        prefix = base.rstrip("/") + "/" if base else ""
+
+        for cand in candidates:
+            try:
+                data = self.run_json(["datastore.ls", "-json", "-ds", ds, cand]) or {}
+                paths = extract_paths_from_datastore_ls_json(data)
+
+                out: List[str] = []
+                for p in paths:
+                    relp = str(p).lstrip("/")
+                    if prefix and relp.startswith(prefix):
+                        relp = relp[len(prefix):]
+                    if relp:
+                        out.append(relp)
+                return out
+            except Exception as e:
+                try:
+                    self.logger.debug(f"govc datastore.ls failed for candidate '{cand}': {e}")
+                except Exception:
+                    pass
+                continue
+
+        return []
 class VsphereMode:
     """CLI entry for vSphere actions: scan / download / cbt-sync."""
 
     def __init__(self, logger: logging.Logger, args: argparse.Namespace):
         self.logger = logger
         self.args = args
+        self.govc = GovmomiCLI(logger, args)
 
     # ✅ ADDITIVE: centralized dc_name resolution (no behavior change)
     def _dc_name(self) -> str:
@@ -32,23 +186,29 @@ class VsphereMode:
         Behavior (unchanged):
           - If user supplied --dc-name, use it
           - Else default to 'ha-datacenter'
-
-        This avoids scattered getattr(...) usage and prevents blank dcPath bugs.
         """
         v = getattr(self.args, "dc_name", None)
         return v if v else "ha-datacenter"
 
+    def _prefer_govmomi(self) -> bool:
+        """
+        If govc/govmomi is available and user didn't disable it, prefer it for:
+          - list_vm_names (inventory traversal is often better)
+          - datastore listing (for download-only flows)
+        """
+        if bool(getattr(self.args, "no_govmomi", False)):
+            return False
+        return self.govc.available()
+
     # ----------------------------------------------------------------------------------
-    # Download-only VM folder helpers (pure additive)
+    # Download-only VM folder helpers
     # ----------------------------------------------------------------------------------
 
-    def _parse_vm_datastore_dir(self, vmx_path: str) -> tuple[str, str]:
+    def _parse_vm_datastore_dir(self, vmx_path: str) -> Tuple[str, str]:
         """
         vm.summary.config.vmPathName looks like:
           "[datastore1] folder/vm.vmx"
         Return: (datastore_name, folder_path)
-          - datastore_name = "datastore1"
-          - folder_path = "folder" (no leading slash). Can be "" for datastore root.
         """
         s = (vmx_path or "").strip()
         if not s.startswith("[") or "]" not in s:
@@ -60,6 +220,40 @@ class VsphereMode:
         else:
             folder = rest.rsplit("/", 1)[0].lstrip("/")
         return ds, folder
+
+    def _parse_datastore_dir_override(self, s: str, *, default_ds: Optional[str] = None) -> Tuple[str, str]:
+        """
+        Override parser for download_only_vm folder listing.
+
+        Accepts:
+          - "folder/subfolder/"                (uses default_ds)
+          - "[ds] folder/subfolder/"           (explicit ds)
+          - "[ds] folder/subfolder/vm.vmx"     (explicit ds + file; dirname used)
+
+        Returns: (ds_name, folder)
+        """
+        t = (s or "").strip()
+        if not t:
+            raise VMwareError("Empty vs_datastore_dir override")
+
+        if t.startswith("[") and "]" in t:
+            ds = t[1 : t.index("]")]
+            rest = t[t.index("]") + 1 :].strip()
+            rest = rest.lstrip("/")
+            if "/" in rest:
+                folder = rest.rsplit("/", 1)[0]
+            else:
+                folder = ""
+            return ds, folder.strip("/")
+
+        if not default_ds:
+            raise VMwareError("vs_datastore_dir provided without datastore and default datastore is unknown")
+
+        folder = t.strip().lstrip("/").rstrip("/")
+        # If user passed a file-like tail, take dirname
+        if "/" in folder and "." in folder.split("/")[-1]:
+            folder = folder.rsplit("/", 1)[0]
+        return str(default_ds), folder.strip("/")
 
     def _find_datastore_obj(self, client: VMwareClient, datastore_name: str) -> vim.Datastore:
         """
@@ -74,7 +268,6 @@ class VsphereMode:
             except Exception:
                 return []
 
-        # content.rootFolder.childEntity may contain folders and/or datacenters
         for top in iter_children(content.rootFolder):
             try:
                 if isinstance(top, vim.Datacenter):
@@ -92,25 +285,21 @@ class VsphereMode:
 
         raise VMwareError(f"Datastore not found in inventory: {datastore_name}")
 
-    def _list_vm_folder_files(
+    def _list_vm_folder_files_pyvmomi(
         self,
         client: VMwareClient,
         datastore_obj: vim.Datastore,
         ds_name: str,
         folder: str,
-        include_glob: list[str],
-        exclude_glob: list[str],
+        include_glob: List[str],
+        exclude_glob: List[str],
         max_files: int,
-    ) -> list[str]:
+    ) -> List[str]:
         """
         Use HostDatastoreBrowser to list files in the VM folder.
-
-        Returns:
-          list of datastore-relative paths like:
-            "folder/file.vmdk" or "folder/file-flat.vmdk" or "folder/vm.vmx"
+        Returns list of datastore-relative paths like: "folder/file.vmdk"
         """
         browser = datastore_obj.browser  # vim.HostDatastoreBrowser
-
         ds_folder_path = f"[{ds_name}] {folder}" if folder else f"[{ds_name}]"
 
         spec = vim.HostDatastoreBrowserSearchSpec()
@@ -124,7 +313,7 @@ class VsphereMode:
         if not result:
             return []
 
-        files: list[str] = []
+        files: List[str] = []
         base = folder.rstrip("/")
 
         for f in getattr(result, "file", []) or []:
@@ -133,7 +322,6 @@ class VsphereMode:
                 continue
             rel = f"{base}/{name}" if base else name
 
-            # include/exclude filtering (match both rel and basename)
             if include_glob and not any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat) for pat in include_glob):
                 continue
             if exclude_glob and any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat) for pat in exclude_glob):
@@ -146,6 +334,50 @@ class VsphereMode:
 
         return files
 
+    def _list_vm_folder_files(
+        self,
+        client: VMwareClient,
+        datastore_obj: vim.Datastore,
+        ds_name: str,
+        folder: str,
+        include_glob: List[str],
+        exclude_glob: List[str],
+        max_files: int,
+    ) -> List[str]:
+        """
+        Prefer govmomi/govc for datastore listing when available, else fall back to pyvmomi.
+        """
+        if self._prefer_govmomi():
+            try:
+                rels = self.govc.datastore_ls(ds_name, folder)
+                files: List[str] = []
+                base = folder.rstrip("/")
+                for name in rels:
+                    rel = f"{base}/{name}" if base and name else (base or name)
+                    if not rel:
+                        continue
+                    bn = rel.split("/")[-1]
+                    if include_glob and not any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(bn, pat) for pat in include_glob):
+                        continue
+                    if exclude_glob and any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(bn, pat) for pat in exclude_glob):
+                        continue
+                    files.append(rel)
+                    if max_files and len(files) > max_files:
+                        raise VMwareError(f"Refusing to download > max_files={max_files} (found so far: {len(files)})")
+                return files
+            except Exception as e:
+                self.logger.debug(f"govc datastore listing failed; falling back to pyvmomi: {e}")
+
+        return self._list_vm_folder_files_pyvmomi(
+            client=client,
+            datastore_obj=datastore_obj,
+            ds_name=ds_name,
+            folder=folder,
+            include_glob=include_glob,
+            exclude_glob=exclude_glob,
+            max_files=max_files,
+        )
+
     def _download_one_folder_file(
         self,
         client: VMwareClient,
@@ -155,6 +387,8 @@ class VsphereMode:
         ds_path: str,
         local_path: Path,
         verify_tls: bool,
+        *,
+        on_bytes: Optional[Any] = None,
         chunk_size: int = 1024 * 1024,
     ) -> None:
         """
@@ -162,20 +396,39 @@ class VsphereMode:
         """
         if not REQUESTS_AVAILABLE:
             raise VMwareError("requests not installed. Install: pip install requests")
-
-        # /folder expects a datastore-relative path; it MUST be URL-encoded but keep slashes.
         quoted_path = quote(ds_path, safe="/")
         url = f"https://{vc_host}/folder/{quoted_path}?dcPath={quote(dc_name)}&dsName={quote(ds_name)}"
         headers = {"Cookie": client._session_cookie()}
 
+        # Silence urllib3 warnings when verify is disabled (common for lab vCenters)
+        if not verify_tls and urllib3 is not None:  # pragma: no cover
+            try:
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
         local_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = local_path.with_suffix(local_path.suffix + ".part")
 
         with requests.get(url, headers=headers, verify=verify_tls, stream=True) as r:
             r.raise_for_status()
-            with open(local_path, "wb") as f:
+            total = int(r.headers.get("content-length", "0") or "0")
+            got = 0
+
+            with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    got += len(chunk)
+                    if on_bytes is not None:
+                        try:
+                            on_bytes(len(chunk), total)
+                        except Exception:
+                            # progress must never break downloads
+                            pass
+
+        os.replace(tmp, local_path)
 
     # ----------------------------------------------------------------------------------
 
@@ -187,7 +440,6 @@ class VsphereMode:
         if not vc_pass and getattr(self.args, "vc_password_env", None):
             vc_pass = os.environ.get(self.args.vc_password_env)
 
-        # ✅ normalize whitespace to prevent accidental InvalidLogin
         if isinstance(vc_pass, str):
             vc_pass = vc_pass.strip()
         if not vc_pass:
@@ -212,29 +464,42 @@ class VsphereMode:
         try:
             action = self.args.vs_action
 
+            # ------------------------------------------------------------------
+            # list_vm_names: prefer govmomi/govc when present (more robust inventory)
+            # ------------------------------------------------------------------
             if action == "list_vm_names":
+                if self._prefer_govmomi():
+                    try:
+                        vms = self.govc.list_vm_names()
+                        self.logger.info(f"VMs found (govc): {len(vms)}")
+                        if self.args.json:
+                            print(json.dumps(vms, indent=2, default=str))
+                        else:
+                            for vm in vms:
+                                print(vm.get("name", "Unnamed VM"))
+                        return 0
+                    except Exception as e:
+                        self.logger.warning(f"govc list_vm_names failed; falling back to pyvmomi: {e}")
+
+                # ---- pyvmomi fallback (your original behavior)
                 try:
                     content = client._content()
-                    # Create container view
                     container = content.rootFolder
                     viewType = [vim.VirtualMachine]
                     recursive = True
                     containerView = content.viewManager.CreateContainerView(container, viewType, recursive)
                     try:
-                        # Traversal spec
                         traversal = vmodl.query.PropertyCollector.TraversalSpec(
                             name="traverseEntities",
                             type=vim.view.ContainerView,
                             path="view",
                             skip=False,
                         )
-                        # Object spec
                         obj_spec = vmodl.query.PropertyCollector.ObjectSpec(
                             obj=containerView,
                             skip=True,
                             selectSet=[traversal],
                         )
-                        # Property specs
                         property_spec = vmodl.query.PropertyCollector.PropertySpec(
                             type=vim.VirtualMachine,
                             all=False,
@@ -251,12 +516,10 @@ class VsphereMode:
                                 "guest.guestState",
                             ],
                         )
-                        # Filter spec
                         filter_spec = vmodl.query.PropertyCollector.FilterSpec(
                             propSet=[property_spec],
                             objectSet=[obj_spec],
                         )
-                        # Retrieve
                         props = content.propertyCollector.RetrieveContents([filter_spec])
                         vms = []
                         for obj in props:
@@ -470,7 +733,6 @@ class VsphereMode:
                 if not vm:
                     raise Fatal(2, f"vsphere: VM not found: {self.args.vm_name}")
 
-                # Find snapshot by name
                 snapshots = []
                 if vm.snapshot:
 
@@ -498,7 +760,7 @@ class VsphereMode:
                     raise Fatal(2, "vsphere query_changed_disk_areas: --device-key or --disk is required")
 
                 start_offset = self.args.start_offset
-                change_id = self.args.change_id
+                change_id = getattr(self.args, "change_id", None)
                 try:
                     changed = client.query_changed_disk_areas(
                         vm, snapshot=snapshot, device_key=device_key, start_offset=start_offset, change_id=change_id
@@ -573,7 +835,7 @@ class VsphereMode:
                     print(f"Downloaded disk from VM {self.args.vm_name} to {local_path}")
                 return 0
 
-            # ✅ NEW: download-only VM folder pull (no guest inspection; no virt-v2v)
+            # ✅ download-only VM folder pull (now with govmomi listing when available)
             if action == "download_only_vm":
                 if not getattr(self.args, "vm_name", None):
                     raise Fatal(2, "vsphere download_only_vm: --vm_name is required")
@@ -601,6 +863,16 @@ class VsphereMode:
                     raise Fatal(2, "vsphere download_only_vm: cannot determine VM folder (vm.summary.config.vmPathName missing)")
 
                 ds_name, folder = self._parse_vm_datastore_dir(str(vmx_path))
+
+                # ✅ YAML/CLI override: force datastore folder even if summary lies
+                override = getattr(self.args, "vs_datastore_dir", None)
+                if override:
+                    try:
+                        ds_name, folder = self._parse_datastore_dir_override(str(override), default_ds=ds_name)
+                        self.logger.info(f"download_only_vm: using vs_datastore_dir override: [{ds_name}] {folder or '.'}")
+                    except Exception as e:
+                        raise Fatal(2, f"vsphere download_only_vm: invalid vs_datastore_dir={override!r}: {e}")
+
                 ds_obj = self._find_datastore_obj(client, ds_name)
 
                 files = self._list_vm_folder_files(
@@ -624,6 +896,7 @@ class VsphereMode:
                         "output_dir": str(out_dir),
                         "include_glob": include_glob,
                         "exclude_glob": exclude_glob,
+                        "used_govmomi": self._prefer_govmomi(),
                     }
                     if self.args.json:
                         print(json.dumps(output, indent=2, default=str))
@@ -631,16 +904,56 @@ class VsphereMode:
                         print("No files matched; nothing downloaded.")
                     return 0
 
-                self.logger.info(f"download_only_vm: matched {len(files)} files in [{ds_name}] {folder or '.'}")
+                self.logger.info(
+                    f"download_only_vm: matched {len(files)} files in [{ds_name}] {folder or '.'} "
+                    f"(listing={'govc' if self._prefer_govmomi() else 'pyvmomi'})"
+                )
 
                 verify_tls = not client.insecure
                 dc_name = self._dc_name()
 
-                downloaded: list[str] = []
-                errors: list[str] = []
+                
+                downloaded: List[str] = []
+                errors: List[str] = []
+
+                # Progress UI (TTY-only, and suppressed in --json mode to avoid corrupting JSON output)
+                progress = None
+                files_task = None
+                bytes_task = None
+                progress_lock = threading.Lock()
+
+                if (Progress is not None) and (not getattr(self.args, "json", False)):
+                    try:
+                        progress = Progress(
+                            SpinnerColumn(),
+                            TextColumn("[bold]{task.description}[/bold]"),
+                            BarColumn(),
+                            TextColumn("{task.completed}/{task.total}" if "{task.total}" else ""),
+                            TransferSpeedColumn(),
+                            TimeElapsedColumn(),
+                            transient=False,
+                        )
+                        files_task = progress.add_task("files", total=len(files))
+                        # bytes task is indeterminate (total unknown); we still advance it for live throughput.
+                        bytes_task = progress.add_task("bytes", total=None)
+                    except Exception:
+                        progress = None
+                        files_task = None
+                        bytes_task = None
 
                 def _job(ds_path: str) -> None:
                     local_path = out_dir / ds_path
+
+                    def _on_bytes(n: int, total: int) -> None:
+                        if progress is None:
+                            return
+                        with progress_lock:
+                            if bytes_task is not None:
+                                progress.advance(bytes_task, n)
+                            if files_task is not None:
+                                # keep the currently active filename visible
+                                progress.update(files_task, description=f"downloading: {ds_path}")
+
                     try:
                         self._download_one_folder_file(
                             client=client,
@@ -650,26 +963,46 @@ class VsphereMode:
                             ds_path=ds_path,
                             local_path=local_path,
                             verify_tls=verify_tls,
+                            on_bytes=_on_bytes,
                         )
                         downloaded.append(ds_path)
+                        if progress is not None:
+                            with progress_lock:
+                                if files_task is not None:
+                                    progress.advance(files_task, 1)
                     except Exception as e:
                         msg = f"{ds_path}: {e}"
                         errors.append(msg)
+                        if progress is not None:
+                            with progress_lock:
+                                if files_task is not None:
+                                    progress.update(files_task, description=f"error: {ds_path}")
                         if fail_on_missing:
                             raise
 
-                if concurrency <= 1:
-                    for p in files:
-                        _job(p)
+
+                
+                # Run downloads (optionally under Rich progress context)
+                def _run_all() -> None:
+                    if concurrency <= 1:
+                        for p in files:
+                            _job(p)
+                    else:
+                        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                            futs = {ex.submit(_job, p): p for p in files}
+                            for fut in as_completed(futs):
+                                try:
+                                    fut.result()
+                                except Exception:
+                                    if fail_on_missing:
+                                        raise Fatal(2, f"download_only_vm: failed: {errors[-1] if errors else 'unknown'}")
+
+                if progress is not None:
+                    with progress:
+                        _run_all()
                 else:
-                    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-                        futs = {ex.submit(_job, p): p for p in files}
-                        for fut in as_completed(futs):
-                            try:
-                                fut.result()
-                            except Exception:
-                                if fail_on_missing:
-                                    raise Fatal(2, f"download_only_vm: failed: {errors[-1] if errors else 'unknown'}")
+                    _run_all()
+
 
                 output = {
                     "status": "success" if not errors else "partial",
@@ -685,6 +1018,9 @@ class VsphereMode:
                     "concurrency": concurrency,
                     "dc_name": dc_name,
                     "verify_tls": verify_tls,
+                    "used_govmomi": self._prefer_govmomi(),
+                    "govc_bin": self.govc.govc_bin if self._prefer_govmomi() else None,
+                    "vs_datastore_dir": str(override) if override else None,
                 }
                 if self.args.json:
                     print(json.dumps(output, indent=2, default=str))
@@ -743,14 +1079,14 @@ class VsphereMode:
                 try:
                     device_key = disk.key
 
-                    # NOTE: your argparse must define change_id for cbt_sync, or this will throw.
-                    # We preserve existing behavior here; if missing, you'll get AttributeError.
+                    change_id = getattr(self.args, "change_id", None)
+
                     changed = client.query_changed_disk_areas(
                         vm,
                         snapshot=snap,
                         device_key=device_key,
                         start_offset=0,
-                        change_id=self.args.change_id,
+                        change_id=change_id,
                     )
 
                     if not getattr(changed, "changedDiskAreas", None):
@@ -760,12 +1096,12 @@ class VsphereMode:
                     else:
                         num_ranges = len(changed.changedDiskAreas)
 
-                        # apply ranges via HTTP Range requests
                         if not REQUESTS_AVAILABLE:
                             raise Fatal(2, "requests not installed. Install: pip install requests")
 
-                        dc_name = self._dc_name()  # ✅ NEW: safe default
-                        url = f"https://{vc_host}/folder/{ds_path}?dcPath={dc_name}&dsName={datastore}"
+                        dc_name = self._dc_name()
+                        quoted = quote(ds_path, safe="/")
+                        url = f"https://{vc_host}/folder/{quoted}?dcPath={quote(dc_name)}&dsName={quote(datastore)}"
                         headers = {"Cookie": client._session_cookie()}
                         verify = not client.insecure
 
@@ -805,7 +1141,6 @@ class VsphereMode:
 
                 finally:
                     try:
-                        # best-effort cleanup
                         task = snap.RemoveSnapshot_Task(removeChildren=False)
                         client.wait_for_task(task)
                     except Exception as e:

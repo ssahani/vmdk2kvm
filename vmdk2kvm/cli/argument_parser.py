@@ -11,11 +11,12 @@ from ..config.systemd_template import SYSTEMD_UNIT_TEMPLATE
 from ..core.logger import c
 from ..core.utils import U
 from ..fixers.fstab_rewriter import FstabMode
-from .help_texts import YAML_EXAMPLE, FEATURE_SUMMARY, SYSTEMD_EXAMPLE
+from .help_texts import FEATURE_SUMMARY, SYSTEMD_EXAMPLE, YAML_EXAMPLE
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
     """Combines raw description formatting with default value display in help."""
+
     pass
 
 
@@ -80,8 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
     # Flatten/convert
     # ------------------------------------------------------------------
     p.add_argument("--flatten", action="store_true", help="Flatten snapshot chain into a single working image first.")
-    p.add_argument("--flatten-format", dest="flatten_format", default="qcow2", choices=["qcow2", "raw"], help="Flatten output format.")
-    p.add_argument("--to-output", dest="to_output", default=None, help="Convert final working image to this path (relative to output-dir if not absolute).")
+    p.add_argument(
+        "--flatten-format", dest="flatten_format", default="qcow2", choices=["qcow2", "raw"], help="Flatten output format."
+    )
+    p.add_argument(
+        "--to-output",
+        dest="to_output",
+        default=None,
+        help="Convert final working image to this path (relative to output-dir if not absolute).",
+    )
     p.add_argument("--out-format", dest="out_format", default="qcow2", choices=["qcow2", "raw", "vdi"], help="Output format.")
     p.add_argument("--compress", action="store_true", help="Compression (qcow2 only).")
     p.add_argument("--compress-level", dest="compress_level", type=int, choices=range(1, 10), default=None, help="Compression level 1-9.")
@@ -111,16 +119,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--virtio-drivers-dir", dest="virtio_drivers_dir", default=None, help="Path to virtio-win drivers directory for Windows injection.")
     p.add_argument("--post-v2v", dest="post_v2v", action="store_true", help="Run virt-v2v after internal fixes.")
     p.add_argument("--use-v2v", dest="use_v2v", action="store_true", help="Use virt-v2v for conversion if available.")
-    p.add_argument("--v2v-parallel", dest="v2v_parallel", action="store_true", help="Run multiple virt-v2v jobs in parallel when multiple disks/images are provided (experimental).")
-    p.add_argument("--v2v-concurrency", dest="v2v_concurrency", type=int, default=2, help="Max concurrent virt-v2v jobs when --v2v-parallel is set (default: 2).")
+    p.add_argument(
+        "--v2v-parallel",
+        dest="v2v_parallel",
+        action="store_true",
+        help="Run multiple virt-v2v jobs in parallel when multiple disks/images are provided (experimental).",
+    )
+    p.add_argument(
+        "--v2v-concurrency",
+        dest="v2v_concurrency",
+        type=int,
+        default=2,
+        help="Max concurrent virt-v2v jobs when --v2v-parallel is set (default: 2).",
+    )
 
     # ------------------------------------------------------------------
     # LUKS knobs
     # ------------------------------------------------------------------
-    p.add_argument("--luks-passphrase", dest="luks_passphrase", default=os.environ.get("VMDK2KVM_LUKS_PASSPHRASE"), help="Passphrase for LUKS-encrypted disks (or set VMDK2KVM_LUKS_PASSPHRASE env var).")
-    p.add_argument("--luks-passphrase-env", dest="luks_passphrase_env", default=None, help="Env var containing LUKS passphrase (overrides --luks-passphrase if set at runtime).")
+    p.add_argument(
+        "--luks-passphrase",
+        dest="luks_passphrase",
+        default=os.environ.get("VMDK2KVM_LUKS_PASSPHRASE"),
+        help="Passphrase for LUKS-encrypted disks (or set VMDK2KVM_LUKS_PASSPHRASE env var).",
+    )
+    p.add_argument(
+        "--luks-passphrase-env",
+        dest="luks_passphrase_env",
+        default=None,
+        help="Env var containing LUKS passphrase (overrides --luks-passphrase if set at runtime).",
+    )
     p.add_argument("--luks-keyfile", dest="luks_keyfile", default=None, help="Path to LUKS keyfile (binary/text). Overrides passphrase if provided.")
-    p.add_argument("--luks-mapper-prefix", dest="luks_mapper_prefix", default="vmdk2kvm-crypt", help="Mapper name prefix for opened LUKS devices (default: vmdk2kvm-crypt).")
+    p.add_argument(
+        "--luks-mapper-prefix",
+        dest="luks_mapper_prefix",
+        default="vmdk2kvm-crypt",
+        help="Mapper name prefix for opened LUKS devices (default: vmdk2kvm-crypt).",
+    )
     p.add_argument("--luks-enable", dest="luks_enable", action="store_true", help="Explicitly enable LUKS unlocking (otherwise inferred from passphrase/keyfile).")
 
     # ------------------------------------------------------------------
@@ -145,11 +179,33 @@ def build_parser() -> argparse.ArgumentParser:
     # ------------------------------------------------------------------
     # OVF/OVA knobs
     # ------------------------------------------------------------------
-    p.add_argument("--log-virt-filesystems", dest="log_virt_filesystems", action="store_true", help="For OVA/OVF inputs, log `virt-filesystems --all --long -h` for each disk.")
-    p.add_argument("--ova-convert-to-qcow2", dest="ova_convert_to_qcow2", action="store_true", help="For OVA/OVF inputs, convert extracted VMDK(s) to qcow2 before continuing pipeline.")
-    p.add_argument("--ova-qcow2-dir", dest="ova_qcow2_dir", default=None, help="Output directory for qcow2 images created from OVA/OVF disks (default: <output-dir>/qcow2).")
+    p.add_argument(
+        "--log-virt-filesystems",
+        dest="log_virt_filesystems",
+        action="store_true",
+        help="For OVA/OVF inputs, log `virt-filesystems --all --long -h` for each disk.",
+    )
+    p.add_argument(
+        "--ova-convert-to-qcow2",
+        dest="ova_convert_to_qcow2",
+        action="store_true",
+        help="For OVA/OVF inputs, convert extracted VMDK(s) to qcow2 before continuing pipeline.",
+    )
+    p.add_argument(
+        "--ova-qcow2-dir",
+        dest="ova_qcow2_dir",
+        default=None,
+        help="Output directory for qcow2 images created from OVA/OVF disks (default: <output-dir>/qcow2).",
+    )
     p.add_argument("--ova-convert-compress", dest="ova_convert_compress", action="store_true", help="When converting OVA/OVF disks to qcow2, enable compression.")
-    p.add_argument("--ova-convert-compress-level", dest="ova_convert_compress_level", type=int, choices=range(1, 10), default=None, help="Compression level 1-9 for qcow2 conversion of OVA/OVF disks.")
+    p.add_argument(
+        "--ova-convert-compress-level",
+        dest="ova_convert_compress_level",
+        type=int,
+        choices=range(1, 10),
+        default=None,
+        help="Compression level 1-9 for qcow2 conversion of OVA/OVF disks.",
+    )
 
     # ------------------------------------------------------------------
     # AMI/cloud tarball extraction knobs
@@ -157,18 +213,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extract-nested-tar", dest="extract_nested_tar", action="store_true", help="For AMI/cloud tarballs: extract one level of nested tarballs (tar-in-tar).")
     p.add_argument("--no-extract-nested-tar", dest="extract_nested_tar", action="store_false", help="Disable nested tar extraction for AMI/cloud tarballs.")
     p.set_defaults(extract_nested_tar=True)
-    p.add_argument("--convert-payload-to-qcow2", dest="convert_payload_to_qcow2", action="store_true", help="For AMI/cloud tarballs: convert extracted payload disk(s) to qcow2 before continuing pipeline.")
-    p.add_argument("--payload-qcow2-dir", dest="payload_qcow2_dir", default=None, help="Output directory for qcow2 created from AMI/cloud payload disks (default: <output-dir>/qcow2).")
+    p.add_argument(
+        "--convert-payload-to-qcow2",
+        dest="convert_payload_to_qcow2",
+        action="store_true",
+        help="For AMI/cloud tarballs: convert extracted payload disk(s) to qcow2 before continuing pipeline.",
+    )
+    p.add_argument(
+        "--payload-qcow2-dir",
+        dest="payload_qcow2_dir",
+        default=None,
+        help="Output directory for qcow2 created from AMI/cloud payload disks (default: <output-dir>/qcow2).",
+    )
     p.add_argument("--payload-convert-compress", dest="payload_convert_compress", action="store_true", help="When converting AMI/cloud payload disks to qcow2, enable compression.")
-    p.add_argument("--payload-convert-compress-level", dest="payload_convert_compress_level", type=int, choices=range(1, 10), default=None, help="Compression level 1-9 for qcow2 conversion of AMI/cloud payload disks.")
+    p.add_argument(
+        "--payload-convert-compress-level",
+        dest="payload_convert_compress_level",
+        type=int,
+        choices=range(1, 10),
+        default=None,
+        help="Compression level 1-9 for qcow2 conversion of AMI/cloud payload disks.",
+    )
 
     # ------------------------------------------------------------------
     # Former subcommand args, promoted to globals (YAML-driven; CLI overrides)
     # ------------------------------------------------------------------
-    # local:
     p.add_argument("--vmdk", default=None, help="Local VMDK path (descriptor OR monolithic/binary VMDK)")
-
-    # ova/ovf/vhd/ami inputs:
     p.add_argument("--ova", default=None, help="Path to .ova")
     p.add_argument("--ovf", default=None, help="Path to .ovf (disks in same dir)")
     p.add_argument("--vhd", default=None, help="Path to .vhd OR tarball containing a .vhd (e.g. .tar/.tar.gz/.tgz).")
@@ -199,7 +269,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vc-insecure", dest="vc_insecure", action="store_true", help="Disable TLS verification")
     p.add_argument("--dc-name", dest="dc_name", default="ha-datacenter", help="Datacenter name for /folder URL (default: ha-datacenter)")
 
-    p.add_argument("--vs-v2v", dest="vs_v2v", action="store_true", help="EXPERIMENTAL: export VM(s) directly from vSphere via virt-v2v (VDDK/SSH) and then run normal pipeline.")
+    # ------------------------------------------------------------------
+    # vSphere control-plane selection: govc vs pyvmomi
+    # ------------------------------------------------------------------
+    p.add_argument(
+        "--vs-control-plane",
+        dest="vs_control_plane",
+        default=None,
+        choices=["auto", "govc", "pyvmomi"],
+        help="vSphere control-plane backend: auto (prefer govc), govc, or pyvmomi.",
+    )
+
+    # govc context knobs (CLI overrides; YAML can carry same keys)
+    p.add_argument("--govc-url", dest="govc_url", default=None, help="govc URL (e.g. https://vcenter/sdk or https://esxi/sdk).")
+    p.add_argument("--govc-user", dest="govc_user", default=None, help="govc username (defaults to vc_user if unset).")
+    p.add_argument("--govc-password", dest="govc_password", default=None, help="govc password (defaults to vc_password if unset).")
+    p.add_argument("--govc-password-env", dest="govc_password_env", default=None, help="Env var containing govc password.")
+    p.add_argument("--govc-insecure", dest="govc_insecure", action="store_true", help="govc: disable TLS verification.")
+    p.add_argument("--govc-datacenter", dest="govc_datacenter", default=None, help="govc datacenter (GOVC_DATACENTER).")
+    p.add_argument("--govc-cluster", dest="govc_cluster", default=None, help="govc cluster (optional).")
+    p.add_argument("--govc-folder", dest="govc_folder", default=None, help="govc inventory folder root (optional).")
+    p.add_argument("--govc-ds", dest="govc_ds", default=None, help="govc datastore default (optional).")
+    p.add_argument("--govc-resource-pool", dest="govc_resource_pool", default=None, help="govc resource pool (optional).")
+    p.add_argument("--govc-stdout-json", dest="govc_stdout_json", action="store_true", help="Prefer govc JSON output where supported.")
+
+    # ------------------------------------------------------------------
+    # Existing virt-v2v vSphere export knobs, download-only knobs, VDDK knobs...
+    # ------------------------------------------------------------------
+    p.add_argument(
+        "--vs-v2v",
+        dest="vs_v2v",
+        action="store_true",
+        help="EXPERIMENTAL: export VM(s) directly from vSphere via virt-v2v (VDDK/SSH) and then run normal pipeline.",
+    )
     p.add_argument("--vs-vm", dest="vs_vm", default=None, help="VM name to export (alternative to --vm-name).")
     p.add_argument("--vs-vms", dest="vs_vms", nargs="*", default=None, help="Multiple VM names to export.")
     p.add_argument("--vs-datacenter", dest="vs_datacenter", default="ha-datacenter", help="Datacenter name (default: ha-datacenter)")
@@ -217,7 +319,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vs-v2v-extra-args", dest="vs_v2v_extra_args", action="append", default=[], help="Extra args passed through to virt-v2v (repeatable).")
     p.add_argument("--vs-no-verify", dest="vs_no_verify", action="store_true", help="Disable TLS verification for virt-v2v vpx:// input (use with caution).")
 
-    p.add_argument("--include-glob", dest="vs_include_glob", action="append", default=[], help="download-only VM folder: include file glob (repeatable). Default is ['*'] if none supplied.")
+    p.add_argument(
+        "--include-glob",
+        dest="vs_include_glob",
+        action="append",
+        default=[],
+        help="download-only VM folder: include file glob (repeatable). Default is ['*'] if none supplied.",
+    )
     p.add_argument("--exclude-glob", dest="vs_exclude_glob", action="append", default=[], help="download-only VM folder: exclude file glob (repeatable).")
     p.add_argument("--concurrency", dest="vs_concurrency", type=int, default=4, help="download-only VM folder: concurrent downloads (default: 4).")
     p.add_argument("--max-files", dest="vs_max_files", type=int, default=5000, help="download-only VM folder: refuse to download more than this many files (default: 5000).")
@@ -278,6 +386,22 @@ def _merged_get(args: argparse.Namespace, conf: Dict[str, Any], key: str) -> Any
     if _require(v):
         return v
     return conf.get(key)
+
+
+def _merged_secret(args: argparse.Namespace, conf: Dict[str, Any], value_key: str, env_key: str) -> Optional[str]:
+    """
+    Resolve a secret from (CLI value) or (CLI env var name) or (YAML value) or (YAML env var name).
+    Example: (vc_password, vc_password_env)
+    """
+    direct = _merged_get(args, conf, value_key)
+    if _require(direct):
+        return str(direct)
+
+    envname = _merged_get(args, conf, env_key)
+    if _require(envname):
+        return os.environ.get(str(envname), None)
+
+    return None
 
 
 def _merged_cmd(args: argparse.Namespace, conf: Dict[str, Any]) -> Optional[str]:
@@ -356,34 +480,63 @@ def validate_args(args: argparse.Namespace, conf: Dict[str, Any]) -> None:
             raise SystemExit("cmd=live-fix: missing required `host:` (YAML) or CLI --host")
 
     elif cmd_l == "generate-systemd":
-        # systemd_output optional; nothing else required here
         pass
 
     elif cmd_l == "daemon":
-        # watch_dir optional; nothing else required here
         pass
 
     elif cmd_l == "vsphere":
-        # NOTE: yaml keys likely use vc_user, vcenter, etc.
+        # Core identity
         vcenter = _merged_get(args, conf, "vcenter")
         vc_user = _merged_get(args, conf, "vc_user")
+        vc_password = _merged_secret(args, conf, "vc_password", "vc_password_env")
+
         if not _require(vcenter):
             raise SystemExit("cmd=vsphere: missing required `vcenter:` (YAML) or CLI --vcenter")
         if not _require(vc_user):
             raise SystemExit("cmd=vsphere: missing required `vc_user:` (YAML) or CLI --vc-user")
+        if not _require(vc_password):
+            raise SystemExit("cmd=vsphere: missing vCenter password. Set `vc_password:` or `vc_password_env:` (or CLI equivalents).")
+
+        # Control-plane selection (auto/govc/pyvmomi)
+        vs_cp = _merged_get(args, conf, "vs_control_plane")
+        if not _require(vs_cp):
+            vs_cp = conf.get("vs_control_plane", None) or "auto"
+        vs_cp = str(vs_cp).strip().lower()
+
+        # govc derived identity (only required if backend=govc)
+        govc_url = _merged_get(args, conf, "govc_url")
+        govc_user = _merged_get(args, conf, "govc_user") or vc_user
+        govc_password = _merged_secret(args, conf, "govc_password", "govc_password_env") or vc_password
+
+        if not _require(govc_url) and _require(vcenter):
+            govc_url = f"https://{str(vcenter).strip()}/sdk"
+
+        if vs_cp == "govc":
+            if not _require(govc_url):
+                raise SystemExit("cmd=vsphere: vs_control_plane=govc requires `govc_url:` (or it must be derivable).")
+            if not _require(govc_user):
+                raise SystemExit("cmd=vsphere: vs_control_plane=govc requires `govc_user:` (or `vc_user:`).")
+            if not _require(govc_password):
+                raise SystemExit("cmd=vsphere: vs_control_plane=govc requires `govc_password:`/`govc_password_env:` (or `vc_password:`).")
+
+        elif vs_cp in ("pyvmomi", "auto"):
+            # pyvmomi uses vc_* keys which are already validated above
+            pass
+        else:
+            raise SystemExit(f"cmd=vsphere: invalid vs_control_plane={vs_cp!r} (use auto|govc|pyvmomi)")
 
         act = _merged_vs_action(args, conf)
         if not _require(act):
             raise SystemExit("cmd=vsphere: missing required `vs_action:` (YAML) or CLI --vs-action")
-
         act = str(act).strip()
 
-        # For action-specific required params, we accept either:
-        #  - YAML keys (vm_name, name, label_or_index, datastore, ds_path, local_path, ...)
-        #  - Or global CLI overrides
+        # Action-specific args
         vm_name = conf.get("vm_name", None)
         if not _require(vm_name):
             vm_name = getattr(args, "vm_name_vsphere", None)
+        if not _require(vm_name):
+            vm_name = getattr(args, "vs_vm", None) or (getattr(args, "vs_vms", None)[0] if getattr(args, "vs_vms", None) else None)
 
         name = conf.get("name", None)
         if not _require(name):
@@ -409,7 +562,7 @@ def validate_args(args: argparse.Namespace, conf: Dict[str, Any]) -> None:
             "vddk_download_disk",
         }
         if act in needs_vm and not _require(vm_name):
-            raise SystemExit(f"cmd=vsphere vs_action={act}: missing required `vm_name:` (YAML) or CLI --vm_name")
+            raise SystemExit(f"cmd=vsphere vs_action={act}: missing required `vm_name:` (YAML) or CLI --vm_name (or --vs-vm)")
 
         if act == "get_vm_by_name" and not _require(name):
             raise SystemExit("cmd=vsphere vs_action=get_vm_by_name: missing required `name:` (YAML) or CLI --name")
@@ -426,6 +579,13 @@ def validate_args(args: argparse.Namespace, conf: Dict[str, Any]) -> None:
             if not _require(local_path):
                 raise SystemExit(f"cmd=vsphere vs_action={act}: missing required `local_path:` (YAML) or CLI --local_path")
 
+        if act == "download_only_vm":
+            outd = conf.get("vs_output_dir", None)
+            if not _require(outd):
+                outd = getattr(args, "vs_output_dir", None) or getattr(args, "output_dir", None)
+            if not _require(outd):
+                raise SystemExit("cmd=vsphere vs_action=download_only_vm: missing `vs_output_dir:` (or set --output-dir).")
+
         if act == "query_changed_disk_areas":
             device_key = conf.get("device_key", None) if _require(conf.get("device_key", None)) else getattr(args, "device_key", None)
             disk = conf.get("disk", None) if _require(conf.get("disk", None)) else getattr(args, "disk", None)
@@ -433,7 +593,6 @@ def validate_args(args: argparse.Namespace, conf: Dict[str, Any]) -> None:
                 raise SystemExit("cmd=vsphere vs_action=query_changed_disk_areas: must set `device_key:` OR `disk:` in YAML (or CLI overrides).")
 
     else:
-        # Unknown cmd: allow, but it's probably a mis-typo
         raise SystemExit(f"Unknown cmd={cmd!r}. Set YAML `cmd:` to a supported operation.")
 
 
@@ -473,6 +632,7 @@ def parse_args_with_config(
 
     if logger is None:
         from ..core.logger import Log  # local import to avoid cycles
+
         logger = Log.setup(getattr(args0, "verbose", 0), getattr(args0, "log_file", None))
 
     conf: Dict[str, Any] = {}

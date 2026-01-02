@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,19 @@ from urllib.parse import quote
 # ---------------------------------------------------------------------------
 # Errors / creds resolver (robust import fallbacks)
 # ---------------------------------------------------------------------------
+
+# govc/govmomi helper primitives live in a shared module so both the CLI
+# (vsphere_mode.py) and the library client can use the exact same behavior.
+try:
+    from .govc_common import GovcRunner, normalize_ds_path, extract_paths_from_datastore_ls_json
+except Exception:  # pragma: no cover
+    GovcRunner = None  # type: ignore
+
+    def normalize_ds_path(datastore: str, ds_path: str) -> Tuple[str, str]:  # type: ignore
+        raise RuntimeError("govc_common.normalize_ds_path unavailable")
+
+    def extract_paths_from_datastore_ls_json(obj: Any) -> List[str]:  # type: ignore
+        return []
 
 try:
     # Your repo says: from ..core.exceptions import VMwareError
@@ -66,6 +81,13 @@ except Exception:  # pragma: no cover
     REQUESTS_AVAILABLE = False
 
 
+# Optional: silence urllib3 TLS warnings when verify=False
+try:  # pragma: no cover
+    import urllib3  # type: ignore
+except Exception:  # pragma: no cover
+    urllib3 = None  # type: ignore
+
+
 # Optional: Async HTTP download (aiohttp + aiofiles)
 try:
     import aiohttp  # type: ignore
@@ -102,6 +124,34 @@ except Exception:  # pragma: no cover
 _BACKING_RE = re.compile(r"\[(.+?)\]\s+(.*)")
 _SHA1_40_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# ✅ NEW: parse VMware-style backing filename "[ds] path" (for govc normalization too)
+_DS_BACKING_RE = re.compile(r"^\[(?P<ds>[^\]]+)\]\s*(?P<path>.+)$")
+
+
+def _normalize_ds_path(datastore: str, ds_path: str) -> Tuple[str, str]:
+    """
+    Normalize datastore paths for govc.
+
+    Accepts:
+      - "[datastore] folder/file"
+      - "folder/file"
+      - "/folder/file"
+
+    Returns:
+      (datastore, "folder/file")  # datastore-relative, no leading slash
+    """
+    s = (ds_path or "").strip()
+    if not s:
+        raise VMwareError("empty datastore path")
+
+    m = _DS_BACKING_RE.match(s)
+    if m:
+        ds = (m.group("ds") or "").strip()
+        path = (m.group("path") or "").strip()
+        return (ds or datastore), path.lstrip("/")
+
+    return datastore, s.lstrip("/")
+
 
 def _run_coro_sync(coro: "asyncio.Future[Any] | asyncio.coroutines.Coroutine[Any, Any, Any]") -> Any:
     """
@@ -126,11 +176,154 @@ def _run_coro_sync(coro: "asyncio.Future[Any] | asyncio.coroutines.Coroutine[Any
 
 
 # ---------------------------------------------------------------------------
-# Options
+# ✅ govc (govmomi CLI) helper
 # ---------------------------------------------------------------------------
 
+class GovmomiCLI(GovcRunner):
+    """
+    Best-effort integration with govmomi CLI (`govc`).
 
-@dataclass(frozen=True)
+    This is intentionally additive:
+      - If govc isn't present or user disabled govmomi, callers should fall back.
+      - This wrapper provides a small set of helpers used by VMwareClient
+        (inventory traversal + datastore listing/downloading).
+
+    Common env + execution logic is centralized in govc_common.py.
+    """
+
+    def __init__(self, logger: Any, args: Any):
+        super().__init__(logger=logger, args=args)
+
+    # Backwards-compatible aliases (older code called these)
+    def _env(self) -> Dict[str, str]:
+        return self.env()
+
+    def _run_text(self, cmd: List[str]) -> str:
+        return self.run_text(cmd)
+
+    def _run_json(self, cmd: List[str]) -> Any:
+        return self.run_json(cmd)
+
+    def _run(self, cmd: List[str]) -> subprocess.CompletedProcess[str]:
+        full = [self.govc_bin] + cmd
+        try:
+            self.logger.debug("govc: %s", " ".join(full))
+        except Exception:
+            pass
+        return subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env(), text=True)
+
+    # -------------------------
+    # inventory
+    # -------------------------
+
+    def list_vm_names(self) -> List[str]:
+        data = self.run_json(["find", "-type", "m", "-json", "."]) or {}
+        elems = data.get("Elements") or []
+        if not isinstance(elems, list):
+            elems = []
+        names = [str(p).split("/")[-1] for p in elems if p]
+        return sorted({n for n in names if n})
+
+    # -------------------------
+    # datastore listing
+    # -------------------------
+
+    def datastore_ls(self, datastore: str, ds_dir: str) -> List[str]:
+        """Text-mode listing (one name per line)."""
+        return self.datastore_ls_text(datastore, ds_dir)
+
+    def datastore_ls_json(self, datastore: str, ds_dir: str) -> List[str]:
+        """
+        JSON-mode listing via `govc datastore.ls -json`.
+
+        Returns entries relative to ds_dir when possible.
+        """
+        ds, rel = normalize_ds_path(datastore, ds_dir)
+        rel = rel.rstrip("/") + "/"
+        data = self.run_json(["datastore.ls", "-json", "-ds", str(ds), rel]) or {}
+        paths = extract_paths_from_datastore_ls_json(data)
+
+        base = rel.lstrip("/")
+        prefix = base.rstrip("/") + "/"
+        out: List[str] = []
+        for p in paths:
+            pp = str(p).lstrip("/")
+            if base and pp.startswith(prefix):
+                pp = pp[len(prefix):]
+            if pp:
+                out.append(pp)
+        return out
+
+    # -------------------------
+    # datastore download
+    # -------------------------
+
+    def datastore_download(self, datastore: str, ds_path: str, local_path: Path) -> None:
+        """
+        Download a single datastore file via:
+          govc datastore.download -ds <datastore> <remote> <local>
+        """
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        ds, remote = normalize_ds_path(datastore, ds_path)
+        if not remote:
+            raise VMwareError("govc datastore.download: empty ds_path after normalization")
+
+        p = self._run(["datastore.download", "-ds", str(ds), remote, str(local_path)])
+        if p.returncode != 0:
+            raise VMwareError(f"govc datastore.download failed ({p.returncode}): {p.stderr.strip()}")
+
+    def datastore_download_dir(
+        self,
+        datastore: str,
+        ds_dir: str,
+        local_dir: Path,
+        *,
+        include_globs: Tuple[str, ...] = ("*",),
+        exclude_globs: Tuple[str, ...] = (),
+        max_files: int = 5000,
+        json_listing: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Non-recursive directory download using:
+          - govc datastore.ls (text or json)
+          - govc datastore.download (per file)
+
+        include/exclude are filename globs (not path globs) applied to the listed names.
+        """
+        ds, rel_dir = normalize_ds_path(datastore, ds_dir)
+        rel_dir = rel_dir.rstrip("/") + "/"
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        names = self.datastore_ls_json(ds, rel_dir) if json_listing else self.datastore_ls(ds, rel_dir)
+
+        picked: List[str] = []
+        for n in names:
+            ok = True
+            if include_globs:
+                ok = any(fnmatch.fnmatch(n, g) for g in include_globs)
+            if ok and exclude_globs:
+                if any(fnmatch.fnmatch(n, g) for g in exclude_globs):
+                    ok = False
+            if ok:
+                picked.append(n)
+            if len(picked) >= int(max_files or 5000):
+                break
+
+        for n in picked:
+            remote = rel_dir + n
+            dst = local_dir / n
+            self.datastore_download(ds, remote, dst)
+
+        return {
+            "ok": True,
+            "provider": "govc",
+            "datastore": str(ds),
+            "ds_dir": rel_dir,
+            "local_dir": str(local_dir),
+            "files_total": len(names),
+            "files_downloaded": len(picked),
+            "files": picked,
+        }
 class V2VExportOptions:
     """
     Export / download options.
@@ -233,6 +426,10 @@ class VMwareClient:
       - HTTPS /folder downloads via session cookie (requests or aiohttp)
       - virt-v2v command builder + runner
       - ✅ NEW: VDDK raw disk downloader (optional)
+      - ✅ NEW: Prefer govc (if present) for:
+          - list VM names (fast)
+          - datastore downloads (robust; avoids /folder cookie + dcPath bugs)
+          - optional datastore.ls / dir downloads (helpers)
 
     Key fixes:
       ✅ compute path is host-system path (host/<cluster>/<esx>) not cluster-only
@@ -241,6 +438,7 @@ class VMwareClient:
       ✅ avoids repeated CreateContainerView where possible via simple caches
       ✅ NEW: download-only mode (no guest inspection; datastore folder download)
       ✅ NEW: vddk_download mode (single disk direct VDDK pull)
+      ✅ NEW: govc prefer-if-present (additive, safe fallback)
     """
 
     def __init__(
@@ -272,6 +470,11 @@ class VMwareClient:
         # optional acceleration caches
         self._vm_name_cache: Optional[List[str]] = None
         self._vm_obj_by_name_cache: Dict[str, Any] = {}
+
+        # ✅ govc preference (auto if present)
+        self.govc_bin = os.environ.get("GOVC_BIN", "govc")
+        self.no_govmomi = False  # can be set via config (no_govmomi: true)
+        self._govc_client: Optional[GovmomiCLI] = None
 
     # ---------------------------------------------------------------------
     # build from config using shared resolver (vs_* + vc_* + *_env)
@@ -308,10 +511,37 @@ class VMwareClient:
         c = cls(logger, creds.host, creds.user, creds.password, port=p, insecure=ins, timeout=timeout)
         if isinstance(c.password, str):
             c.password = c.password.strip()
+
+        # ✅ govc knobs (additive)
+        c.govc_bin = str(cfg.get("govc_bin") or os.environ.get("GOVC_BIN") or "govc")
+        c.no_govmomi = bool(cfg.get("no_govmomi", False))
+
         return c
 
     def has_creds(self) -> bool:
         return bool((self.host or "").strip() and (self.user or "").strip() and (self.password or "").strip())
+
+    def _govc(self) -> Optional[GovmomiCLI]:
+        """
+        Return a govc wrapper if govc is available and not disabled.
+
+        Behavior:
+          - If no_govmomi=True => None
+          - If govc missing/broken => None
+          - Otherwise => GovmomiCLI instance
+        """
+        if self.no_govmomi:
+            return None
+        if self._govc_client is None:
+            self._govc_client = GovmomiCLI(
+                self.logger,
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                insecure=self.insecure,
+                govc_bin=self.govc_bin,
+            )
+        return self._govc_client if self._govc_client.available() else None
 
     # ---------------------------
     # Context managers
@@ -642,6 +872,19 @@ class VMwareClient:
                 pass
 
     def list_vm_names(self) -> List[str]:
+        """
+        Prefer govc for inventory listing if present (fast).
+        Fallback to pyvmomi container view.
+        """
+        g = self._govc()
+        if g is not None:
+            try:
+                names = g.list_vm_names(datacenter=None)
+                self._vm_name_cache = names
+                return names
+            except Exception as e:
+                self.logger.warning("govc list_vm_names failed; falling back to pyvmomi: %s", e)
+
         self._require_pyvmomi()
         content = self._content()
         view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
@@ -1015,7 +1258,7 @@ class VMwareClient:
         return str(cookie)
 
     # ---------------------------
-    # HTTP datastore download (requests)
+    # HTTP datastore download (requests)  + ✅ prefer govc if present
     # ---------------------------
 
     def download_datastore_file(
@@ -1025,8 +1268,19 @@ class VMwareClient:
         ds_path: str,
         local_path: Path,
         dc_name: Optional[str] = None,
+        on_bytes: Optional[Any] = None,
         chunk_size: int = 1024 * 1024,
     ) -> None:
+        # ✅ Prefer govc datastore.download if present (no cookies, fewer dcPath issues)
+        g = self._govc()
+        if g is not None:
+            try:
+                dc_use = (dc_name or "").strip() or None
+                g.datastore_download(datastore=datastore, ds_path=ds_path, local_path=local_path, datacenter=dc_use)
+                return
+            except Exception as e:
+                self.logger.warning("govc datastore.download failed; falling back to /folder HTTP: %s", e)
+
         if not REQUESTS_AVAILABLE:
             raise VMwareError("requests not installed. Install: pip install requests")
 
@@ -1040,6 +1294,12 @@ class VMwareClient:
         url = f"https://{self.host}/folder/{ds_path}?dcPath={dc_use}&dsName={datastore}"
         headers = {"Cookie": self._session_cookie()}
         verify = not self.insecure
+
+        if not verify and urllib3 is not None:  # pragma: no cover
+            try:
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
         local_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger.info("Downloading datastore file: [%s] %s (dc=%s) -> %s", datastore, ds_path, dc_use, local_path)
@@ -1063,6 +1323,11 @@ class VMwareClient:
                             continue
                         f.write(chunk)
                         got += len(chunk)
+                        if on_bytes is not None:
+                            try:
+                                on_bytes(len(chunk), total)
+                            except Exception:
+                                pass
                         if total and got and got % (128 * 1024 * 1024) < chunk_size:
                             self.logger.info(
                                 "Download progress: %.1f MiB / %.1f MiB (%.1f%%)",
@@ -1079,7 +1344,7 @@ class VMwareClient:
                         pass
 
     # ---------------------------
-    # Async datastore download (aiohttp + aiofiles)
+    # Async datastore download (aiohttp + aiofiles) + ✅ prefer govc if present
     # ---------------------------
 
     async def async_download_datastore_file(
@@ -1089,8 +1354,25 @@ class VMwareClient:
         ds_path: str,
         local_path: Path,
         dc_name: Optional[str] = None,
+        on_bytes: Optional[Any] = None,
         chunk_size: int = 1024 * 1024,
     ) -> None:
+        # ✅ Prefer govc in async path too (run in a thread)
+        g = self._govc()
+        if g is not None:
+            try:
+                dc_use = (dc_name or "").strip() or None
+                await asyncio.to_thread(
+                    g.datastore_download,
+                    datastore=datastore,
+                    ds_path=ds_path,
+                    local_path=local_path,
+                    datacenter=dc_use,
+                )
+                return
+            except Exception as e:
+                self.logger.warning("govc datastore.download failed (async); falling back to aiohttp: %s", e)
+
         if not (AIOHTTP_AVAILABLE and AIOFILES_AVAILABLE):
             raise VMwareError("aiohttp and aiofiles not installed. Install: pip install aiohttp aiofiles")
 
@@ -1138,6 +1420,11 @@ class VMwareClient:
                                 continue
                             await f.write(chunk)
                             got += len(chunk)
+                            if on_bytes is not None:
+                                try:
+                                    on_bytes(len(chunk), total)
+                                except Exception:
+                                    pass
                             if total and got and got % (128 * 1024 * 1024) < chunk_size:
                                 self.logger.info(
                                     "Download progress: %.1f MiB / %.1f MiB (%.1f%%)",
@@ -1273,8 +1560,28 @@ class VMwareClient:
         use_async_http: bool,
     ) -> None:
         """
-        Use aiohttp if enabled+available; otherwise fall back to requests (in a thread).
+        Prefer govc datastore.download if available; fall back to aiohttp/requests.
+
+        - govc path: reliable and avoids /folder session/DC path quirks.
+        - aiohttp path: fast concurrent downloads when available.
+        - requests path: sync fallback.
         """
+        # ✅ govc first
+        g = self._govc()
+        if g is not None:
+            try:
+                await asyncio.to_thread(
+                    g.datastore_download,
+                    datastore=datastore,
+                    ds_path=ds_path,
+                    local_path=local_path,
+                    datacenter=dc_name,
+                )
+                return
+            except Exception as e:
+                self.logger.warning("govc download failed for %s; falling back to HTTP: %s", ds_path, e)
+
+        # aiohttp if enabled+available
         if use_async_http and AIOHTTP_AVAILABLE and AIOFILES_AVAILABLE:
             await self.async_download_datastore_file(
                 datastore=datastore,
@@ -1285,7 +1592,7 @@ class VMwareClient:
             return
 
         if not REQUESTS_AVAILABLE:
-            raise VMwareError("download-only requires aiohttp+aiofiles or requests; install one of them.")
+            raise VMwareError("download-only requires govc or aiohttp+aiofiles or requests; install one of them.")
 
         await asyncio.to_thread(
             self.download_datastore_file,
@@ -1301,7 +1608,7 @@ class VMwareClient:
 
         - Locate VM directory from summary.config.vmPathName (VMX)
         - List files using DatastoreBrowser
-        - Download selected files using HTTPS /folder with session cookie
+        - Download selected files using datastore downloader (govc preferred; HTTP fallback)
         """
         if not self.si:
             raise VMwareError("Not connected to vSphere; cannot download. Call connect() first.")
@@ -1370,6 +1677,74 @@ class VMwareClient:
     def download_only_vm(self, opt: V2VExportOptions) -> Path:
         """Sync wrapper for async_download_only_vm()."""
         return Path(_run_coro_sync(self.async_download_only_vm(opt)))
+
+    # =========================================================================
+    # ✅ NEW: govc-only directory download (NO pyvmomi listing)
+    # =========================================================================
+
+    def govc_download_datastore_dir(
+        self,
+        *,
+        vm_name: str,
+        datastore: str,
+        folder: str,
+        output_dir: Path,
+        include_glob: Tuple[str, ...] = ("*",),
+        exclude_glob: Tuple[str, ...] = (),
+        max_files: int = 5000,
+        datacenter: Optional[str] = None,
+        use_json_ls: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Download a datastore directory using ONLY govc:
+          - govc datastore.ls (-json)
+          - govc datastore.download (per file)
+
+        This matches the style of the JSON you pasted in your logs:
+          {
+            "status": "success",
+            "vm_name": "...",
+            "datastore": "...",
+            "folder": "...",
+            "matched": N,
+            "downloaded": N,
+            "output_dir": "...",
+            "include_glob": ["*"],
+            "exclude_glob": ["*.lck", ...],
+            "used_govmomi": true
+          }
+
+        NOTE: If govc isn't available, we raise (caller can fall back to pyvmomi flow).
+        """
+        g = self._govc()
+        if g is None:
+            raise VMwareError("govc not available (or disabled via no_govmomi); cannot run govc-only download")
+
+        output_dir = Path(output_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Delegate to GovmomiCLI helper and add vm_name to match CLI JSON shape.
+        data = g.datastore_download_dir(
+            datastore=datastore,
+            ds_dir=folder,
+            local_dir=output_dir,
+            include_globs=tuple(include_glob or ("*",)),
+            exclude_globs=tuple(exclude_glob or ()),
+            max_files=int(max_files or 5000),
+            datacenter=(datacenter or "").strip() or None,
+            use_json_ls=bool(use_json_ls),
+        )
+        data["vm_name"] = vm_name
+        # ensure keys exist exactly as your logs show
+        data.setdefault("matched", data.get("files_downloaded", data.get("matched", 0)))
+        data.setdefault("downloaded", data.get("matched", 0))
+        data.setdefault("folder", folder)
+        data.setdefault("output_dir", str(output_dir))
+        data.setdefault("include_glob", list(include_glob))
+        data.setdefault("exclude_glob", list(exclude_glob))
+        data.setdefault("used_govmomi", True)
+        data["status"] = "success"
+        return data
 
     # =========================================================================
     # ✅ NEW: vddk_download mode (single disk direct pull via VDDK client)
@@ -1467,7 +1842,6 @@ class VMwareClient:
         def _progress(done: int, total: int, pct: float) -> None:
             le = int(opt.vddk_download_log_every_bytes or 0)
             if total and done and le > 0:
-                # log on boundary-ish; keep it cheap
                 if done % le < int(opt.vddk_download_sectors_per_read or 2048) * 512:
                     self.logger.info(
                         "VDDK download progress: %.1f%% (%.1f/%.1f GiB)",

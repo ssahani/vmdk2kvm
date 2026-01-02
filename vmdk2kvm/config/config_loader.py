@@ -34,6 +34,7 @@ class Config:
       - VM fan-out via 'vms' list, with deep-merge per VM override
       - argparse defaults application with type coercion
       - ✅ alias canonicalization (command<->cmd, vs_action<->action)
+      - ✅ vSphere control-plane canonicalization (govc knobs, env aliases)
     """
 
     # -----------------------------
@@ -340,10 +341,16 @@ class Config:
         """
         Canonicalize common alias keys so YAML can stay stable while code evolves.
 
-        Policy:
+        Existing policy:
           - Keep 'command' canonical for new project readability,
             but populate 'cmd' for legacy/compat dispatchers.
           - Keep 'vs_action' canonical but populate 'action' (and vice-versa).
+
+        Added policy (govc / control-plane):
+          - Accept either 'vs_control_plane' or 'control_plane' and mirror to the other.
+          - Accept either govc_* keys or GOVC_* style names (after normalization).
+          - If govc_url not provided, allow vcenter to imply https://<vcenter>/sdk (used later).
+          - If govc_user/password missing, allow falling back to vc_user/vc_password at runtime.
         """
         # command <-> cmd
         if "command" in d and "cmd" not in d:
@@ -356,6 +363,38 @@ class Config:
             d["action"] = d["vs_action"]
         elif "action" in d and "vs_action" not in d:
             d["vs_action"] = d["action"]
+
+        # vs_control_plane <-> control_plane
+        if "vs_control_plane" in d and "control_plane" not in d:
+            d["control_plane"] = d["vs_control_plane"]
+        elif "control_plane" in d and "vs_control_plane" not in d:
+            d["vs_control_plane"] = d["control_plane"]
+
+        # GOVC_* style aliases (after key normalization, these are likely "govc_url" etc,
+        # but users may still write "GOVC_URL" in YAML; safe-load keeps case, normalize_keys
+        # does not change case, so we map a few common ones explicitly.)
+        # Prefer explicit govc_* if present.
+        govc_map = {
+            "GOVC_URL": "govc_url",
+            "GOVC_USERNAME": "govc_user",
+            "GOVC_USER": "govc_user",
+            "GOVC_PASSWORD": "govc_password",
+            "GOVC_PASSWORD_ENV": "govc_password_env",
+            "GOVC_INSECURE": "govc_insecure",
+            "GOVC_DATACENTER": "govc_datacenter",
+            "GOVC_DATASTORE": "govc_ds",
+            "GOVC_DS": "govc_ds",
+            "GOVC_FOLDER": "govc_folder",
+            "GOVC_CLUSTER": "govc_cluster",
+            "GOVC_RESOURCE_POOL": "govc_resource_pool",
+        }
+        for src, dst in govc_map.items():
+            if src in d and dst not in d:
+                d[dst] = d[src]
+
+        # Light normalization of vs_control_plane values if user provided one
+        if "vs_control_plane" in d and isinstance(d["vs_control_plane"], str):
+            d["vs_control_plane"] = d["vs_control_plane"].strip().lower()
 
         return d
 
@@ -405,11 +444,9 @@ class Config:
         """
         Best-effort type coercion consistent with argparse.
         """
-        # If action expects multiple values, allow list/tuple
         nargs = getattr(act, "nargs", None)
         act_type = getattr(act, "type", None)
 
-        # StoreTrue/False flags: allow booleans or truthy strings
         if isinstance(act, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
             if isinstance(raw_val, bool):
                 return raw_val
@@ -418,7 +455,6 @@ class Config:
                 return s in ("1", "true", "yes", "y", "on")
             return bool(raw_val)
 
-        # If no explicit type, return as-is
         if act_type is None:
             return raw_val
 
@@ -432,7 +468,6 @@ class Config:
         if nargs in ("+", "*") or isinstance(raw_val, (list, tuple)):
             if isinstance(raw_val, (list, tuple)):
                 return [coerce_one(x) for x in raw_val]
-            # single scalar but nargs expects many -> wrap
             return [coerce_one(raw_val)]
 
         return coerce_one(raw_val)
@@ -453,14 +488,13 @@ class Config:
         if not missing:
             return
 
-        # Keep message compact but useful
         msg_lines: List[str] = ["Config file(s) not found:"]
         for m in missing[:20]:
             msg_lines.append(f"  - {m}")
         if len(missing) > 20:
             msg_lines.append(f"  ... and {len(missing) - 20} more")
 
-        msg_lines.append("")  # spacing
+        msg_lines.append("")
         msg_lines.append(Config._missing_config_help(missing[0], original_spec=None))
 
         U.die(logger, "\n".join(msg_lines), 1)
