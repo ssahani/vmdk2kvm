@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import logging
@@ -11,9 +12,10 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import guestfs  # type: ignore
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -37,6 +39,9 @@ from . import network_fixer  # type: ignore
 from . import grub_fixer  # type: ignore
 from . import windows_fixer  # type: ignore
 from .offline_vmware_tools_remover import OfflineVmwareToolsRemover
+
+
+_T = TypeVar("_T")
 
 
 # ---------------------------------------------------------------------
@@ -97,6 +102,13 @@ class OfflineFSFix:
       - mdraid assemble (mdadm --assemble --scan --run) if available in appliance
       - best-effort ZFS import if zpool exists in appliance
       - stronger brute-force root choice via scoring (multi-root safety)
+
+    Improvements added here (non-breaking, orchestrator-level):
+      - stage runner with timing + error capture per stage (report-friendly)
+      - safer Windows hooks gating (don’t run on Linux)
+      - optional gating for grub steps via flags (still delegated)
+      - richer guestfs introspection (best-effort) into report
+      - mount_local_run thread error collection + join safety
     """
 
     _BTRFS_COMMON_SUBVOLS = ["@", "@/", "@root", "@rootfs", "@/.snapshots/1/snapshot"]
@@ -168,6 +180,81 @@ class OfflineFSFix:
         self._timings: Dict[str, float] = {}
 
     # ---------------------------------------------------------------------
+    # stage runner (timing + per-stage error capture)
+    # ---------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _time_stage(self, name: str) -> Any:
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            dt = time.time() - t0
+            self._timings[name] = dt
+            try:
+                self.report.setdefault("analysis", {}).setdefault("stages", {})[name] = {
+                    "duration_s": round(dt, 6),
+                }
+            except Exception:
+                pass
+
+    def _run_stage(
+        self,
+        name: str,
+        fn: Callable[[], _T],
+        *,
+        critical: bool = False,
+        default: Optional[_T] = None,
+    ) -> _T:
+        """
+        Run a stage, capture duration, and write a structured entry into report.
+        - critical=True re-raises on failure (preserving existing "fail fast" semantics where needed)
+        - critical=False returns default and records error (keeps report complete)
+        """
+        self.logger.debug(f"Stage start: {name}")
+        with self._time_stage(name):
+            try:
+                out = fn()
+                try:
+                    self.report.setdefault("analysis", {}).setdefault("stages", {})[name].update(
+                        {"ok": True, "error": None}
+                    )
+                except Exception:
+                    pass
+                self.logger.debug(f"Stage ok: {name}")
+                return out
+            except Exception as e:
+                tb = traceback.format_exc(limit=50)
+                self.logger.warning(f"Stage failed: {name}: {e}")
+                try:
+                    self.report.setdefault("analysis", {}).setdefault("stages", {})[name].update(
+                        {"ok": False, "error": str(e), "traceback": tb}
+                    )
+                except Exception:
+                    pass
+                if critical:
+                    raise
+                return default  # type: ignore[return-value]
+
+    def _stash_guestfs_info(self, g: guestfs.GuestFS) -> None:
+        info: Dict[str, Any] = {}
+        try:
+            # python guestfs bindings typically expose version()
+            if hasattr(g, "version"):
+                info["version"] = g.version()
+        except Exception:
+            pass
+        try:
+            # not always present; harmless
+            if hasattr(g, "get_backend_settings"):
+                info["backend_settings"] = g.get_backend_settings()
+        except Exception:
+            pass
+        try:
+            self.report.setdefault("analysis", {})["guestfs"] = info
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------------
     # guestfs open/close helpers
     # ---------------------------------------------------------------------
     def open(self) -> guestfs.GuestFS:
@@ -180,6 +267,7 @@ class OfflineFSFix:
         # NOTE: read-only when dry_run (prevents accidental writes).
         g.add_drive_opts(str(self.image), readonly=self.dry_run)
         g.launch()
+        self._stash_guestfs_info(g)
         return g
 
     @staticmethod
@@ -778,7 +866,9 @@ class OfflineFSFix:
                 self.logger.info(f"Fallback root detected at {dev} (score={best[0]})")
                 if mount_failures:
                     try:
-                        self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+                        self.report.setdefault("analysis", {}).setdefault("mount", {})[
+                            "bruteforce_failures"
+                        ] = mount_failures
                     except Exception:
                         pass
                 return
@@ -820,7 +910,9 @@ class OfflineFSFix:
                 self.logger.info(f"Fallback btrfs root detected at {dev} (subvol={sv}, score={best_btrfs[0]})")
                 if mount_failures:
                     try:
-                        self.report.setdefault("analysis", {}).setdefault("mount", {})["bruteforce_failures"] = mount_failures
+                        self.report.setdefault("analysis", {}).setdefault("mount", {})[
+                            "bruteforce_failures"
+                        ] = mount_failures
                     except Exception:
                         pass
                 return
@@ -1140,7 +1232,7 @@ class OfflineFSFix:
         mountpoint: Path,
         *,
         ready_timeout_s: float = 15.0,
-    ) -> Tuple[bool, Optional[str], Optional[threading.Thread]]:
+    ) -> Tuple[bool, Optional[str], Optional[threading.Thread], List[str]]:
         """
         guestfs.mount_local_run() is a blocking FUSE loop.
         The correct pattern is:
@@ -1148,15 +1240,15 @@ class OfflineFSFix:
           - start a background thread that calls mount_local_run()
           - do your host-side file operations against mountpoint
           - call umount_local() to stop the FUSE loop
+
+        Improvement: we now return any mount_local_run() exceptions collected in the background thread.
         """
         err: List[str] = []
-        started = False
 
         try:
             g.mount_local(str(mountpoint))
-            started = True
         except Exception as e:
-            return False, f"mount_local_failed:{e}", None
+            return False, f"mount_local_failed:{e}", None, err
 
         def _runner() -> None:
             try:
@@ -1172,10 +1264,9 @@ class OfflineFSFix:
         deadline = time.time() + ready_timeout_s
         while time.time() < deadline:
             try:
-                # On success, we should see at least a few root entries soon-ish.
                 if mountpoint.exists():
                     _ = list(mountpoint.iterdir())
-                    return True, None, t
+                    return True, None, t, err
             except Exception:
                 pass
             time.sleep(0.1)
@@ -1185,7 +1276,7 @@ class OfflineFSFix:
             g.umount_local()
         except Exception:
             pass
-        return False, "mount_local_ready_timeout", t
+        return False, "mount_local_ready_timeout", t, err
 
     def remove_vmware_tools_func(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         """
@@ -1194,6 +1285,8 @@ class OfflineFSFix:
 
         IMPORTANT: mount_local_run() is blocking. This implementation avoids deadlock and
         always attempts umount_local() + cleanup.
+
+        Improvement: background thread errors are bubbled into warnings for debugging.
         """
         if not self.remove_vmware_tools:
             return {"enabled": False}
@@ -1212,11 +1305,14 @@ class OfflineFSFix:
         mnt = Path(tempfile.mkdtemp(prefix="vmdk2kvm.guestfs.mnt."))
         mounted_local = False
         t: Optional[threading.Thread] = None
+        thread_errs: List[str] = []
 
         try:
-            ok, why, t = self._mount_local_run_threaded(g, mnt)
+            ok, why, t, thread_errs = self._mount_local_run_threaded(g, mnt)
             if not ok:
                 res.errors.append(why or "mount_local_failed")
+                if thread_errs:
+                    res.warnings.append(f"mount_local_run_errors:{thread_errs[:3]}")
                 return res.as_dict()
             mounted_local = True
 
@@ -1237,6 +1333,10 @@ class OfflineFSFix:
             if getattr(rr, "warnings", None):
                 res.warnings.extend(rr.warnings)
 
+            if thread_errs:
+                # Common harmless case: Interrupted system call on umount; still useful to store.
+                res.warnings.append(f"mount_local_run_errors:{thread_errs[:5]}")
+
             return res.as_dict()
 
         finally:
@@ -1247,6 +1347,8 @@ class OfflineFSFix:
                     pass
             if t:
                 t.join(timeout=3.0)
+                if t.is_alive():
+                    res.warnings.append("mount_local_thread_still_alive_after_join")
             try:
                 shutil.rmtree(str(mnt), ignore_errors=True)
             except Exception:
@@ -1367,33 +1469,33 @@ class OfflineFSFix:
             self.recovery_manager.save_checkpoint("start", {"image": str(self.image)})
 
         if self.resize:
-            self.report["analysis"]["image_resize"] = self._resize_image_container()
+            self.report["analysis"]["image_resize"] = self._run_stage("image_resize", self._resize_image_container)  # type: ignore
 
         g = self.open()
         try:
             # 1) LUKS (optional but wired)
-            luks_audit = self._unlock_luks_devices(g)
+            luks_audit = self._run_stage("luks_unlock", lambda: self._unlock_luks_devices(g), default={})
             self.report["analysis"]["luks"] = luks_audit
             self.logger.info(f"LUKS audit: {U.json_dump(luks_audit)}")
 
             # 2) storage stack activation (additive): mdraid + zfs + lvm
-            try:
-                stack_audit = self._pre_mount_activate_storage_stack(g)
-                self.report.setdefault("analysis", {})["storage_stack"] = stack_audit
-            except Exception as e:
-                self.report.setdefault("analysis", {})["storage_stack"] = {"error": str(e)}
+            stack_audit = self._run_stage("storage_stack", lambda: self._pre_mount_activate_storage_stack(g), default={})
+            self.report.setdefault("analysis", {})["storage_stack"] = stack_audit
 
             # 3) LVM activation (existing behavior; safe even if no LVM)
-            self._activate_lvm(g)
+            self._run_stage("lvm_activate", lambda: self._activate_lvm(g), default=None)
 
-            # 4) Mount root
-            self.detect_and_mount_root(g)
+            # 4) Mount root (critical: nothing else makes sense without it)
+            self._run_stage("mount_root", lambda: self.detect_and_mount_root(g), critical=True, default=None)
 
             # identity into report
-            try:
-                osr = U.to_text(g.read_file("/etc/os-release")) if g.is_file("/etc/os-release") else ""
-            except Exception:
-                osr = ""
+            def _read_os_release() -> str:
+                try:
+                    return U.to_text(g.read_file("/etc/os-release")) if g.is_file("/etc/os-release") else ""
+                except Exception:
+                    return ""
+
+            osr = self._run_stage("read_os_release", _read_os_release, default="")
             self.report["analysis"]["guest"] = {
                 "inspect_root": self.inspect_root,
                 "root_dev": self.root_dev,
@@ -1402,13 +1504,17 @@ class OfflineFSFix:
             }
 
             # validation (bool/dict compatible)
-            suite = self.create_validation_suite(g)
-            ctx = {"image": str(self.image), "root_dev": self.root_dev, "subvol": self.root_btrfs_subvol}
-            raw = suite.run_all(ctx)
-            norm = self._normalize_validation_results(raw)
-            summary = self._summarize_validation(norm)
-            self.report["validation"] = {"results": norm, "summary": summary}
+            def _do_validation() -> Dict[str, Any]:
+                suite = self.create_validation_suite(g)
+                ctx = {"image": str(self.image), "root_dev": self.root_dev, "subvol": self.root_btrfs_subvol}
+                raw = suite.run_all(ctx)
+                norm = self._normalize_validation_results(raw)
+                summary = self._summarize_validation(norm)
+                return {"results": norm, "summary": summary}
 
+            self.report["validation"] = self._run_stage("validation", _do_validation, default={"results": {}, "summary": {}})
+
+            norm = (self.report.get("validation") or {}).get("results", {}) or {}
             critical_failures = [name for name, r in norm.items() if r.get("critical") and not r.get("passed")]
             if critical_failures:
                 self.logger.warning(f"Critical validation failures: {critical_failures}")
@@ -1419,36 +1525,69 @@ class OfflineFSFix:
                     {
                         "root_dev": self.root_dev,
                         "root_btrfs_subvol": self.root_btrfs_subvol,
-                        "validation": self.report["validation"],
+                        "validation": self.report.get("validation"),
                     },
                 )
 
             # fixes
-            c_fstab, fstab_changes, fstab_audit = self.rewrite_fstab(g)
-            c_crypt = self.rewrite_crypttab(g)
-            network_audit = self.fix_network_config(g)
-            c_devmap = self.remove_stale_device_map(g)
-            c_grub = self.update_grub_root(g)
-
-            # keep your existing mdraid_check()/inject_cloud_init()/resize_disk() if they exist
-            mdraid = getattr(self, "mdraid_check")(g) if hasattr(self, "mdraid_check") else {"present": False}
-            cloud_init = (
-                getattr(self, "inject_cloud_init")(g) if hasattr(self, "inject_cloud_init") else {"enabled": False}
+            c_fstab, fstab_changes, fstab_audit = self._run_stage(
+                "rewrite_fstab", lambda: self.rewrite_fstab(g), default=(0, [], {})
             )
+            c_crypt = self._run_stage("rewrite_crypttab", lambda: self.rewrite_crypttab(g), default=0)
+            network_audit = self._run_stage("fix_network", lambda: self.fix_network_config(g), default={"enabled": False})
 
-            # Windows hooks (delegated)
-            win = self.windows_bcd_actual_fix(g)
-            virtio = self.inject_virtio_drivers(g)
-
-            disk = self.analyze_disk_space(g)
-            vmware_removal = self.remove_vmware_tools_func(g)
-            regen_info = self.regen(g)
-
-            if not self.dry_run:
+            # keep grub-related things grub-related, but orchestrator should gate them properly
+            c_devmap = 0
+            c_grub = 0
+            if self.update_grub:
+                c_devmap = self._run_stage("grub_remove_device_map", lambda: self.remove_stale_device_map(g), default=0)
+                c_grub = self._run_stage("grub_update_root", lambda: self.update_grub_root(g), default=0)
+            else:
                 try:
-                    g.sync()
+                    self.report.setdefault("analysis", {}).setdefault("stages", {})["grub_update_root"] = {
+                        "ok": True,
+                        "skipped": "update_grub_disabled",
+                        "duration_s": 0.0,
+                    }
                 except Exception:
                     pass
+
+            # keep your existing mdraid_check()/inject_cloud_init()/resize_disk() if they exist
+            mdraid = self._run_stage(
+                "mdraid_check",
+                lambda: getattr(self, "mdraid_check")(g) if hasattr(self, "mdraid_check") else {"present": False},
+                default={"present": False},
+            )
+            cloud_init = self._run_stage(
+                "inject_cloud_init",
+                lambda: getattr(self, "inject_cloud_init")(g) if hasattr(self, "inject_cloud_init") else {"enabled": False},
+                default={"enabled": False},
+            )
+
+            # Windows hooks: only run on Windows
+            is_win = self._run_stage("detect_windows", lambda: self.is_windows(g), default=False)
+            if is_win:
+                win = self._run_stage("windows_bcd_fix", lambda: self.windows_bcd_actual_fix(g), default={"enabled": True, "error": "failed"})
+                virtio = self._run_stage("windows_inject_virtio", lambda: self.inject_virtio_drivers(g), default={"enabled": True, "error": "failed"})
+            else:
+                win = {"enabled": False, "skipped": "not_windows"}
+                virtio = {"enabled": False, "skipped": "not_windows"}
+
+            disk = self._run_stage("disk_analysis", lambda: self.analyze_disk_space(g), default={"analysis": "failed"})
+            vmware_removal = self._run_stage(
+                "vmware_tools_removal",
+                lambda: self.remove_vmware_tools_func(g),
+                default={"enabled": False, "error": "failed"},
+            )
+
+            regen_info: Dict[str, Any]
+            if self.regen_initramfs:
+                regen_info = self._run_stage("regen_initramfs_and_bootloader", lambda: self.regen(g), default={"enabled": True, "error": "failed"})
+            else:
+                regen_info = {"enabled": False, "skipped": "regen_initramfs_disabled"}
+
+            if not self.dry_run:
+                self._run_stage("guestfs_sync", lambda: g.sync(), default=None)
 
             self._safe_umount_all(g)
 
@@ -1469,6 +1608,7 @@ class OfflineFSFix:
             self.report["analysis"]["virtio"] = virtio
             self.report["analysis"]["disk"] = disk
             self.report["analysis"]["regen"] = regen_info
+            self.report["analysis"]["timings"] = dict(self._timings)
             self.report["timestamps"]["end"] = _dt.datetime.now().isoformat()
 
         finally:
