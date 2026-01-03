@@ -107,6 +107,30 @@ def _hivex_read_dword(h, node, key: str) -> Optional[int]:
         return None
 
 
+def _detect_current_controlset(h, root) -> str:
+    """
+    Return active ControlSetXYZ name using SYSTEM\\Select\\Current.
+    Falls back to ControlSet001 if anything looks off.
+    """
+    select = h.node_get_child(root, "Select")
+    if select is None:
+        return "ControlSet001"
+
+    cur = h.node_get_value(select, "Current")
+    if cur is None or "value" not in cur:
+        return "ControlSet001"
+
+    cur_raw = cur["value"]
+    if isinstance(cur_raw, (bytes, bytearray)) and len(cur_raw) >= 4:
+        current_set = int.from_bytes(cur_raw[:4], "little", signed=False)
+    elif isinstance(cur_raw, int):
+        current_set = int(cur_raw)
+    else:
+        current_set = 1
+
+    return f"ControlSet{current_set:03d}"
+
+
 # ---------------------------
 # Public: SYSTEM hive edit (Services + CDD + StartOverride)
 # ---------------------------
@@ -177,24 +201,7 @@ def edit_system_hive(
             h = g.hivex_open(str(local_hive), write=write_mode)
             root = h.root()
 
-            # Determine current ControlSet
-            select = h.node_get_child(root, "Select")
-            if select is None:
-                raise RuntimeError("SYSTEM hive missing Select key")
-
-            cur = h.node_get_value(select, "Current")
-            if cur is None or "value" not in cur:
-                raise RuntimeError("SYSTEM hive missing Select\\Current value")
-
-            cur_raw = cur["value"]
-            if isinstance(cur_raw, (bytes, bytearray)) and len(cur_raw) >= 4:
-                current_set = int.from_bytes(cur_raw[:4], "little", signed=False)
-            elif isinstance(cur_raw, int):
-                current_set = int(cur_raw)
-            else:
-                current_set = 1
-
-            cs_name = f"ControlSet{current_set:03d}"
+            cs_name = _detect_current_controlset(h, root)
             logger.info(f"Using control set: {cs_name}")
 
             control_set = h.node_get_child(root, cs_name)
@@ -384,6 +391,123 @@ def edit_system_hive(
 
 
 # ---------------------------
+# Public: SYSTEM hive generic DWORD setter (for CrashControl etc.)
+# ---------------------------
+
+def set_system_dword(
+    self,
+    g: guestfs.GuestFS,
+    hive_path: str,
+    *,
+    key_path: List[str],
+    name: str,
+    value: int,
+) -> Dict[str, Any]:
+    """
+    Generic offline SYSTEM hive edit:
+      HKLM\\SYSTEM\\<CurrentControlSet>\\<key_path...>\\<name> = REG_DWORD(value)
+
+    Example:
+      set_system_dword(..., key_path=["Control","CrashControl"], name="AutoReboot", value=0)
+    """
+    logger = _safe_logger(self)
+    dry_run = getattr(self, "dry_run", False)
+
+    out: Dict[str, Any] = {
+        "success": False,
+        "dry_run": bool(dry_run),
+        "hive_path": hive_path,
+        "key_path": list(key_path),
+        "name": name,
+        "value": int(value),
+        "modified": False,
+        "original": None,
+        "new": None,
+        "errors": [],
+        "notes": [],
+    }
+
+    try:
+        if not g.is_file(hive_path):
+            out["errors"].append(f"SYSTEM hive not found: {hive_path}")
+            return out
+    except Exception as e:
+        out["errors"].append(f"Failed to stat hive {hive_path}: {e}")
+        return out
+
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / "SYSTEM"
+        try:
+            if not dry_run:
+                ts = U.now_ts()
+                backup_path = f"{hive_path}.vmdk2kvm.backup.{ts}"
+                g.cp(hive_path, backup_path)
+                out["hive_backup"] = backup_path
+
+            g.download(hive_path, str(local))
+            orig_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+
+            h = g.hivex_open(str(local), write=(0 if dry_run else 1))
+            root = h.root()
+
+            cs_name = _detect_current_controlset(h, root)
+            cs = h.node_get_child(root, cs_name)
+            if cs is None:
+                cs_name = "ControlSet001"
+                cs = h.node_get_child(root, cs_name)
+            if cs is None:
+                out["errors"].append("No usable ControlSet found (001/current)")
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                return out
+
+            # Walk/ensure path under controlset
+            node = cs
+            for comp in key_path:
+                node = _ensure_child(h, node, comp)
+
+            old = _hivex_read_dword(h, node, name)
+            out["original"] = old
+
+            if old != int(value):
+                _set_dword(h, node, name, int(value))
+                out["modified"] = True
+                out["new"] = int(value)
+            else:
+                out["new"] = old
+
+            if not dry_run:
+                h.hivex_commit(None)
+                h.hivex_close()
+                g.upload(str(local), hive_path)
+
+                with tempfile.TemporaryDirectory() as vtd:
+                    vlocal = Path(vtd) / "SYSTEM_verify"
+                    g.download(hive_path, str(vlocal))
+                    new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
+
+                out["success"] = (new_hash != orig_hash) or (not out["modified"])
+            else:
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                out["success"] = True
+
+            out["notes"] += [
+                f"ControlSet resolved and edited at: {cs_name}",
+                "DWORD written as REG_DWORD (little-endian).",
+            ]
+            return out
+
+        except Exception as e:
+            out["errors"].append(f"SYSTEM dword set failed: {e}")
+            return out
+
+
+# ---------------------------
 # Public: SOFTWARE hive DevicePath append
 # ---------------------------
 
@@ -500,4 +624,122 @@ def append_devicepath_software_hive(
 
         except Exception as e:
             out["errors"].append(f"DevicePath update failed: {e}")
+            return out
+
+
+# ---------------------------
+# Public: SOFTWARE hive RunOnce helper (for firstboot scripts)
+# ---------------------------
+
+def add_software_runonce(
+    self,
+    g: guestfs.GuestFS,
+    software_hive_path: str,
+    *,
+    name: str,
+    command: str,
+) -> Dict[str, Any]:
+    """
+    Add/overwrite a RunOnce entry:
+
+      HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\<name> = "<command>"
+
+    This is the simplest way to ensure a one-time firstboot action without
+    relying on Task Scheduler or services.
+
+    Note: Stored as REG_SZ (UTF-16LE).
+    """
+    logger = _safe_logger(self)
+    dry_run = getattr(self, "dry_run", False)
+
+    out: Dict[str, Any] = {
+        "success": False,
+        "dry_run": bool(dry_run),
+        "hive_path": software_hive_path,
+        "name": name,
+        "command": command,
+        "modified": False,
+        "original": None,
+        "new": None,
+        "errors": [],
+        "notes": [],
+    }
+
+    try:
+        if not g.is_file(software_hive_path):
+            out["errors"].append(f"SOFTWARE hive not found: {software_hive_path}")
+            return out
+    except Exception as e:
+        out["errors"].append(f"Failed to stat hive {software_hive_path}: {e}")
+        return out
+
+    with tempfile.TemporaryDirectory() as td:
+        local = Path(td) / "SOFTWARE"
+        try:
+            if not dry_run:
+                ts = U.now_ts()
+                backup_path = f"{software_hive_path}.vmdk2kvm.backup.{ts}"
+                g.cp(software_hive_path, backup_path)
+                out["hive_backup"] = backup_path
+
+            g.download(software_hive_path, str(local))
+            orig_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+
+            h = g.hivex_open(str(local), write=(0 if dry_run else 1))
+            root = h.root()
+
+            # Walk Microsoft\Windows\CurrentVersion\RunOnce
+            microsoft = h.node_get_child(root, "Microsoft")
+            if microsoft is None:
+                microsoft = _ensure_child(h, root, "Microsoft")
+
+            windows = h.node_get_child(microsoft, "Windows")
+            if windows is None:
+                windows = _ensure_child(h, microsoft, "Windows")
+
+            cv = h.node_get_child(windows, "CurrentVersion")
+            if cv is None:
+                cv = _ensure_child(h, windows, "CurrentVersion")
+
+            runonce = h.node_get_child(cv, "RunOnce")
+            if runonce is None:
+                runonce = _ensure_child(h, cv, "RunOnce")
+
+            old = _hivex_read_sz(h, runonce, name)
+            out["original"] = old
+
+            if old != command:
+                _set_sz(h, runonce, name, command)
+                out["modified"] = True
+                out["new"] = command
+            else:
+                out["new"] = old
+
+            if not dry_run:
+                h.hivex_commit(None)
+                h.hivex_close()
+                g.upload(str(local), software_hive_path)
+
+                with tempfile.TemporaryDirectory() as vtd:
+                    vlocal = Path(vtd) / "SOFTWARE_verify"
+                    g.download(software_hive_path, str(vlocal))
+                    new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
+
+                out["success"] = (new_hash != orig_hash) or (not out["modified"])
+            else:
+                try:
+                    h.hivex_close()
+                except Exception:
+                    pass
+                out["success"] = True
+
+            logger.info(f"RunOnce set: {name} -> {command}")
+            out["notes"] += [
+                r"RunOnce written at HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+                "Value written as REG_SZ (UTF-16LE).",
+            ]
+            return out
+
+        except Exception as e:
+            out["errors"].append(f"RunOnce update failed: {e}")
             return out
