@@ -7,9 +7,7 @@ import json
 import logging
 import os
 import sys
-import threading
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -158,7 +156,7 @@ class GovmomiCLI(GovcRunner):
                 for p in paths:
                     relp = str(p).lstrip("/")
                     if prefix and relp.startswith(prefix):
-                        relp = relp[len(prefix):]
+                        relp = relp[len(prefix) :]
                     if relp:
                         out.append(relp)
                 return out
@@ -170,6 +168,8 @@ class GovmomiCLI(GovcRunner):
                 continue
 
         return []
+
+
 class VsphereMode:
     """CLI entry for vSphere actions: scan / download / cbt-sync."""
 
@@ -199,6 +199,136 @@ class VsphereMode:
         if bool(getattr(self.args, "no_govmomi", False)):
             return False
         return self.govc.available()
+
+    # ----------------------------------------------------------------------------------
+    # Download transport selection
+    # ----------------------------------------------------------------------------------
+
+    def _transport_preference(self) -> str:
+        """
+        Decide which download transport to attempt first.
+
+        Priority request from you:
+          - Prefer VDDK when available (fast), otherwise fall back to HTTPS /folder
+          - Keep behavior additive + feature-detected (no hard dependency)
+
+        Sources (in order):
+          - args.vs_transport (or args.vs_download_transport)
+          - env VMDK2KVM_VSPHERE_TRANSPORT
+          - default: "vddk"
+        """
+        v = getattr(self.args, "vs_transport", None) or getattr(self.args, "vs_download_transport", None)
+        if not v:
+            v = os.environ.get("VMDK2KVM_VSPHERE_TRANSPORT") or os.environ.get("VSPHERE_TRANSPORT")
+        v = (str(v).strip().lower() if v else "vddk")
+        if v in ("vddk", "https", "http", "folder", "pyvmomi", "auto"):
+            return v
+        # tolerate junk, don't crash CLI
+        return "vddk"
+
+    def _client_has_vddk(self, client: VMwareClient) -> bool:
+        """
+        Feature-detect VDDK support on the client.
+
+        We intentionally do NOT assume any one API name in VMwareClient.
+        We check a few common possibilities.
+        """
+        for attr in (
+            "download_datastore_file_vddk",
+            "download_disk_vddk",
+            "vddk_available",
+            "has_vddk",
+            "vddk",
+        ):
+            try:
+                if hasattr(client, attr):
+                    # If it's a method returning bool, call it; else just treat presence as support.
+                    obj = getattr(client, attr)
+                    if callable(obj) and attr in ("vddk_available", "has_vddk"):
+                        return bool(obj())
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _download_one_file_prefer_vddk(
+        self,
+        client: VMwareClient,
+        *,
+        vc_host: str,
+        dc_name: str,
+        ds_name: str,
+        ds_path: str,
+        local_path: Path,
+        verify_tls: bool,
+        on_bytes: Optional[Any] = None,
+        chunk_size: int = 1024 * 1024,
+    ) -> None:
+        """
+        Prefer VDDK when available, otherwise fall back to HTTPS /folder download.
+
+        This is additive and safe:
+          - If VDDK isn't present or client doesn't support it -> HTTPS fallback
+          - If VDDK attempt fails -> log debug + fallback to HTTPS
+        """
+        pref = self._transport_preference()
+
+        # Normalize synonyms
+        if pref in ("http", "https", "folder"):
+            pref = "https"
+        if pref == "auto":
+            pref = "vddk"
+
+        # 1) Try VDDK first (unless user forced https)
+        if pref == "vddk" and self._client_has_vddk(client):
+            # Preferred method name: download_datastore_file_vddk(datastore, ds_path, local_path, dc_name?, ...)
+            # We'll try a couple of call signatures defensively.
+            try:
+                fn = getattr(client, "download_datastore_file_vddk", None)
+                if callable(fn):
+                    try:
+                        # most likely signature
+                        fn(
+                            datastore=ds_name,
+                            ds_path=ds_path,
+                            local_path=local_path,
+                            dc_name=dc_name,
+                            chunk_size=chunk_size,
+                            on_bytes=on_bytes,
+                        )
+                        return
+                    except TypeError:
+                        # alternate signature (positional / fewer kwargs)
+                        fn(ds_name, ds_path, local_path)
+                        return
+
+                fn2 = getattr(client, "download_disk_vddk", None)
+                if callable(fn2):
+                    try:
+                        fn2(datastore=ds_name, ds_path=ds_path, local_path=local_path, dc_name=dc_name)
+                    except TypeError:
+                        fn2(ds_name, ds_path, local_path)
+                    return
+
+                # If we got here, we "have vddk" but no known callable
+                self.logger.debug("VDDK detected but no callable VDDK download method found on VMwareClient")
+            except Exception as e:
+                # VDDK can segfault or raise; we fall back for Python exceptions.
+                # (If it segfaults, nothing can catch it; that's a process crash.)
+                self.logger.warning(f"VDDK download failed; falling back to HTTPS folder: {e}")
+
+        # 2) HTTPS /folder fallback (original behavior)
+        self._download_one_folder_file(
+            client=client,
+            vc_host=vc_host,
+            dc_name=dc_name,
+            ds_name=ds_name,
+            ds_path=ds_path,
+            local_path=local_path,
+            verify_tls=verify_tls,
+            on_bytes=on_bytes,
+            chunk_size=chunk_size,
+        )
 
     # ----------------------------------------------------------------------------------
     # Download-only VM folder helpers
@@ -652,11 +782,16 @@ class VsphereMode:
                 dc_name = self._dc_name()
                 chunk_size = int(getattr(self.args, "chunk_size", 1024 * 1024))
                 try:
-                    client.download_datastore_file(
-                        datastore=self.args.datastore,
+                    # Prefer VDDK when available; fallback to HTTPS folder
+                    self._download_one_file_prefer_vddk(
+                        client=client,
+                        vc_host=vc_host,
+                        dc_name=dc_name,
+                        ds_name=self.args.datastore,
                         ds_path=self.args.ds_path,
                         local_path=local_path,
-                        dc_name=dc_name,
+                        verify_tls=not client.insecure,
+                        on_bytes=None,
                         chunk_size=chunk_size,
                     )
                 except VMwareError as e:
@@ -667,6 +802,7 @@ class VsphereMode:
                     "datastore": self.args.datastore,
                     "ds_path": self.args.ds_path,
                     "dc_name": dc_name,
+                    "transport": "vddk" if (self._transport_preference() == "vddk" and self._client_has_vddk(client)) else "https",
                 }
                 if self.args.json:
                     print(json.dumps(output, indent=2))
@@ -810,11 +946,16 @@ class VsphereMode:
                 chunk_size = int(getattr(self.args, "chunk_size", 1024 * 1024))
 
                 try:
-                    client.download_datastore_file(
-                        datastore=datastore,
+                    # Prefer VDDK when available; fallback to HTTPS folder
+                    self._download_one_file_prefer_vddk(
+                        client=client,
+                        vc_host=vc_host,
+                        dc_name=dc_name,
+                        ds_name=datastore,
                         ds_path=ds_path,
                         local_path=local_path,
-                        dc_name=dc_name,
+                        verify_tls=not client.insecure,
+                        on_bytes=None,
                         chunk_size=chunk_size,
                     )
                 except VMwareError as e:
@@ -828,6 +969,7 @@ class VsphereMode:
                     "datastore": datastore,
                     "ds_path": ds_path,
                     "dc_name": dc_name,
+                    "transport": "vddk" if (self._transport_preference() == "vddk" and self._client_has_vddk(client)) else "https",
                 }
                 if self.args.json:
                     print(json.dumps(output, indent=2))
@@ -835,7 +977,7 @@ class VsphereMode:
                     print(f"Downloaded disk from VM {self.args.vm_name} to {local_path}")
                 return 0
 
-            # ✅ download-only VM folder pull (now with govmomi listing when available)
+            # ✅ download-only VM folder pull (SYNC only; still uses Rich progress when available)
             if action == "download_only_vm":
                 if not getattr(self.args, "vm_name", None):
                     raise Fatal(2, "vsphere download_only_vm: --vm_name is required")
@@ -852,6 +994,15 @@ class VsphereMode:
                 concurrency = int(getattr(self.args, "vs_concurrency", 4) or 4)
                 max_files = int(getattr(self.args, "vs_max_files", 5000) or 5000)
                 fail_on_missing = bool(getattr(self.args, "vs_fail_on_missing", False))
+
+                # You asked: no threads/async. We keep the knob for config compatibility,
+                # but force sync execution.
+                if concurrency != 1:
+                    try:
+                        self.logger.debug(f"download_only_vm: forcing sync mode (ignoring vs_concurrency={concurrency})")
+                    except Exception:
+                        pass
+                    concurrency = 1
 
                 vmx_path = None
                 try:
@@ -897,6 +1048,7 @@ class VsphereMode:
                         "include_glob": include_glob,
                         "exclude_glob": exclude_glob,
                         "used_govmomi": self._prefer_govmomi(),
+                        "transport_pref": self._transport_preference(),
                     }
                     if self.args.json:
                         print(json.dumps(output, indent=2, default=str))
@@ -912,7 +1064,6 @@ class VsphereMode:
                 verify_tls = not client.insecure
                 dc_name = self._dc_name()
 
-                
                 downloaded: List[str] = []
                 errors: List[str] = []
 
@@ -920,7 +1071,6 @@ class VsphereMode:
                 progress = None
                 files_task = None
                 bytes_task = None
-                progress_lock = threading.Lock()
 
                 if (Progress is not None) and (not getattr(self.args, "json", False)):
                     try:
@@ -928,13 +1078,11 @@ class VsphereMode:
                             SpinnerColumn(),
                             TextColumn("[bold]{task.description}[/bold]"),
                             BarColumn(),
-                            TextColumn("{task.completed}/{task.total}" if "{task.total}" else ""),
                             TransferSpeedColumn(),
                             TimeElapsedColumn(),
                             transient=False,
                         )
                         files_task = progress.add_task("files", total=len(files))
-                        # bytes task is indeterminate (total unknown); we still advance it for live throughput.
                         bytes_task = progress.add_task("bytes", total=None)
                     except Exception:
                         progress = None
@@ -947,15 +1095,13 @@ class VsphereMode:
                     def _on_bytes(n: int, total: int) -> None:
                         if progress is None:
                             return
-                        with progress_lock:
-                            if bytes_task is not None:
-                                progress.advance(bytes_task, n)
-                            if files_task is not None:
-                                # keep the currently active filename visible
-                                progress.update(files_task, description=f"downloading: {ds_path}")
+                        if bytes_task is not None:
+                            progress.advance(bytes_task, n)
+                        if files_task is not None:
+                            progress.update(files_task, description=f"downloading: {ds_path}")
 
                     try:
-                        self._download_one_folder_file(
+                        self._download_one_file_prefer_vddk(
                             client=client,
                             vc_host=vc_host,
                             dc_name=dc_name,
@@ -964,45 +1110,28 @@ class VsphereMode:
                             local_path=local_path,
                             verify_tls=verify_tls,
                             on_bytes=_on_bytes,
+                            chunk_size=int(getattr(self.args, "chunk_size", 1024 * 1024)),
                         )
                         downloaded.append(ds_path)
-                        if progress is not None:
-                            with progress_lock:
-                                if files_task is not None:
-                                    progress.advance(files_task, 1)
+                        if progress is not None and files_task is not None:
+                            progress.advance(files_task, 1)
                     except Exception as e:
                         msg = f"{ds_path}: {e}"
                         errors.append(msg)
-                        if progress is not None:
-                            with progress_lock:
-                                if files_task is not None:
-                                    progress.update(files_task, description=f"error: {ds_path}")
+                        if progress is not None and files_task is not None:
+                            progress.update(files_task, description=f"error: {ds_path}")
                         if fail_on_missing:
                             raise
 
-
-                
-                # Run downloads (optionally under Rich progress context)
-                def _run_all() -> None:
-                    if concurrency <= 1:
-                        for p in files:
-                            _job(p)
-                    else:
-                        with ThreadPoolExecutor(max_workers=concurrency) as ex:
-                            futs = {ex.submit(_job, p): p for p in files}
-                            for fut in as_completed(futs):
-                                try:
-                                    fut.result()
-                                except Exception:
-                                    if fail_on_missing:
-                                        raise Fatal(2, f"download_only_vm: failed: {errors[-1] if errors else 'unknown'}")
+                def _run_all_sync() -> None:
+                    for p in files:
+                        _job(p)
 
                 if progress is not None:
                     with progress:
-                        _run_all()
+                        _run_all_sync()
                 else:
-                    _run_all()
-
+                    _run_all_sync()
 
                 output = {
                     "status": "success" if not errors else "partial",
@@ -1015,12 +1144,14 @@ class VsphereMode:
                     "errors": errors,
                     "include_glob": include_glob,
                     "exclude_glob": exclude_glob,
-                    "concurrency": concurrency,
+                    "concurrency": 1,  # forced sync
                     "dc_name": dc_name,
                     "verify_tls": verify_tls,
                     "used_govmomi": self._prefer_govmomi(),
                     "govc_bin": self.govc.govc_bin if self._prefer_govmomi() else None,
                     "vs_datastore_dir": str(override) if override else None,
+                    "transport_pref": self._transport_preference(),
+                    "vddk_detected": self._client_has_vddk(client),
                 }
                 if self.args.json:
                     print(json.dumps(output, indent=2, default=str))
@@ -1078,7 +1209,6 @@ class VsphereMode:
                 num_ranges = 0
                 try:
                     device_key = disk.key
-
                     change_id = getattr(self.args, "change_id", None)
 
                     changed = client.query_changed_disk_areas(
