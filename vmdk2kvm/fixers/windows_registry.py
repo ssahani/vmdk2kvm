@@ -6,16 +6,17 @@ import hashlib
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import guestfs  # type: ignore
+import hivex  # type: ignore
 
 from ..core.utils import U
 
-
-# ---------------------------
+# ---------------------------------------------------------------------------
 # Logging helper
-# ---------------------------
+# ---------------------------------------------------------------------------
+
 
 def _safe_logger(self) -> logging.Logger:
     lg = getattr(self, "logger", None)
@@ -24,105 +25,277 @@ def _safe_logger(self) -> logging.Logger:
     return logging.getLogger("vmdk2kvm.windows_registry")
 
 
-# ---------------------------
+# ---------------------------------------------------------------------------
+# Robust hive download helpers
+# ---------------------------------------------------------------------------
+
+
+def _download_hive_local(logger: logging.Logger, g: guestfs.GuestFS, remote: str, local: Path) -> None:
+    """
+    Robustly download a hive from the guest to a local path.
+
+    We've seen cases where g.download() does not materialize the local file
+    (or produces an empty/truncated file) without raising. This helper:
+      1) tries g.download()
+      2) verifies local exists + size >= 4KiB
+      3) falls back to g.read_file()/g.cat() and writes bytes locally
+    """
+    local.parent.mkdir(parents=True, exist_ok=True)
+
+    # Attempt primary download path.
+    try:
+        logger.info("Downloading hive: %r -> %r", remote, str(local))
+        g.download(remote, str(local))
+    except Exception as e:
+        logger.warning("g.download(%r, %r) failed: %s", remote, str(local), e)
+
+    # Verify the file actually exists and is non-trivial.
+    try:
+        if local.exists() and local.stat().st_size >= 4096:
+            return
+    except Exception:
+        pass
+
+    # Fallback: read bytes from guestfs and write locally.
+    logger.warning("Hive not materialized after download; falling back to guestfs read: %r", remote)
+    data: Optional[bytes] = None
+
+    for fn_name in ("read_file", "cat"):
+        fn = getattr(g, fn_name, None)
+        if not callable(fn):
+            continue
+        try:
+            out = fn(remote)
+            if isinstance(out, (bytes, bytearray)):
+                data = bytes(out)
+            else:
+                # Some bindings return str; preserve raw-ish bytes best-effort.
+                data = str(out).encode("latin-1", errors="ignore")
+            break
+        except Exception as e:
+            logger.warning("%s(%r) failed: %s", fn_name, remote, e)
+
+    if not data or len(data) < 4096:
+        raise RuntimeError(
+            f"Failed to download hive locally: remote={remote} local={local} (len={len(data) if data else 0})"
+        )
+
+    local.write_bytes(data)
+
+    if not local.exists() or local.stat().st_size < 4096:
+        raise RuntimeError(f"Local hive still missing after fallback: {local}")
+
+
+def _log_mountpoints_best_effort(logger: logging.Logger, g: guestfs.GuestFS) -> None:
+    """
+    Helpful when hive paths are correct but the wrong partition is mounted as /.
+    """
+    try:
+        mps = g.mountpoints()
+        logger.debug("guestfs mountpoints=%r", mps)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Hivex node normalization (IMPORTANT)
+# ---------------------------------------------------------------------------
+# python-hivex bindings vary:
+# - some return 0 for "not found"
+# - some return None for "not found"
+# We normalize to an int node id (0 means invalid).
+
+
+NodeLike = Union[int, None]
+
+
+def _node_id(n: NodeLike) -> int:
+    """
+    Normalize a node id to int. Invalid/missing => 0.
+    """
+    if n is None:
+        return 0
+    try:
+        return int(n)
+    except Exception:
+        return 0
+
+
+def _node_ok(n: NodeLike) -> bool:
+    return _node_id(n) != 0
+
+
+# ---------------------------------------------------------------------------
 # Registry encoding helpers (CRITICAL)
-# ---------------------------
+# ---------------------------------------------------------------------------
 # Windows registry strings in hives are typically UTF-16LE NUL-terminated.
 
+
 def _reg_sz(s: str) -> bytes:
+    # strings here are typically ASCII-safe; keep ignore for robustness
     return (s + "\0").encode("utf-16le", errors="ignore")
 
 
-def _set_sz(h, node, key: str, s: str) -> None:
-    # REG_SZ => t=1 in hivex
-    h.node_set_value(node, {"key": key, "t": 1, "value": _reg_sz(s)})
+def _decode_reg_sz(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-16le", errors="ignore").rstrip("\x00")
+    except Exception:
+        try:
+            return raw.decode("utf-8", errors="ignore").rstrip("\x00")
+        except Exception:
+            return ""
 
 
-def _set_expand_sz(h, node, key: str, s: str) -> None:
-    # REG_EXPAND_SZ => t=2 in hivex
-    h.node_set_value(node, {"key": key, "t": 2, "value": _reg_sz(s)})
+def _mk_reg_value(name: str, t: int, value: bytes) -> Dict[str, Any]:
+    """
+    Create a value dict compatible with python-hivex.
+
+    Many python-hivex versions accept dicts:
+      {"key": <name>, "t": <type>, "value": <bytes>}
+    """
+    return {"key": name, "t": int(t), "value": value}
 
 
-def _set_dword(h, node, key: str, v: int) -> None:
-    # REG_DWORD => t=4 in hivex
-    h.node_set_value(node, {"key": key, "t": 4, "value": int(v).to_bytes(4, "little", signed=False)})
+def _set_sz(h: hivex.Hivex, node: NodeLike, key: str, s: str) -> None:
+    nid = _node_id(node)
+    if nid == 0:
+        raise RuntimeError(f"invalid registry node for setting {key}=REG_SZ")
+    h.node_set_value(nid, _mk_reg_value(key, 1, _reg_sz(s)))
 
 
-def _ensure_child(h, parent, name: str):
-    ch = h.node_get_child(parent, name)
-    if ch is None:
-        ch = h.node_add_child(parent, name)
+def _set_expand_sz(h: hivex.Hivex, node: NodeLike, key: str, s: str) -> None:
+    nid = _node_id(node)
+    if nid == 0:
+        raise RuntimeError(f"invalid registry node for setting {key}=REG_EXPAND_SZ")
+    h.node_set_value(nid, _mk_reg_value(key, 2, _reg_sz(s)))
+
+
+def _set_dword(h: hivex.Hivex, node: NodeLike, key: str, v: int) -> None:
+    nid = _node_id(node)
+    if nid == 0:
+        raise RuntimeError(f"invalid registry node for setting {key}=REG_DWORD")
+    h.node_set_value(nid, _mk_reg_value(key, 4, int(v).to_bytes(4, "little", signed=False)))
+
+
+def _ensure_child(h: hivex.Hivex, parent: NodeLike, name: str) -> int:
+    pid = _node_id(parent)
+    if pid == 0:
+        raise RuntimeError(f"invalid parent node while ensuring child {name}")
+
+    ch = _node_id(h.node_get_child(pid, name))
+    if ch == 0:
+        ch = _node_id(h.node_add_child(pid, name))
+    if ch == 0:
+        raise RuntimeError(f"failed to create child key {name}")
     return ch
 
 
-def _delete_child_if_exists(h, parent, name: str) -> bool:
+def _delete_child_if_exists(h: hivex.Hivex, parent: NodeLike, name: str, *, logger: Optional[logging.Logger] = None) -> bool:
     """
     Remove a child key node if present (commonly StartOverride).
+
+    python-hivex API signatures vary across versions/bindings. Common patterns:
+      - node_delete_child(parent_node, child_node)
+      - node_delete_child(parent_node, child_name)
+      - (rare) node_delete_child(child_node)
+
+    Important: do NOT bail on the first non-TypeError exception; some bindings
+    raise other exception types for arg mismatch.
     """
-    try:
-        n = h.node_get_child(parent, name)
-        if n is None:
-            return False
-        h.node_delete_child(n)
-        return True
-    except Exception:
+    pid = _node_id(parent)
+    if pid == 0:
         return False
 
+    child = _node_id(h.node_get_child(pid, name))
+    if child == 0:
+        return False
 
-def _hivex_read_sz(h, node, key: str) -> Optional[str]:
+    # Try plausible signatures (most correct first).
+    tried: List[str] = []
+    for args in ((pid, child), (pid, name), (child,)):
+        tried.append(repr(args))
+        try:
+            h.node_delete_child(*args)  # type: ignore[misc]
+            if logger:
+                logger.debug("Deleted child key %r using node_delete_child%s", name, args)
+            return True
+        except Exception as e:
+            # If this is an argument mismatch, many bindings throw TypeError,
+            # but some throw generic Exception. Keep trying.
+            if logger:
+                logger.debug("node_delete_child%s failed for %r: %s", args, name, e)
+            continue
+
+    if logger:
+        logger.warning("All node_delete_child signatures failed for %r (tried: %s)", name, ", ".join(tried))
+    return False
+
+
+def _hivex_read_value_dict(h: hivex.Hivex, node: NodeLike, key: str) -> Optional[Dict[str, Any]]:
+    """
+    Return a value dict {"key","t","value"} or None.
+    """
+    nid = _node_id(node)
+    if nid == 0:
+        return None
+    try:
+        v = h.node_get_value(nid, key)
+        if not v or "value" not in v:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _hivex_read_sz(h: hivex.Hivex, node: NodeLike, key: str) -> Optional[str]:
     """
     Read REG_SZ/REG_EXPAND_SZ-ish as text (best-effort).
-    hivex returns bytes often UTF-16LE for string values.
     """
-    try:
-        v = h.node_get_value(node, key)
-        if not v or "value" not in v:
-            return None
-        raw = v["value"]
-        if isinstance(raw, (bytes, bytearray)):
-            try:
-                return raw.decode("utf-16le", errors="ignore").rstrip("\x00").strip() or None
-            except Exception:
-                try:
-                    return raw.decode("utf-8", errors="ignore").rstrip("\x00").strip() or None
-                except Exception:
-                    return None
-        return str(raw).strip() or None
-    except Exception:
+    v = _hivex_read_value_dict(h, node, key)
+    if not v:
         return None
-
-
-def _hivex_read_dword(h, node, key: str) -> Optional[int]:
-    try:
-        v = h.node_get_value(node, key)
-        if not v or "value" not in v:
-            return None
-        raw = v["value"]
-        if isinstance(raw, (bytes, bytearray)) and len(raw) >= 4:
-            return int.from_bytes(raw[:4], "little", signed=False)
-        if isinstance(raw, int):
-            return raw
+    raw = v.get("value")
+    if isinstance(raw, (bytes, bytearray)):
+        s = _decode_reg_sz(bytes(raw)).strip()
+        return s or None
+    if raw is None:
         return None
-    except Exception:
+    s2 = str(raw).strip()
+    return s2 or None
+
+
+def _hivex_read_dword(h: hivex.Hivex, node: NodeLike, key: str) -> Optional[int]:
+    v = _hivex_read_value_dict(h, node, key)
+    if not v:
         return None
+    raw = v.get("value")
+    if isinstance(raw, (bytes, bytearray)) and len(raw) >= 4:
+        return int.from_bytes(bytes(raw)[:4], "little", signed=False)
+    if isinstance(raw, int):
+        return raw
+    return None
 
 
-def _detect_current_controlset(h, root) -> str:
+def _detect_current_controlset(h: hivex.Hivex, root: NodeLike) -> str:
     """
     Return active ControlSetXYZ name using SYSTEM\\Select\\Current.
     Falls back to ControlSet001 if anything looks off.
     """
-    select = h.node_get_child(root, "Select")
-    if select is None:
+    r = _node_id(root)
+    if r == 0:
         return "ControlSet001"
 
-    cur = h.node_get_value(select, "Current")
-    if cur is None or "value" not in cur:
+    select = _node_id(h.node_get_child(r, "Select"))
+    if select == 0:
         return "ControlSet001"
 
-    cur_raw = cur["value"]
+    v = _hivex_read_value_dict(h, select, "Current")
+    if not v:
+        return "ControlSet001"
+
+    cur_raw = v.get("value")
     if isinstance(cur_raw, (bytes, bytearray)) and len(cur_raw) >= 4:
-        current_set = int.from_bytes(cur_raw[:4], "little", signed=False)
+        current_set = int.from_bytes(bytes(cur_raw)[:4], "little", signed=False)
     elif isinstance(cur_raw, int):
         current_set = int(cur_raw)
     else:
@@ -131,9 +304,139 @@ def _detect_current_controlset(h, root) -> str:
     return f"ControlSet{current_set:03d}"
 
 
-# ---------------------------
+# ---------------------------------------------------------------------------
+# Hivex open helpers (LOCAL FILES ONLY)
+# ---------------------------------------------------------------------------
+
+
+def _open_hive_local(path: Path, *, write: bool) -> hivex.Hivex:
+    """
+    Open a *local* hive file using python-hivex.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"hive local file missing: {path}")
+    st = path.stat()
+    if st.st_size < 4096:
+        raise RuntimeError(f"hive local file too small ({st.st_size} bytes): {path}")
+    # python-hivex expects write as int (0/1) in many versions
+    return hivex.Hivex(str(path), write=(1 if write else 0))
+
+
+def _close_best_effort(h: Optional[hivex.Hivex]) -> None:
+    """
+    Close hive handle across python-hivex versions.
+    Some expose .close(); some expose .hivex_close().
+    """
+    if h is None:
+        return
+    try:
+        if hasattr(h, "close") and callable(getattr(h, "close")):
+            h.close()
+            return
+    except Exception:
+        pass
+    try:
+        if hasattr(h, "hivex_close") and callable(getattr(h, "hivex_close")):
+            h.hivex_close()
+            return
+    except Exception:
+        pass
+
+
+def _commit_best_effort(h: hivex.Hivex) -> None:
+    """
+    Commit changes across python-hivex versions.
+    Some expose .commit(); some expose .hivex_commit().
+
+    Signatures vary too:
+      - commit(None) or commit()
+      - hivex_commit(None) or hivex_commit()
+    """
+    if hasattr(h, "commit") and callable(getattr(h, "commit")):
+        try:
+            h.commit(None)  # type: ignore[arg-type]
+            return
+        except TypeError:
+            h.commit()  # type: ignore[call-arg]
+            return
+        except Exception:
+            pass
+
+    if hasattr(h, "hivex_commit") and callable(getattr(h, "hivex_commit")):
+        try:
+            h.hivex_commit(None)  # type: ignore[arg-type]
+            return
+        except TypeError:
+            h.hivex_commit()  # type: ignore[call-arg]
+            return
+
+    raise RuntimeError("python-hivex: no commit method found")
+
+
+# ---------------------------------------------------------------------------
+# Internal: normalize Start values (fixes NoneType -> int errors)
+# ---------------------------------------------------------------------------
+
+
+def _driver_start_default(drv: Any, *, fallback: int = 3) -> int:
+    """
+    Extract a sane default Start value from drv.start_type.
+
+    We have seen driver descriptors where:
+      - drv.start_type is an Enum with .value
+      - drv.start_type is an int
+      - drv.start_type.value is None  (=> your 'NoneType cannot be interpreted as int' error)
+
+    We normalize to a valid int, using fallback (3 = DEMAND_START).
+    """
+    st = getattr(drv, "start_type", None)
+
+    # Enum-like
+    if st is not None and hasattr(st, "value"):
+        v = getattr(st, "value", None)
+        if v is None:
+            return int(fallback)
+        try:
+            return int(v)
+        except Exception:
+            return int(fallback)
+
+    if st is None:
+        return int(fallback)
+
+    try:
+        return int(st)
+    except Exception:
+        return int(fallback)
+
+
+def _driver_type_norm(drv: Any) -> str:
+    """
+    Normalize driver type for comparisons (string-safe).
+    Handles Enum.value, ints, and arbitrary objects.
+    """
+    t = getattr(drv, "type", None)
+    if t is None:
+        return ""
+    if hasattr(t, "value"):
+        v = getattr(t, "value", None)
+        if v is not None:
+            return str(v)
+    return str(t)
+
+
+def _pci_id_normalize(pci_id: str) -> str:
+    """
+    Normalize CDD key names. Windows is case-insensitive but hive keys are stored as-is.
+    Keep the original string, but strip whitespace.
+    """
+    return str(pci_id).strip()
+
+
+# ---------------------------------------------------------------------------
 # Public: SYSTEM hive edit (Services + CDD + StartOverride)
-# ---------------------------
+# ---------------------------------------------------------------------------
+
 
 def edit_system_hive(
     self,
@@ -149,17 +452,13 @@ def edit_system_hive(
       - Create Services\\<driver> keys with correct Type/Start/ImagePath/Group
       - Add CriticalDeviceDatabase entries for STORAGE drivers
       - Remove StartOverride keys that frequently disable boot drivers
-
-    NOTE: we keep this file independent from DriverType/Enum imports by passing:
-      - driver_type_storage_value: usually "storage"
-      - boot_start_value: usually 0 (BOOT)
     """
     logger = _safe_logger(self)
-    dry_run = getattr(self, "dry_run", False)
+    dry_run = bool(getattr(self, "dry_run", False))
 
     results: Dict[str, Any] = {
         "success": False,
-        "dry_run": bool(dry_run),
+        "dry_run": dry_run,
         "registry_modified": False,
         "hive_path": hive_path,
         "errors": [],
@@ -171,6 +470,7 @@ def edit_system_hive(
         "verification_errors": [],
     }
 
+    # Fast preflight: does the hive exist inside the guest mount?
     try:
         if not g.is_file(hive_path):
             results["errors"].append(f"SYSTEM hive not found: {hive_path}")
@@ -181,67 +481,75 @@ def edit_system_hive(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_hive = Path(tmpdir) / "SYSTEM"
+        h: Optional[hivex.Hivex] = None
+
         try:
+            _log_mountpoints_best_effort(logger, g)
+
             # Backup hive inside guest
             if not dry_run:
                 ts = U.now_ts()
                 backup_path = f"{hive_path}.vmdk2kvm.backup.{ts}"
                 g.cp(hive_path, backup_path)
-                logger.info(f"Hive backup created: {backup_path}")
+                logger.info("Hive backup created: %s", backup_path)
                 results["hive_backup"] = backup_path
 
-            logger.info(f"Downloading SYSTEM hive: {hive_path} -> {local_hive}")
-            g.download(hive_path, str(local_hive))
+            # Download hive locally (robust)
+            _download_hive_local(logger, g, hive_path, local_hive)
 
-            orig_bytes = local_hive.read_bytes()
-            original_hash = hashlib.sha256(orig_bytes).hexdigest()
-            logger.debug(f"SYSTEM hive baseline sha256={original_hash}")
+            original_hash = hashlib.sha256(local_hive.read_bytes()).hexdigest()
+            logger.debug("SYSTEM hive baseline sha256=%s", original_hash)
 
-            write_mode = 0 if dry_run else 1
-            h = g.hivex_open(str(local_hive), write=write_mode)
-            root = h.root()
+            # Open local hive with python-hivex
+            h = _open_hive_local(local_hive, write=(not dry_run))
+            root = _node_id(h.root())
+            if root == 0:
+                raise RuntimeError("python-hivex root() returned invalid node")
 
             cs_name = _detect_current_controlset(h, root)
-            logger.info(f"Using control set: {cs_name}")
+            logger.info("Using control set: %s", cs_name)
 
-            control_set = h.node_get_child(root, cs_name)
-            if control_set is None:
-                logger.warning(f"{cs_name} missing; falling back to ControlSet001")
+            control_set = _node_id(h.node_get_child(root, cs_name))
+            if control_set == 0:
+                logger.warning("%s missing; falling back to ControlSet001", cs_name)
                 cs_name = "ControlSet001"
-                control_set = h.node_get_child(root, cs_name)
-                if control_set is None:
+                control_set = _node_id(h.node_get_child(root, cs_name))
+                if control_set == 0:
                     raise RuntimeError("No usable ControlSet found (001/current)")
 
             services = _ensure_child(h, control_set, "Services")
 
-            # Create / update Services\\<driver> entries
+            storage_type_norm = str(driver_type_storage_value)
+
+            # Services\<driver>
             for drv in drivers:
                 try:
-                    # Expected fields on drv:
-                    #   drv.service_name, drv.dest_name, drv.start_type.value, drv.type.value (or drv.type str)
-                    drv_type_value = getattr(getattr(drv, "type", None), "value", None) or str(getattr(drv, "type", ""))
+                    drv_type_value = _driver_type_norm(drv)
                     svc_name = str(getattr(drv, "service_name"))
                     dest_name = str(getattr(drv, "dest_name"))
-                    start_default = int(getattr(getattr(drv, "start_type", None), "value", getattr(drv, "start_type", 0)))
 
-                    svc = h.node_get_child(services, svc_name)
-                    action = "updated" if svc is not None else "created"
-                    if svc is None:
-                        svc = h.node_add_child(services, svc_name)
+                    start_default = _driver_start_default(drv, fallback=3)
+                    svc = _node_id(h.node_get_child(services, svc_name))
+                    action = "updated" if svc != 0 else "created"
+                    if svc == 0:
+                        svc = _node_id(h.node_add_child(services, svc_name))
+                    if svc == 0:
+                        raise RuntimeError(f"failed to open/create service key {svc_name}")
 
-                    logger.info(f"Registry service {action}: Services\\{svc_name}")
+                    logger.info("Registry service %s: Services\\%s", action, svc_name)
 
-                    _set_dword(h, svc, "Type", 1)           # SERVICE_KERNEL_DRIVER
-                    _set_dword(h, svc, "ErrorControl", 1)   # normal error handling
+                    # Always kernel driver (assumption for our staged virtio drivers)
+                    _set_dword(h, svc, "Type", 1)  # SERVICE_KERNEL_DRIVER
+                    _set_dword(h, svc, "ErrorControl", 1)
 
-                    start = start_default
-                    if drv_type_value == driver_type_storage_value:
-                        start = boot_start_value
+                    start = int(start_default)
+                    if str(drv_type_value) == storage_type_norm:
+                        start = int(boot_start_value)
                     _set_dword(h, svc, "Start", start)
 
-                    if drv_type_value == driver_type_storage_value:
+                    if str(drv_type_value) == storage_type_norm:
                         group = "SCSI miniport"
-                    elif drv_type_value == "network":
+                    elif str(drv_type_value) == "network":
                         group = "NDIS"
                     else:
                         group = "System Bus Extender"
@@ -250,9 +558,9 @@ def edit_system_hive(
                     _set_sz(h, svc, "ImagePath", fr"\SystemRoot\System32\drivers\{dest_name}")
                     _set_sz(h, svc, "DisplayName", svc_name)
 
-                    removed = _delete_child_if_exists(h, svc, "StartOverride")
+                    removed = _delete_child_if_exists(h, svc, "StartOverride", logger=logger)
                     if removed:
-                        logger.info(f"Removed StartOverride: Services\\{svc_name}\\StartOverride")
+                        logger.info("Removed StartOverride: Services\\%s\\StartOverride", svc_name)
                         results["startoverride_removed"].append(svc_name)
 
                     results["services"].append(
@@ -275,8 +583,8 @@ def edit_system_hive(
             cdd = _ensure_child(h, control, "CriticalDeviceDatabase")
 
             for drv in drivers:
-                drv_type_value = getattr(getattr(drv, "type", None), "value", None) or str(getattr(drv, "type", ""))
-                if drv_type_value != driver_type_storage_value:
+                drv_type_value = _driver_type_norm(drv)
+                if str(drv_type_value) != storage_type_norm:
                     continue
 
                 svc_name = str(getattr(drv, "service_name"))
@@ -285,93 +593,91 @@ def edit_system_hive(
 
                 pci_ids = list(getattr(drv, "pci_ids", []) or [])
                 for pci_id in pci_ids:
+                    pci_id = _pci_id_normalize(pci_id)
+                    if not pci_id:
+                        continue
                     try:
-                        node = h.node_get_child(cdd, pci_id)
-                        action = "updated" if node is not None else "created"
-                        if node is None:
-                            node = h.node_add_child(cdd, pci_id)
+                        node = _node_id(h.node_get_child(cdd, pci_id))
+                        action = "updated" if node != 0 else "created"
+                        if node == 0:
+                            node = _node_id(h.node_add_child(cdd, pci_id))
+                        if node == 0:
+                            raise RuntimeError(f"failed to open/create CDD node {pci_id}")
 
                         _set_sz(h, node, "Service", svc_name)
                         _set_sz(h, node, "ClassGUID", class_guid)
                         _set_sz(h, node, "Class", "SCSIAdapter")
                         _set_sz(h, node, "DeviceDesc", dev_name)
 
-                        logger.info(f"CDD {action}: {pci_id} -> {svc_name}")
+                        logger.info("CDD %s: %s -> %s", action, pci_id, svc_name)
                         results["cdd"].append({"pci_id": pci_id, "service": svc_name, "action": action})
                     except Exception as e:
                         msg = f"Failed CDD entry {pci_id} -> {svc_name}: {e}"
                         logger.error(msg)
                         results["errors"].append(msg)
 
-            # Commit + upload if not dry_run
             if not dry_run:
-                logger.info("Committing SYSTEM hive changes (hivex_commit)")
-                h.hivex_commit(None)
-                h.hivex_close()
+                try:
+                    logger.info("Committing SYSTEM hive changes (python-hivex commit)")
+                    _commit_best_effort(h)
+                finally:
+                    _close_best_effort(h)
+                    h = None
 
-                logger.info(f"Uploading modified SYSTEM hive back to guest: {hive_path}")
+                logger.info("Uploading modified SYSTEM hive back to guest: %s", hive_path)
                 g.upload(str(local_hive), hive_path)
 
-                # Verify by hash
                 with tempfile.TemporaryDirectory() as verify_tmp:
                     verify_path = Path(verify_tmp) / "SYSTEM_verify"
-                    g.download(hive_path, str(verify_path))
+                    _download_hive_local(logger, g, hive_path, verify_path)
                     new_hash = hashlib.sha256(verify_path.read_bytes()).hexdigest()
 
                 if new_hash != original_hash:
                     results["registry_modified"] = True
-                    logger.info(f"SYSTEM hive changed: sha256 {original_hash} -> {new_hash}")
+                    logger.info("SYSTEM hive changed: sha256 %s -> %s", original_hash, new_hash)
                 else:
                     logger.warning("SYSTEM hive appears unchanged after upload (unexpected)")
 
-                # Post-edit verification
+                # Optional verification readback (best-effort)
                 with tempfile.TemporaryDirectory() as verify_dir:
                     verify_hive = Path(verify_dir) / "SYSTEM_verify"
-                    g.download(hive_path, str(verify_hive))
-
-                    vh = g.hivex_open(str(verify_hive), write=0)
-                    vroot = vh.root()
-
-                    vcs = vh.node_get_child(vroot, cs_name)
-                    if vcs is None:
-                        vcs = vh.node_get_child(vroot, "ControlSet001")
-
-                    vservices = vh.node_get_child(vcs, "Services") if vcs else None
-                    if vservices is None:
-                        results["verification_errors"].append("Verification failed: Services node missing")
-                    else:
-                        for drv in drivers:
-                            svc_name = str(getattr(drv, "service_name"))
-                            drv_type_value = getattr(getattr(drv, "type", None), "value", None) or str(getattr(drv, "type", ""))
-                            start_default = int(getattr(getattr(drv, "start_type", None), "value", getattr(drv, "start_type", 0)))
-
-                            svc = vh.node_get_child(vservices, svc_name)
-                            if svc is None:
-                                results["verification_errors"].append(f"Missing service after edit: {svc_name}")
-                                continue
-
-                            got = _hivex_read_dword(vh, svc, "Start")
-                            expected = start_default
-                            if drv_type_value == driver_type_storage_value:
-                                expected = boot_start_value
-
-                            if got == expected:
-                                results["verified_services"].append(svc_name)
-                            else:
-                                results["verification_errors"].append(
-                                    f"{svc_name} Start mismatch: got={got} expected={expected}"
-                                )
-
+                    _download_hive_local(logger, g, hive_path, verify_hive)
+                    vh: Optional[hivex.Hivex] = None
                     try:
-                        vh.hivex_close()
-                    except Exception:
-                        pass
+                        vh = _open_hive_local(verify_hive, write=False)
+                        vroot = _node_id(vh.root())
+                        vcs = _node_id(vh.node_get_child(vroot, cs_name))
+                        if vcs == 0:
+                            vcs = _node_id(vh.node_get_child(vroot, "ControlSet001"))
+                        vservices = _node_id(vh.node_get_child(vcs, "Services")) if vcs != 0 else 0
 
+                        if vservices == 0:
+                            results["verification_errors"].append("Verification failed: Services node missing")
+                        else:
+                            for drv in drivers:
+                                svc_name = str(getattr(drv, "service_name"))
+                                drv_type_value = _driver_type_norm(drv)
+                                start_default = _driver_start_default(drv, fallback=3)
+
+                                svc = _node_id(vh.node_get_child(vservices, svc_name))
+                                if svc == 0:
+                                    results["verification_errors"].append(f"Missing service after edit: {svc_name}")
+                                    continue
+
+                                got = _hivex_read_dword(vh, svc, "Start")
+                                expected = int(start_default)
+                                if str(drv_type_value) == storage_type_norm:
+                                    expected = int(boot_start_value)
+
+                                if got == expected:
+                                    results["verified_services"].append(svc_name)
+                                else:
+                                    results["verification_errors"].append(
+                                        f"{svc_name} Start mismatch: got={got} expected={expected}"
+                                    )
+                    finally:
+                        _close_best_effort(vh)
             else:
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 logger.info("Dry-run: registry edits computed but not committed/uploaded")
 
             results["success"] = len(results["errors"]) == 0
@@ -380,6 +686,9 @@ def edit_system_hive(
                 "StartOverride keys removed (if present) because they can silently disable drivers.",
                 "Registry strings written as UTF-16LE REG_SZ (Windows-correct).",
                 "CriticalDeviceDatabase populated for storage PCI IDs.",
+                "Node ids normalized across python-hivex versions (0 vs None).",
+                "Driver start_type None handled with fallback Start=3 (demand).",
+                "Driver type comparisons normalized via _driver_type_norm().",
             ]
             return results
 
@@ -388,11 +697,14 @@ def edit_system_hive(
             logger.error(msg)
             results["errors"].append(msg)
             return results
+        finally:
+            _close_best_effort(h)
 
 
-# ---------------------------
+# ---------------------------------------------------------------------------
 # Public: SYSTEM hive generic DWORD setter (for CrashControl etc.)
-# ---------------------------
+# ---------------------------------------------------------------------------
+
 
 def set_system_dword(
     self,
@@ -406,16 +718,13 @@ def set_system_dword(
     """
     Generic offline SYSTEM hive edit:
       HKLM\\SYSTEM\\<CurrentControlSet>\\<key_path...>\\<name> = REG_DWORD(value)
-
-    Example:
-      set_system_dword(..., key_path=["Control","CrashControl"], name="AutoReboot", value=0)
     """
     logger = _safe_logger(self)
-    dry_run = getattr(self, "dry_run", False)
+    dry_run = bool(getattr(self, "dry_run", False))
 
     out: Dict[str, Any] = {
         "success": False,
-        "dry_run": bool(dry_run),
+        "dry_run": dry_run,
         "hive_path": hive_path,
         "key_path": list(key_path),
         "name": name,
@@ -437,33 +746,34 @@ def set_system_dword(
 
     with tempfile.TemporaryDirectory() as td:
         local = Path(td) / "SYSTEM"
+        h: Optional[hivex.Hivex] = None
         try:
+            _log_mountpoints_best_effort(logger, g)
+
             if not dry_run:
                 ts = U.now_ts()
                 backup_path = f"{hive_path}.vmdk2kvm.backup.{ts}"
                 g.cp(hive_path, backup_path)
                 out["hive_backup"] = backup_path
 
-            g.download(hive_path, str(local))
+            _download_hive_local(logger, g, hive_path, local)
             orig_hash = hashlib.sha256(local.read_bytes()).hexdigest()
 
-            h = g.hivex_open(str(local), write=(0 if dry_run else 1))
-            root = h.root()
-
-            cs_name = _detect_current_controlset(h, root)
-            cs = h.node_get_child(root, cs_name)
-            if cs is None:
-                cs_name = "ControlSet001"
-                cs = h.node_get_child(root, cs_name)
-            if cs is None:
-                out["errors"].append("No usable ControlSet found (001/current)")
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
+            h = _open_hive_local(local, write=(not dry_run))
+            root = _node_id(h.root())
+            if root == 0:
+                out["errors"].append("Invalid hivex root()")
                 return out
 
-            # Walk/ensure path under controlset
+            cs_name = _detect_current_controlset(h, root)
+            cs = _node_id(h.node_get_child(root, cs_name))
+            if cs == 0:
+                cs_name = "ControlSet001"
+                cs = _node_id(h.node_get_child(root, cs_name))
+            if cs == 0:
+                out["errors"].append("No usable ControlSet found (001/current)")
+                return out
+
             node = cs
             for comp in key_path:
                 node = _ensure_child(h, node, comp)
@@ -479,37 +789,41 @@ def set_system_dword(
                 out["new"] = old
 
             if not dry_run:
-                h.hivex_commit(None)
-                h.hivex_close()
+                try:
+                    _commit_best_effort(h)
+                finally:
+                    _close_best_effort(h)
+                    h = None
+
                 g.upload(str(local), hive_path)
 
                 with tempfile.TemporaryDirectory() as vtd:
                     vlocal = Path(vtd) / "SYSTEM_verify"
-                    g.download(hive_path, str(vlocal))
+                    _download_hive_local(logger, g, hive_path, vlocal)
                     new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
 
                 out["success"] = (new_hash != orig_hash) or (not out["modified"])
             else:
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 out["success"] = True
 
             out["notes"] += [
                 f"ControlSet resolved and edited at: {cs_name}",
                 "DWORD written as REG_DWORD (little-endian).",
+                "Node ids normalized across python-hivex versions (0 vs None).",
             ]
             return out
 
         except Exception as e:
             out["errors"].append(f"SYSTEM dword set failed: {e}")
             return out
+        finally:
+            _close_best_effort(h)
 
 
-# ---------------------------
+# ---------------------------------------------------------------------------
 # Public: SOFTWARE hive DevicePath append
-# ---------------------------
+# ---------------------------------------------------------------------------
+
 
 def append_devicepath_software_hive(
     self,
@@ -522,11 +836,11 @@ def append_devicepath_software_hive(
       HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DevicePath
     """
     logger = _safe_logger(self)
-    dry_run = getattr(self, "dry_run", False)
+    dry_run = bool(getattr(self, "dry_run", False))
 
     out: Dict[str, Any] = {
         "success": False,
-        "dry_run": bool(dry_run),
+        "dry_run": dry_run,
         "hive_path": software_hive_path,
         "modified": False,
         "original": None,
@@ -545,38 +859,39 @@ def append_devicepath_software_hive(
 
     with tempfile.TemporaryDirectory() as td:
         local = Path(td) / "SOFTWARE"
+        h: Optional[hivex.Hivex] = None
         try:
-            g.download(software_hive_path, str(local))
+            _log_mountpoints_best_effort(logger, g)
+
+            # Backup (match other SOFTWARE edits)
+            if not dry_run:
+                ts = U.now_ts()
+                backup_path = f"{software_hive_path}.vmdk2kvm.backup.{ts}"
+                g.cp(software_hive_path, backup_path)
+                out["hive_backup"] = backup_path
+
+            _download_hive_local(logger, g, software_hive_path, local)
             orig_hash = hashlib.sha256(local.read_bytes()).hexdigest()
 
-            h = g.hivex_open(str(local), write=(0 if dry_run else 1))
-            root = h.root()
+            h = _open_hive_local(local, write=(not dry_run))
+            root = _node_id(h.root())
+            if root == 0:
+                out["errors"].append("Invalid hivex root()")
+                return out
 
-            microsoft = h.node_get_child(root, "Microsoft")
-            if microsoft is None:
+            microsoft = _node_id(h.node_get_child(root, "Microsoft"))
+            if microsoft == 0:
                 out["errors"].append("SOFTWARE hive missing Microsoft key")
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 return out
 
-            windows = h.node_get_child(microsoft, "Windows")
-            if windows is None:
+            windows = _node_id(h.node_get_child(microsoft, "Windows"))
+            if windows == 0:
                 out["errors"].append("SOFTWARE hive missing Microsoft\\Windows key")
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 return out
 
-            cv = h.node_get_child(windows, "CurrentVersion")
-            if cv is None:
+            cv = _node_id(h.node_get_child(windows, "CurrentVersion"))
+            if cv == 0:
                 out["errors"].append("SOFTWARE hive missing Microsoft\\Windows\\CurrentVersion key")
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 return out
 
             cur = _hivex_read_sz(h, cv, "DevicePath") or r"%SystemRoot%\inf"
@@ -589,47 +904,49 @@ def append_devicepath_software_hive(
             out["new"] = new
 
             if new != cur:
-                logger.info(f"Updating DevicePath: +{append_path}")
+                logger.info("Updating DevicePath: +%s", append_path)
                 _set_expand_sz(h, cv, "DevicePath", new)
                 out["modified"] = True
             else:
                 logger.info("DevicePath already contains staging path; no change needed")
 
             if not dry_run:
-                h.hivex_commit(None)
-                h.hivex_close()
+                try:
+                    _commit_best_effort(h)
+                finally:
+                    _close_best_effort(h)
+                    h = None
+
                 g.upload(str(local), software_hive_path)
 
                 with tempfile.TemporaryDirectory() as vtd:
                     vlocal = Path(vtd) / "SOFTWARE_verify"
-                    g.download(software_hive_path, str(vlocal))
+                    _download_hive_local(logger, g, software_hive_path, vlocal)
                     new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
 
-                if new_hash != orig_hash:
-                    out["success"] = True
-                else:
-                    out["success"] = not out["modified"]
+                out["success"] = (new_hash != orig_hash) or (not out["modified"])
             else:
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 out["success"] = True
 
             out["notes"] += [
                 "DevicePath updated to help Windows PnP discover staged INF packages on first boot.",
                 "Value written as REG_EXPAND_SZ (UTF-16LE).",
+                "Node ids normalized across python-hivex versions (0 vs None).",
+                "Backup created alongside other SOFTWARE edits.",
             ]
             return out
 
         except Exception as e:
             out["errors"].append(f"DevicePath update failed: {e}")
             return out
+        finally:
+            _close_best_effort(h)
 
 
-# ---------------------------
+# ---------------------------------------------------------------------------
 # Public: SOFTWARE hive RunOnce helper (for firstboot scripts)
-# ---------------------------
+# ---------------------------------------------------------------------------
+
 
 def add_software_runonce(
     self,
@@ -641,20 +958,14 @@ def add_software_runonce(
 ) -> Dict[str, Any]:
     """
     Add/overwrite a RunOnce entry:
-
       HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\<name> = "<command>"
-
-    This is the simplest way to ensure a one-time firstboot action without
-    relying on Task Scheduler or services.
-
-    Note: Stored as REG_SZ (UTF-16LE).
     """
     logger = _safe_logger(self)
-    dry_run = getattr(self, "dry_run", False)
+    dry_run = bool(getattr(self, "dry_run", False))
 
     out: Dict[str, Any] = {
         "success": False,
-        "dry_run": bool(dry_run),
+        "dry_run": dry_run,
         "hive_path": software_hive_path,
         "name": name,
         "command": command,
@@ -675,34 +986,39 @@ def add_software_runonce(
 
     with tempfile.TemporaryDirectory() as td:
         local = Path(td) / "SOFTWARE"
+        h: Optional[hivex.Hivex] = None
         try:
+            _log_mountpoints_best_effort(logger, g)
+
             if not dry_run:
                 ts = U.now_ts()
                 backup_path = f"{software_hive_path}.vmdk2kvm.backup.{ts}"
                 g.cp(software_hive_path, backup_path)
                 out["hive_backup"] = backup_path
 
-            g.download(software_hive_path, str(local))
+            _download_hive_local(logger, g, software_hive_path, local)
             orig_hash = hashlib.sha256(local.read_bytes()).hexdigest()
 
-            h = g.hivex_open(str(local), write=(0 if dry_run else 1))
-            root = h.root()
+            h = _open_hive_local(local, write=(not dry_run))
+            root = _node_id(h.root())
+            if root == 0:
+                out["errors"].append("Invalid hivex root()")
+                return out
 
-            # Walk Microsoft\Windows\CurrentVersion\RunOnce
-            microsoft = h.node_get_child(root, "Microsoft")
-            if microsoft is None:
+            microsoft = _node_id(h.node_get_child(root, "Microsoft"))
+            if microsoft == 0:
                 microsoft = _ensure_child(h, root, "Microsoft")
 
-            windows = h.node_get_child(microsoft, "Windows")
-            if windows is None:
+            windows = _node_id(h.node_get_child(microsoft, "Windows"))
+            if windows == 0:
                 windows = _ensure_child(h, microsoft, "Windows")
 
-            cv = h.node_get_child(windows, "CurrentVersion")
-            if cv is None:
+            cv = _node_id(h.node_get_child(windows, "CurrentVersion"))
+            if cv == 0:
                 cv = _ensure_child(h, windows, "CurrentVersion")
 
-            runonce = h.node_get_child(cv, "RunOnce")
-            if runonce is None:
+            runonce = _node_id(h.node_get_child(cv, "RunOnce"))
+            if runonce == 0:
                 runonce = _ensure_child(h, cv, "RunOnce")
 
             old = _hivex_read_sz(h, runonce, name)
@@ -716,30 +1032,33 @@ def add_software_runonce(
                 out["new"] = old
 
             if not dry_run:
-                h.hivex_commit(None)
-                h.hivex_close()
+                try:
+                    _commit_best_effort(h)
+                finally:
+                    _close_best_effort(h)
+                    h = None
+
                 g.upload(str(local), software_hive_path)
 
                 with tempfile.TemporaryDirectory() as vtd:
                     vlocal = Path(vtd) / "SOFTWARE_verify"
-                    g.download(software_hive_path, str(vlocal))
+                    _download_hive_local(logger, g, software_hive_path, vlocal)
                     new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
 
                 out["success"] = (new_hash != orig_hash) or (not out["modified"])
             else:
-                try:
-                    h.hivex_close()
-                except Exception:
-                    pass
                 out["success"] = True
 
-            logger.info(f"RunOnce set: {name} -> {command}")
+            logger.info("RunOnce set: %s -> %s", name, command)
             out["notes"] += [
                 r"RunOnce written at HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
                 "Value written as REG_SZ (UTF-16LE).",
+                "Node ids normalized across python-hivex versions (0 vs None).",
             ]
             return out
 
         except Exception as e:
             out["errors"].append(f"RunOnce update failed: {e}")
             return out
+        finally:
+            _close_best_effort(h)
