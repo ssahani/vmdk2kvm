@@ -1,0 +1,46 @@
+# ------------------------------------------------------------
+# vmdk2kvm — local VMDK → qcow2 (offline pipeline)
+# NOTE: virtio-win is provided as an *extracted directory*, not an ISO.
+# ------------------------------------------------------------
+
+cmd: local
+
+# Source
+vmdk: /home/ssahani/tt/vmdk2kvm/win10/win10.vmdk
+
+# Output
+output_dir: /home/ssahani/tt/vmdk2kvm/out
+to_output: /home/ssahani/tt/vmdk2kvm/out/windows10-fixed.qcow2
+out_format: qcow2
+compress: true
+checksum: true
+
+# Optional workdir (keeps intermediate junk out of out/)
+workdir: /home/ssahani/tt/vmdk2kvm/out/work
+
+# Fix / behavior toggles (global)
+fstab_mode: stabilize-all
+regen_initramfs: true
+no_grub: false
+print_fstab: false
+no_backup: false
+dry_run: false
+
+# VirtIO drivers: MUST be a DIRECTORY now (your extracted ISO tree)
+virtio_drivers_dir: /home/ssahani/tt/vmdk2kvm/virtio-win-extracted
+
+# Convert tuning (these map to your CLI flags only if you have them;
+# keep/remove depending on what your converter code reads)
+# cache: none
+# aio: native
+
+# Tests (off by default)
+libvirt_test: false
+qemu_test: false
+vm_name: converted-vm
+memory: 2048
+vcpus: 2
+uefi: false
+timeout: 60
+keep_domain: false
+headless: false

@@ -1184,6 +1184,7 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
                     log_path="/Windows/Temp/vmdk2kvm-firstboot.log",
                     driver_stage_dir=staging_root,
                     extra_cmd=None,
+                    remove_vmware_tools=True,
                 )
                 result["firstboot"] = fb
                 if not fb.get("success", True):

@@ -573,8 +573,6 @@ def _service_imagepath_cmd(cmdline: str) -> str:
     Build a service ImagePath that runs cmd.exe /c <cmdline>.
     Use REG_EXPAND_SZ so %SystemRoot% and %SystemDrive% can expand.
     """
-    # NOTE: for services, ImagePath typically does NOT need outer quotes unless there are spaces.
-    # We'll keep it explicit and robust.
     return r'%SystemRoot%\System32\cmd.exe /c ' + cmdline
 
 
@@ -592,20 +590,6 @@ def _add_firstboot_service_system_hive(
     """
     Create/update a Win32 service entry that executes once at boot.
     Service runs as LocalSystem by default.
-
-    Key location:
-      HKLM\\SYSTEM\\<CurrentControlSet>\\Services\\<service_name>
-    Minimal values written:
-      Type=0x10 (SERVICE_WIN32_OWN_PROCESS)
-      Start=<start>
-      ErrorControl=1
-      ImagePath=REG_EXPAND_SZ("%SystemRoot%\\System32\\cmd.exe /c ...")
-      ObjectName="LocalSystem"
-      DisplayName=<display_name>
-      (optional) Description
-
-    The script should self-delete the service after success:
-      sc.exe delete <service_name>
     """
     logger = _safe_logger(self)
     dry_run = bool(getattr(self, "dry_run", False))
@@ -669,9 +653,8 @@ def _add_firstboot_service_system_hive(
                 results["errors"].append(f"Failed to create Services\\{service_name}")
                 return results
 
-            # Win32 own process service
-            _set_dword(h, svc, "Type", 0x10)
-            _set_dword(h, svc, "Start", int(start))
+            _set_dword(h, svc, "Type", 0x10)          # SERVICE_WIN32_OWN_PROCESS
+            _set_dword(h, svc, "Start", int(start))  # AUTO_START by default
             _set_dword(h, svc, "ErrorControl", 1)
             _set_expand_sz(h, svc, "ImagePath", _service_imagepath_cmd(cmdline))
             _set_sz(h, svc, "ObjectName", "LocalSystem")
@@ -715,6 +698,83 @@ def _add_firstboot_service_system_hive(
             _close_best_effort(h)
 
 
+# ---------------------------------------------------------------------------
+# VMware Tools removal (firstboot script block)
+# ---------------------------------------------------------------------------
+
+def _vmware_tools_removal_cmd_block() -> str:
+    """
+    Returns a CMD script block (CRLF) that attempts to uninstall VMware Tools
+    *inside* Windows at first boot.
+
+    Why firstboot (not offline)?
+      - Product codes vary by version.
+      - Uninstall strings live in SOFTWARE hive and are best executed by Windows.
+
+    Approach:
+      1) Look for DisplayName containing "VMware Tools" in both 64-bit and WOW6432Node uninstall keys
+      2) Extract QuietUninstallString or UninstallString
+      3) Try to run it silently (best effort) and log output
+      4) Stop/delete common VMware services, and disable some known VMware drivers
+         (safe after migration; not a guarantee)
+
+    All operations are best-effort and never fail the whole firstboot.
+    """
+    # Keep it old-school CMD + PowerShell (present on Win7+). If PS missing, we just skip.
+    return r"""
+echo --- VMware Tools removal (best-effort) --- >> "%LOG%"
+where powershell >> "%LOG%" 2>&1
+if %ERRORLEVEL%==0 (
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ErrorActionPreference='Continue';" ^
+    "$keys=@(" ^
+    "'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'," ^
+    "'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'" ^
+    ");" ^
+    "$apps=Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'VMware Tools' };" ^
+    "if(-not $apps){ 'No VMware Tools uninstall entry found' | Out-File -Append -Encoding ascii $env:LOG; exit 0 }" ^
+    "foreach($a in $apps){" ^
+    "  ('Found: ' + $a.DisplayName) | Out-File -Append -Encoding ascii $env:LOG;" ^
+    "  $u=$a.QuietUninstallString; if(-not $u){ $u=$a.UninstallString };" ^
+    "  if(-not $u){ 'No uninstall string' | Out-File -Append -Encoding ascii $env:LOG; continue }" ^
+    "  ('UninstallString: ' + $u) | Out-File -Append -Encoding ascii $env:LOG;" ^
+    "  try {" ^
+    "    if($u -match 'msiexec'){ if($u -notmatch '/qn'){ $u += ' /qn' }; if($u -notmatch '/norestart'){ $u += ' /norestart' } }" ^
+    "    Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ' + $u) -Wait -PassThru | ForEach-Object { ('rc=' + $_.ExitCode) | Out-File -Append -Encoding ascii $env:LOG }" ^
+    "  } catch { $_ | Out-File -Append -Encoding ascii $env:LOG }" ^
+    "}" ^
+    >> "%LOG%" 2>&1
+) else (
+  echo powershell not available; skipping VMware Tools uninstall via registry >> "%LOG%"
+)
+
+echo --- VMware services stop/delete (best-effort) --- >> "%LOG%"
+for %%S in (VMTools VGAuthService vmvss vmware-aliases vmtoolsd) do (
+  sc.exe query "%%S" >> "%LOG%" 2>&1
+  if %ERRORLEVEL%==0 (
+    sc.exe stop "%%S" >> "%LOG%" 2>&1
+    sc.exe delete "%%S" >> "%LOG%" 2>&1
+  )
+)
+
+echo --- VMware driver/services cleanup (best-effort) --- >> "%LOG%"
+for %%D in (vm3dmp vmmouse vmusbmouse vmxnet3 vmhgfs vmci vmscsi pvscsi) do (
+  reg query "HKLM\SYSTEM\CurrentControlSet\Services\%%D" >> "%LOG%" 2>&1
+  if %ERRORLEVEL%==0 (
+    reg add "HKLM\SYSTEM\CurrentControlSet\Services\%%D" /v Start /t REG_DWORD /d 4 /f >> "%LOG%" 2>&1
+  )
+)
+
+echo --- VMware file cleanup (best-effort) --- >> "%LOG%"
+if exist "%ProgramFiles%\VMware\VMware Tools" (
+  dir /s /b "%ProgramFiles%\VMware\VMware Tools" >> "%LOG%" 2>&1
+)
+if exist "%ProgramFiles(x86)%\VMware\VMware Tools" (
+  dir /s /b "%ProgramFiles(x86)%\VMware\VMware Tools" >> "%LOG%" 2>&1
+)
+"""
+
+
 def provision_firstboot_payload_and_service(
     self,
     g: guestfs.GuestFS,
@@ -725,6 +785,7 @@ def provision_firstboot_payload_and_service(
     log_path: str = "/Windows/Temp/vmdk2kvm-firstboot.log",
     driver_stage_dir: str = "/vmdk2kvm/drivers",
     extra_cmd: Optional[str] = None,
+    remove_vmware_tools: bool = False,
 ) -> Dict[str, Any]:
     """
     End-to-end firstboot provisioning:
@@ -733,12 +794,8 @@ def provision_firstboot_payload_and_service(
       3) Create a service that runs it at boot (LocalSystem), logs to C:\\Windows\\Temp\\vmdk2kvm-firstboot.log
       4) Record what was uploaded (sha256 + bytes) in results["uploaded_files"]
 
-    The script:
-      - writes verbose logs (date/time, hostname, disk, etc.)
-      - enumerates staged drivers (INF) under driver_stage_dir
-      - installs drivers using pnputil (best effort)
-      - optionally runs extra_cmd
-      - deletes the service and optionally cleans up
+    Optional:
+      - remove_vmware_tools=True: attempt to uninstall VMware Tools and disable common VMware services/drivers at first boot.
 
     IMPORTANT: This does NOT invent drivers. You should ensure your driver injection code
     actually uploads INF/CAT/SYS into driver_stage_dir before first boot.
@@ -759,6 +816,7 @@ def provision_firstboot_payload_and_service(
             "log_path": log_path,
             "driver_stage_dir": driver_stage_dir,
         },
+        "remove_vmware_tools": bool(remove_vmware_tools),
     }
 
     # Ensure the *right* Windows volume is / (so /Windows and /vmdk2kvm are truly C:\Windows and C:\vmdk2kvm)
@@ -778,8 +836,7 @@ def provision_firstboot_payload_and_service(
         return results
 
     # Build the firstboot script content (Windows CMD)
-    # Note: On Windows runtime, %SystemDrive% is typically C:
-    # We keep paths in Windows form inside the script.
+    # Keep log path anchored to %SystemRoot%\Temp (matches your observed expectations).
     win_guest_dir = r"%SystemDrive%\vmdk2kvm"
     win_driver_dir = fr"{win_guest_dir}\drivers"
     win_log = r"%SystemRoot%\Temp\vmdk2kvm-firstboot.log"
@@ -792,6 +849,11 @@ def provision_firstboot_payload_and_service(
             f"call {extra_cmd} >> \"%LOG%\" 2>&1\r\n"
             "echo ==== EXTRA CMD END ====>> \"%LOG%\"\r\n"
         )
+
+    vmware_block = ""
+    if remove_vmware_tools:
+        # Ensure LOG env var is available for the PowerShell block.
+        vmware_block = _vmware_tools_removal_cmd_block().replace("\n", "\r\n").strip() + "\r\n"
 
     firstboot_cmd = rf"""@echo off
 setlocal EnableExtensions EnableDelayedExpansion
@@ -835,6 +897,7 @@ if %ERRORLEVEL%==0 (
   echo pnputil not found; cannot install INF drivers >> "%LOG%"
 )
 
+{vmware_block}
 {extra}
 
 echo --- Cleanup / self-delete --- >> "%LOG%"
@@ -887,6 +950,11 @@ exit /b 0
         "Drivers must be staged under C:\\vmdk2kvm\\drivers (guestfs path: /vmdk2kvm/drivers).",
         "uploaded_files includes sha256+size so you can prove what landed on disk.",
     ]
+    if remove_vmware_tools:
+        results["notes"].append(
+            "VMware Tools removal enabled: firstboot will attempt registry-based uninstall + stop/delete common VMware services and disable known VMware drivers (best-effort)."
+        )
+
     results["success"] = True
     return results
 
