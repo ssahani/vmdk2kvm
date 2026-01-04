@@ -8,16 +8,22 @@ import logging
 import re
 import shutil
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import guestfs  # type: ignore
 
 from ..core.utils import U
-from .windows_registry import append_devicepath_software_hive, edit_system_hive
+from .windows_registry import (
+    append_devicepath_software_hive,
+    edit_system_hive,
+    provision_firstboot_payload_and_service,
+    _ensure_windows_root,  # internal helper in same package; ensures correct system volume mounted
+)
 
 # Optional ISO extractor
 try:
@@ -127,7 +133,7 @@ def _plan_to_dict(plan: WindowsVirtioPlan) -> Dict[str, Any]:
 
 
 # ---------------------------
-# Logging + helpers
+# Logging helpers (emoji + steps)
 # ---------------------------
 
 def _safe_logger(self) -> logging.Logger:
@@ -136,6 +142,36 @@ def _safe_logger(self) -> logging.Logger:
         return lg
     return logging.getLogger("vmdk2kvm.windows_virtio")
 
+
+def _emoji(level: int) -> str:
+    if level >= logging.ERROR:
+        return "❌"
+    if level >= logging.WARNING:
+        return "⚠️"
+    if level >= logging.INFO:
+        return "✅"
+    return "🔍"
+
+
+def _log(logger: logging.Logger, level: int, msg: str, *args: Any) -> None:
+    logger.log(level, f"{_emoji(level)} {msg}", *args)
+
+
+@contextmanager
+def _step(logger: logging.Logger, title: str):
+    t0 = time.time()
+    _log(logger, logging.INFO, "%s ...", title)
+    try:
+        yield
+        _log(logger, logging.INFO, "%s done (%.2fs)", title, time.time() - t0)
+    except Exception as e:
+        _log(logger, logging.ERROR, "%s failed (%.2fs): %s", title, time.time() - t0, e)
+        raise
+
+
+# ---------------------------
+# Misc helpers
+# ---------------------------
 
 def _to_int(v: Any, default: int = 0) -> int:
     if isinstance(v, int):
@@ -170,6 +206,35 @@ def _guest_sha256(g: guestfs.GuestFS, guest_path: str) -> Optional[str]:
         return None
 
 
+def _sha256_path(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _log_mountpoints_best_effort(logger: logging.Logger, g: guestfs.GuestFS) -> None:
+    try:
+        mps = g.mountpoints()
+        _log(logger, logging.DEBUG, "guestfs mountpoints=%r", mps)
+    except Exception:
+        pass
+
+
+def _guest_mkdir_p(g: guestfs.GuestFS, path: str, *, dry_run: bool) -> None:
+    if dry_run:
+        return
+    try:
+        if not g.is_dir(path):
+            g.mkdir_p(path)
+    except Exception:
+        # Some backends throw if path does not exist; mkdir_p is idempotent anyway.
+        g.mkdir_p(path)
+
+
+def _guest_write_text(g: guestfs.GuestFS, path: str, content: str, *, dry_run: bool) -> None:
+    if dry_run:
+        return
+    g.write(path, content.encode("utf-8", errors="ignore"))
+
+
 # ---------------------------
 # VirtIO source materialization (dir OR ISO)
 # ---------------------------
@@ -192,8 +257,10 @@ def _materialize_virtio_source(self, virtio_path: Path):
         )
 
     td = Path(tempfile.mkdtemp(prefix="vmdk2kvm-virtio-iso-"))
+    extracted = 0
+    tried: List[str] = []
     try:
-        logger.info(f"Extracting VirtIO ISO to temp dir: {td}")
+        _log(logger, logging.INFO, "📀 Extracting VirtIO ISO -> %s", td)
         iso = pycdlib.PyCdlib()
         iso.open(str(virtio_path))
 
@@ -224,6 +291,8 @@ def _materialize_virtio_source(self, virtio_path: Path):
                     continue
 
         for use_joliet in (False, True):
+            mode = "joliet" if use_joliet else "iso9660"
+            tried.append(mode)
             for iso_file in _walk("/", use_joliet):
                 rel = iso_file.lstrip("/").rstrip(";1")
                 out = td / rel
@@ -233,14 +302,16 @@ def _materialize_virtio_source(self, virtio_path: Path):
                         iso.get_file_from_iso(str(out), joliet_path=iso_file)
                     else:
                         iso.get_file_from_iso(str(out), iso_path=iso_file)
+                    extracted += 1
                 except Exception as e:
-                    logger.debug(f"ISO extract failed for {iso_file} (joliet={use_joliet}): {e}")
+                    _log(logger, logging.DEBUG, "ISO extract failed for %s (%s): %s", iso_file, mode, e)
 
         try:
             iso.close()
         except Exception:
             pass
 
+        _log(logger, logging.INFO, "📀 ISO extraction complete: %d files (modes tried=%s)", extracted, tried)
         yield td
     finally:
         try:
@@ -256,7 +327,7 @@ def _materialize_virtio_source(self, virtio_path: Path):
 def is_windows(self, g: guestfs.GuestFS) -> bool:
     logger = _safe_logger(self)
     if not getattr(self, "inspect_root", None):
-        logger.debug("Windows detect: inspect_root missing -> not Windows")
+        _log(logger, logging.DEBUG, "Windows detect: inspect_root missing -> not Windows")
         return False
 
     root = self.inspect_root
@@ -265,7 +336,7 @@ def is_windows(self, g: guestfs.GuestFS) -> bool:
         try:
             os_type = U.to_text(g.inspect_get_type(root))
             if os_type and os_type.lower() == "windows":
-                logger.debug("Windows detect: inspect_get_type says windows")
+                _log(logger, logging.DEBUG, "Windows detect: inspect_get_type says windows")
                 return True
         except Exception:
             pass
@@ -273,7 +344,7 @@ def is_windows(self, g: guestfs.GuestFS) -> bool:
         for dir_path in ["/Windows", "/WINDOWS", "/winnt", "/WINNT", "/Program Files"]:
             try:
                 if g.is_dir(dir_path):
-                    logger.debug(f"Windows detect: found dir {dir_path}")
+                    _log(logger, logging.DEBUG, "Windows detect: found dir %s", dir_path)
                     return True
             except Exception:
                 continue
@@ -285,16 +356,16 @@ def is_windows(self, g: guestfs.GuestFS) -> bool:
         ]:
             try:
                 if g.is_file(reg_file):
-                    logger.debug(f"Windows detect: found SOFTWARE hive {reg_file}")
+                    _log(logger, logging.DEBUG, "Windows detect: found SOFTWARE hive %s", reg_file)
                     return True
             except Exception:
                 continue
 
-        logger.debug("Windows detect: no signals -> not Windows")
+        _log(logger, logging.DEBUG, "Windows detect: no signals -> not Windows")
         return False
 
     except Exception as e:
-        logger.debug(f"Windows detect: exception -> not Windows: {e}")
+        _log(logger, logging.DEBUG, "Windows detect: exception -> not Windows: %s", e)
         return False
 
 
@@ -303,11 +374,11 @@ def _find_windows_root(self, g: guestfs.GuestFS) -> Optional[str]:
     for p in ["/Windows", "/WINDOWS", "/winnt", "/WINNT"]:
         try:
             if g.is_dir(p):
-                logger.debug(f"Windows root: found {p}")
+                _log(logger, logging.DEBUG, "Windows root: found %s", p)
                 return p
         except Exception:
             continue
-    logger.debug("Windows root: no direct hit")
+    _log(logger, logging.DEBUG, "Windows root: no direct hit")
     return None
 
 
@@ -326,7 +397,7 @@ def _windows_version_info(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 
     root = getattr(self, "inspect_root", None)
     if not root:
-        logger.debug("Windows info: inspect_root missing")
+        _log(logger, logging.DEBUG, "Windows info: inspect_root missing")
         return info
 
     try:
@@ -336,7 +407,7 @@ def _windows_version_info(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         info["product_name"] = U.to_text(g.inspect_get_product_name(root))
         info["distro"] = U.to_text(g.inspect_get_distro(root))
     except Exception as e:
-        logger.debug(f"Windows info: inspect getters failed: {e}")
+        _log(logger, logging.DEBUG, "Windows info: inspect getters failed: %s", e)
 
     arch = (info.get("arch") or "").lower()
     if arch in ("x86_64", "amd64", "arm64", "aarch64"):
@@ -466,13 +537,15 @@ def _choose_driver_plan(self, win_info: Dict[str, Any]) -> WindowsVirtioPlan:
         drivers_needed=drivers_needed,
     )
 
-    logger.info(
-        "Windows plan:"
-        f" edition={plan.edition.value}"
-        f" arch={plan.arch_dir}"
-        f" bucket_hint={plan.os_bucket}"
-        f" bucket_candidates={_bucket_candidates(plan.edition)}"
-        f" drivers_needed={sorted([d.value for d in plan.drivers_needed])}"
+    _log(
+        logger,
+        logging.INFO,
+        "🧩 Windows plan: edition=%s arch=%s bucket_hint=%s candidates=%s drivers=%s",
+        plan.edition.value,
+        plan.arch_dir,
+        plan.os_bucket,
+        _bucket_candidates(plan.edition),
+        sorted([d.value for d in plan.drivers_needed]),
     )
     return plan
 
@@ -640,14 +713,14 @@ def _discover_virtio_drivers(self, virtio_src: Path, plan: WindowsVirtioPlan) ->
         except Exception:
             return None
 
-    logger.info("Discovering VirtIO drivers...")
-    logger.info(f"VirtIO source: {virtio_src}")
-    logger.info(f"Bucket candidates: {buckets}")
+    _log(logger, logging.INFO, "🔎 Discovering VirtIO drivers ...")
+    _log(logger, logging.INFO, "VirtIO source: %s", virtio_src)
+    _log(logger, logging.INFO, "Bucket candidates: %s", buckets)
 
     with _materialize_virtio_source(self, virtio_src) as base:
-        logger.info(f"VirtIO materialized dir: {base}")
+        _log(logger, logging.INFO, "VirtIO materialized dir: %s", base)
 
-        for driver_type in plan.drivers_needed:
+        for driver_type in sorted(plan.drivers_needed, key=lambda d: d.value):
             cfgs = driver_configs.get(driver_type, [])
             if not cfgs:
                 continue
@@ -692,15 +765,33 @@ def _discover_virtio_drivers(self, virtio_src: Path, plan: WindowsVirtioPlan) ->
                                 match_pattern=pat,
                             )
                         )
-                        logger.info(f"Found {driver_type.value} driver: {driver_name} bucket={bucket} -> {src}")
+                        _log(
+                            logger,
+                            logging.INFO,
+                            "📦 Found driver: type=%s name=%s bucket=%s -> %s",
+                            driver_type.value,
+                            driver_name,
+                            bucket,
+                            src,
+                        )
                         if infp:
-                            logger.info(f" - INF: {infp}")
+                            _log(logger, logging.INFO, "📄 INF: %s", infp)
+                        else:
+                            _log(logger, logging.WARNING, "📄 INF missing near %s (PnP may still work via SYS only)", src)
                         found = True
                         break
 
                 if not found:
                     lvl = logging.WARNING if driver_type == DriverType.STORAGE else logging.INFO
-                    logger.log(lvl, f"Driver not found: type={driver_type.value} name={driver_name} arch={plan.arch_dir} buckets={buckets}")
+                    _log(
+                        logger,
+                        lvl,
+                        "Driver not found: type=%s name=%s arch=%s buckets=%s",
+                        driver_type.value,
+                        driver_name,
+                        plan.arch_dir,
+                        buckets,
+                    )
 
     return drivers
 
@@ -777,13 +868,13 @@ def windows_bcd_actual_fix(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     logger = _safe_logger(self)
 
-    dry_run = getattr(self, "dry_run", False)
+    dry_run = bool(getattr(self, "dry_run", False))
     force_overwrite = bool(getattr(self, "force_virtio_overwrite", False))
     virtio_dir = getattr(self, "virtio_drivers_dir", None)
-    export_report = getattr(self, "export_report", False)
+    export_report = bool(getattr(self, "export_report", False))
 
     if not virtio_dir:
-        logger.info("VirtIO inject: virtio_drivers_dir not set -> skip")
+        _log(logger, logging.INFO, "VirtIO inject: virtio_drivers_dir not set -> skip")
         return {"injected": False, "reason": "virtio_drivers_dir_not_set"}
 
     virtio_src = Path(str(virtio_dir))
@@ -797,14 +888,24 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     if not getattr(self, "inspect_root", None):
         return {"injected": False, "reason": "no_inspect_root"}
 
-    windows_root = _find_windows_root(self, g)
-    if not windows_root:
+    _log_mountpoints_best_effort(logger, g)
+
+    # Ensure we're operating on the REAL Windows system volume (C:) mounted at /
+    # This prevents "copied to wrong partition" failures.
+    with _step(logger, "🧭 Ensure Windows system volume mounted (C: -> /)"):
+        # SYSTEM hive existence is the strongest anchor that /Windows is real.
+        _ensure_windows_root(logger, g, hint_hive_path="/Windows/System32/config/SYSTEM")
+
+    windows_root = _find_windows_root(self, g) or "/Windows"
+    if not windows_root or not g.is_dir(windows_root):
         return {"injected": False, "reason": "no_windows_root"}
 
     win_info = _windows_version_info(self, g)
     plan = _choose_driver_plan(self, win_info)
 
-    drivers = _discover_virtio_drivers(self, virtio_src, plan)
+    with _step(logger, "🔎 Discover VirtIO drivers"):
+        drivers = _discover_virtio_drivers(self, virtio_src, plan)
+
     if not drivers:
         return {
             "injected": False,
@@ -814,6 +915,11 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
             "plan": _plan_to_dict(plan),
             "buckets_tried": _bucket_candidates(plan.edition),
         }
+
+    # Critical sanity: storage drivers missing is almost always fatal for boot.
+    storage_services = sorted({d.service_name for d in drivers if d.type == DriverType.STORAGE})
+    if not storage_services:
+        _log(logger, logging.ERROR, "No storage drivers discovered (viostor/vioscsi). Boot is likely to fail.")
 
     result: Dict[str, Any] = {
         "injected": False,
@@ -830,177 +936,283 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         "registry_changes": {},
         "devicepath_changes": {},
         "bcd_changes": {},
+        "firstboot": {},
+        "artifacts": [],
         "warnings": [],
         "notes": [],
     }
 
     # ---- Copy SYS into System32\drivers ----
     drivers_target_dir = f"{windows_root}/System32/drivers"
-    try:
-        if not g.is_dir(drivers_target_dir) and not dry_run:
-            g.mkdir_p(drivers_target_dir)
-    except Exception as e:
-        return {**result, "reason": f"drivers_dir_error: {e}"}
-
-    for drv in drivers:
-        dest_path = f"{drivers_target_dir}/{drv.dest_name}"
+    with _step(logger, "🧱 Ensure System32\\drivers exists"):
         try:
-            src_size = drv.src_path.stat().st_size
-
-            if g.is_file(dest_path) and not force_overwrite:
-                try:
-                    guest_hash = _guest_sha256(g, dest_path)
-                    host_hash = hashlib.sha256(drv.src_path.read_bytes()).hexdigest()
-                    if guest_hash and guest_hash == host_hash:
-                        result["files_copied"].append(
-                            {
-                                "name": drv.dest_name,
-                                "action": "skipped",
-                                "reason": "already_exists_same_hash",
-                                "source": str(drv.src_path),
-                                "destination": dest_path,
-                                "size": src_size,
-                                "type": drv.type.value,
-                                "service": drv.service_name,
-                            }
-                        )
-                        continue
-                except Exception:
-                    pass
-
-            if not dry_run:
-                g.upload(str(drv.src_path), dest_path)
-
-            result["files_copied"].append(
-                {
-                    "name": drv.dest_name,
-                    "action": "copied" if not dry_run else "dry_run",
-                    "source": str(drv.src_path),
-                    "destination": dest_path,
-                    "size": src_size,
-                    "type": drv.type.value,
-                    "service": drv.service_name,
-                    "bucket_used": drv.bucket_used,
-                    "match_pattern": drv.match_pattern,
-                }
-            )
+            if not g.is_dir(drivers_target_dir) and not dry_run:
+                g.mkdir_p(drivers_target_dir)
         except Exception as e:
-            result["warnings"].append(f"VirtIO inject: copy failed {drv.src_path} -> {dest_path}: {e}")
+            return {**result, "reason": f"drivers_dir_error: {e}"}
 
-    # ---- Stage packages (small offline-friendly payload) ----
-    staging_root = f"{windows_root}/vmdk2kvm/drivers/virtio"
-    devicepath_append = r"%SystemRoot%\vmdk2kvm\drivers\virtio"
+    with _step(logger, "📦 Upload .sys driver binaries"):
+        for drv in drivers:
+            dest_path = f"{drivers_target_dir}/{drv.dest_name}"
+            try:
+                src_size = drv.src_path.stat().st_size
+                host_hash = _sha256_path(drv.src_path)
 
-    def _guest_mkdir_p(path: str) -> None:
-        if dry_run:
-            return
-        try:
-            if not g.is_dir(path):
-                g.mkdir_p(path)
-        except Exception:
-            g.mkdir_p(path)
+                if g.is_file(dest_path) and not force_overwrite:
+                    try:
+                        guest_hash = _guest_sha256(g, dest_path)
+                        if guest_hash and guest_hash == host_hash:
+                            result["files_copied"].append(
+                                {
+                                    "name": drv.dest_name,
+                                    "action": "skipped",
+                                    "reason": "already_exists_same_hash",
+                                    "source": str(drv.src_path),
+                                    "destination": dest_path,
+                                    "size": src_size,
+                                    "sha256": host_hash,
+                                    "type": drv.type.value,
+                                    "service": drv.service_name,
+                                }
+                            )
+                            result["artifacts"].append(
+                                {
+                                    "kind": "driver_sys",
+                                    "service": drv.service_name,
+                                    "type": drv.type.value,
+                                    "src": str(drv.src_path),
+                                    "dst": dest_path,
+                                    "size": src_size,
+                                    "sha256": host_hash,
+                                    "action": "skipped",
+                                }
+                            )
+                            _log(logger, logging.INFO, "Skip (same hash): %s -> %s", drv.src_path, dest_path)
+                            continue
+                    except Exception:
+                        pass
 
-    try:
-        _guest_mkdir_p(staging_root)
-    except Exception as e:
-        result["warnings"].append(f"VirtIO stage: failed to create staging root: {e}")
+                if not dry_run:
+                    g.upload(str(drv.src_path), dest_path)
 
-    for drv in drivers:
-        if not drv.package_dir or not drv.package_dir.exists() or not drv.inf_path:
-            continue
+                # Optional verify for critical storage drivers (cheap + high value)
+                verify = None
+                if drv.type == DriverType.STORAGE and not dry_run:
+                    try:
+                        verify = _guest_sha256(g, dest_path)
+                    except Exception:
+                        verify = None
 
-        guest_pkg_dir = f"{staging_root}/{drv.service_name}"
-        try:
-            _guest_mkdir_p(guest_pkg_dir)
-        except Exception as e:
-            result["warnings"].append(f"VirtIO stage: cannot create {guest_pkg_dir}: {e}")
-            continue
-
-        staged_files: List[Dict[str, Any]] = []
-        try:
-            payload = sorted([p for p in drv.package_dir.iterdir() if p.is_file() and _is_probably_driver_payload(p)])
-            for p in payload:
-                gp = f"{guest_pkg_dir}/{p.name}"
-                try:
-                    if not dry_run:
-                        g.upload(str(p), gp)
-                    staged_files.append({"name": p.name, "source": str(p), "dest": gp, "size": p.stat().st_size})
-                except Exception as e:
-                    result["warnings"].append(f"VirtIO stage: upload failed {p} -> {gp}: {e}")
-
-            if staged_files:
-                result["packages_staged"].append(
+                action = "copied" if not dry_run else "dry_run"
+                result["files_copied"].append(
                     {
-                        "service": drv.service_name,
+                        "name": drv.dest_name,
+                        "action": action,
+                        "source": str(drv.src_path),
+                        "destination": dest_path,
+                        "size": src_size,
+                        "sha256": host_hash,
+                        "guest_sha256": verify,
                         "type": drv.type.value,
-                        "package_dir": str(drv.package_dir),
-                        "inf": str(drv.inf_path),
-                        "guest_dir": guest_pkg_dir,
-                        "files": staged_files,
+                        "service": drv.service_name,
+                        "bucket_used": drv.bucket_used,
+                        "match_pattern": drv.match_pattern,
                     }
                 )
-        except Exception as e:
-            result["warnings"].append(f"VirtIO stage: failed staging package for {drv.service_name}: {e}")
+                result["artifacts"].append(
+                    {
+                        "kind": "driver_sys",
+                        "service": drv.service_name,
+                        "type": drv.type.value,
+                        "src": str(drv.src_path),
+                        "dst": dest_path,
+                        "size": src_size,
+                        "sha256": host_hash,
+                        "guest_sha256": verify,
+                        "action": action,
+                        "bucket_used": drv.bucket_used,
+                        "match_pattern": drv.match_pattern,
+                    }
+                )
+                _log(logger, logging.INFO, "Upload: %s -> %s", drv.src_path, dest_path)
+            except Exception as e:
+                msg = f"VirtIO inject: copy failed {drv.src_path} -> {dest_path}: {e}"
+                result["warnings"].append(msg)
+                _log(logger, logging.WARNING, "%s", msg)
 
-    # Stage a setup.cmd for manual run (optional)
+    # ---- Stage packages for firstboot pnputil (C:\vmdk2kvm\drivers\virtio\...) ----
+    # IMPORTANT: /vmdk2kvm maps to C:\vmdk2kvm (NOT /Windows/vmdk2kvm).
+    staging_root = "/vmdk2kvm/drivers/virtio"
+    devicepath_append = r"%SystemDrive%\vmdk2kvm\drivers\virtio"  # safer than %SystemRoot%\vmdk2kvm\...
+
+    with _step(logger, "📁 Stage driver packages (INF/CAT/DLL) for PnP"):
+        try:
+            _guest_mkdir_p(g, staging_root, dry_run=dry_run)
+        except Exception as e:
+            msg = f"VirtIO stage: failed to create staging root {staging_root}: {e}"
+            result["warnings"].append(msg)
+            _log(logger, logging.WARNING, "%s", msg)
+
+        for drv in drivers:
+            if not drv.package_dir or not drv.package_dir.exists() or not drv.inf_path:
+                continue
+
+            guest_pkg_dir = f"{staging_root}/{drv.service_name}"
+            try:
+                _guest_mkdir_p(g, guest_pkg_dir, dry_run=dry_run)
+            except Exception as e:
+                msg = f"VirtIO stage: cannot create {guest_pkg_dir}: {e}"
+                result["warnings"].append(msg)
+                _log(logger, logging.WARNING, "%s", msg)
+                continue
+
+            staged_files: List[Dict[str, Any]] = []
+            try:
+                payload = sorted([p for p in drv.package_dir.iterdir() if p.is_file() and _is_probably_driver_payload(p)])
+                for p in payload:
+                    gp = f"{guest_pkg_dir}/{p.name}"
+                    try:
+                        if not dry_run:
+                            g.upload(str(p), gp)
+                        staged_files.append({"name": p.name, "source": str(p), "dest": gp, "size": p.stat().st_size})
+                        result["artifacts"].append(
+                            {
+                                "kind": "staged_payload",
+                                "service": drv.service_name,
+                                "type": drv.type.value,
+                                "src": str(p),
+                                "dst": gp,
+                                "size": p.stat().st_size,
+                                "action": "copied" if not dry_run else "dry_run",
+                            }
+                        )
+                    except Exception as e:
+                        msg = f"VirtIO stage: upload failed {p} -> {gp}: {e}"
+                        result["warnings"].append(msg)
+                        _log(logger, logging.WARNING, "%s", msg)
+
+                if staged_files:
+                    result["packages_staged"].append(
+                        {
+                            "service": drv.service_name,
+                            "type": drv.type.value,
+                            "package_dir": str(drv.package_dir),
+                            "inf": str(drv.inf_path),
+                            "guest_dir": guest_pkg_dir,
+                            "files": staged_files,
+                        }
+                    )
+                    _log(logger, logging.INFO, "Staged package: %s -> %s (%d files)", drv.service_name, guest_pkg_dir, len(staged_files))
+            except Exception as e:
+                msg = f"VirtIO stage: failed staging package for {drv.service_name}: {e}"
+                result["warnings"].append(msg)
+                _log(logger, logging.WARNING, "%s", msg)
+
+    # Stage a setup.cmd for manual run (optional emergency lever)
     if result["packages_staged"]:
-        setup_script = f"{windows_root}/vmdk2kvm/setup.cmd"
+        setup_script = "/vmdk2kvm/setup.cmd"
         script_content = "@echo off\r\n"
         script_content += "echo Installing staged VirtIO drivers...\r\n"
         for staged in result["packages_staged"]:
             inf = staged.get("inf")
             if inf:
                 inf_name = Path(str(inf)).name
+                # NOTE: setup.cmd is run inside Windows, so use C:\ paths
                 script_content += (
-                    f'pnputil /add-driver "%SystemRoot%\\vmdk2kvm\\drivers\\virtio\\{staged["service"]}\\{inf_name}" /install\r\n'
+                    f'pnputil /add-driver "C:\\vmdk2kvm\\drivers\\virtio\\{staged["service"]}\\{inf_name}" /install\r\n'
                 )
         script_content += "echo Done.\r\n"
         try:
-            if not dry_run:
-                g.write(setup_script, script_content.encode("utf-8", errors="ignore"))
+            with _step(logger, "🧾 Stage manual setup.cmd (optional)"):
+                _guest_write_text(g, setup_script, script_content, dry_run=dry_run)
             result["setup_script"] = {"path": setup_script, "content": script_content}
+            result["artifacts"].append({"kind": "setup_cmd", "dst": setup_script, "action": "written" if not dry_run else "dry_run"})
         except Exception as e:
-            result["warnings"].append(f"Failed to stage setup.cmd: {e}")
+            msg = f"Failed to stage setup.cmd: {e}"
+            result["warnings"].append(msg)
+            _log(logger, logging.WARNING, "%s", msg)
 
     # ---- Registry edits (SYSTEM) ----
     system_hive = f"{windows_root}/System32/config/SYSTEM"
-    try:
-        reg_res = edit_system_hive(
-            self,
-            g,
-            system_hive,
-            drivers,
-            driver_type_storage_value=DriverType.STORAGE.value,
-            boot_start_value=DriverStartType.BOOT.value,
-        )
-        result["registry_changes"] = reg_res
-    except Exception as e:
-        result["registry_changes"] = {"success": False, "error": str(e)}
-        result["warnings"].append(f"Registry edit failed: {e}")
+    with _step(logger, "🧬 Edit SYSTEM hive (Services + CDD + StartOverride)"):
+        try:
+            reg_res = edit_system_hive(
+                self,
+                g,
+                system_hive,
+                drivers,
+                driver_type_storage_value=DriverType.STORAGE.value,
+                boot_start_value=DriverStartType.BOOT.value,
+            )
+            result["registry_changes"] = reg_res
+            if not reg_res.get("success"):
+                _log(logger, logging.WARNING, "SYSTEM hive edit reported errors: %s", reg_res.get("errors"))
+        except Exception as e:
+            result["registry_changes"] = {"success": False, "error": str(e)}
+            msg = f"Registry edit failed: {e}"
+            result["warnings"].append(msg)
+            _log(logger, logging.WARNING, "%s", msg)
 
     # ---- DevicePath append (SOFTWARE) ----
-    try:
-        software_hive = f"{windows_root}/System32/config/SOFTWARE"
-        if result["packages_staged"]:
-            dp_res = append_devicepath_software_hive(self, g, software_hive, devicepath_append)
-            result["devicepath_changes"] = dp_res
-        else:
-            result["devicepath_changes"] = {"skipped": True, "reason": "no_packages_staged"}
-    except Exception as e:
-        result["devicepath_changes"] = {"success": False, "error": str(e)}
-        result["warnings"].append(f"DevicePath update failed: {e}")
+    with _step(logger, "🧩 Update SOFTWARE DevicePath (PnP discovery)"):
+        try:
+            software_hive = f"{windows_root}/System32/config/SOFTWARE"
+            if result["packages_staged"]:
+                dp_res = append_devicepath_software_hive(self, g, software_hive, devicepath_append)
+                result["devicepath_changes"] = dp_res
+                if not dp_res.get("success", True):
+                    _log(logger, logging.WARNING, "DevicePath update reported errors: %s", dp_res.get("errors"))
+            else:
+                result["devicepath_changes"] = {"skipped": True, "reason": "no_packages_staged"}
+                _log(logger, logging.INFO, "DevicePath: skipped (no packages staged)")
+        except Exception as e:
+            result["devicepath_changes"] = {"success": False, "error": str(e)}
+            msg = f"DevicePath update failed: {e}"
+            result["warnings"].append(msg)
+            _log(logger, logging.WARNING, "%s", msg)
+
+    # ---- Firstboot service (preferred over RunOnce) ----
+    if result["packages_staged"]:
+        with _step(logger, "🛠️ Provision firstboot service (pnputil /install + logging)"):
+            try:
+                fb = provision_firstboot_payload_and_service(
+                    self,
+                    g,
+                    system_hive_path=system_hive,
+                    service_name="vmdk2kvm-firstboot",
+                    guest_dir="/vmdk2kvm",
+                    log_path="/Windows/Temp/vmdk2kvm-firstboot.log",
+                    driver_stage_dir=staging_root,
+                    extra_cmd=None,
+                )
+                result["firstboot"] = fb
+                if not fb.get("success", True):
+                    msg = f"Firstboot provisioning failed: {fb.get('errors')}"
+                    result["warnings"].append(msg)
+                    _log(logger, logging.WARNING, "%s", msg)
+                else:
+                    _log(logger, logging.INFO, "Firstboot installed: service=vmdk2kvm-firstboot log=C:\\Windows\\Temp\\vmdk2kvm-firstboot.log")
+            except Exception as e:
+                result["firstboot"] = {"success": False, "error": str(e)}
+                msg = f"Firstboot provisioning exception: {e}"
+                result["warnings"].append(msg)
+                _log(logger, logging.WARNING, "%s", msg)
+    else:
+        result["firstboot"] = {"skipped": True, "reason": "no_packages_staged"}
 
     # ---- BCD backup/hints ----
-    try:
-        result["bcd_changes"] = windows_bcd_actual_fix(self, g)
-    except Exception as e:
-        result["bcd_changes"] = {"windows": True, "bcd": "error", "error": str(e)}
-        result["warnings"].append(f"BCD check failed: {e}")
+    with _step(logger, "🧷 BCD store discovery + backup"):
+        try:
+            result["bcd_changes"] = windows_bcd_actual_fix(self, g)
+        except Exception as e:
+            result["bcd_changes"] = {"windows": True, "bcd": "error", "error": str(e)}
+            msg = f"BCD check failed: {e}"
+            result["warnings"].append(msg)
+            _log(logger, logging.WARNING, "%s", msg)
 
     # ---- Success criteria ----
     sys_ok = any(x.get("action") in ("copied", "dry_run", "skipped") for x in result["files_copied"])
     reg_ok = bool(result.get("registry_changes", {}).get("success"))
-
     result["injected"] = bool(sys_ok and reg_ok)
     result["success"] = result["injected"]
     if not result["success"]:
@@ -1019,8 +1231,14 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
         "CDD: CriticalDeviceDatabase populated for virtio storage PCI IDs to ensure early binding.",
         f"Driver discovery buckets: {_bucket_candidates(plan.edition)}",
         f"Storage drivers found: {storage_found} missing: {storage_missing}",
-        "Staging: driver payload staged under %SystemRoot%\\vmdk2kvm\\drivers\\virtio to help PnP on first boot.",
+        r"Staging: payload staged under C:\vmdk2kvm\drivers\virtio and installed via firstboot service (pnputil).",
+        r"Logs: C:\Windows\Temp\vmdk2kvm-firstboot.log (firstboot) and service name vmdk2kvm-firstboot.",
     ]
+
+    if storage_missing:
+        msg = f"Missing critical storage drivers: {storage_missing} (guest may BSOD INACCESSIBLE_BOOT_DEVICE)"
+        result["warnings"].append(msg)
+        _log(logger, logging.WARNING, "%s", msg)
 
     if export_report:
         report_path = "virtio_inject_report.json"
@@ -1028,8 +1246,11 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, default=str)
             result["report_exported"] = report_path
+            _log(logger, logging.INFO, "Report exported: %s", report_path)
         except Exception as e:
-            result["warnings"].append(f"Failed to export report: {e}")
+            msg = f"Failed to export report: {e}"
+            result["warnings"].append(msg)
+            _log(logger, logging.WARNING, "%s", msg)
 
     return result
 
