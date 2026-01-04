@@ -294,9 +294,7 @@ def _upload_bytes(
         sz = len(data)
 
     if results is not None:
-        results.setdefault("uploaded_files", []).append(
-            {"guest_path": guest_path, "sha256": sha, "bytes": sz}
-        )
+        results.setdefault("uploaded_files", []).append({"guest_path": guest_path, "sha256": sha, "bytes": sz})
     logger.info("Uploaded guest file: %s (sha256=%s, bytes=%s)", guest_path, sha, sz)
 
 
@@ -380,7 +378,9 @@ def _ensure_child(h: hivex.Hivex, parent: NodeLike, name: str) -> int:
     return ch
 
 
-def _delete_child_if_exists(h: hivex.Hivex, parent: NodeLike, name: str, *, logger: Optional[logging.Logger] = None) -> bool:
+def _delete_child_if_exists(
+    h: hivex.Hivex, parent: NodeLike, name: str, *, logger: Optional[logging.Logger] = None
+) -> bool:
     pid = _node_id(parent)
     if pid == 0:
         return False
@@ -568,12 +568,13 @@ def _pci_id_normalize(pci_id: str) -> str:
 # First-boot mechanism: create a one-shot SERVICE (more reliable than RunOnce)
 # ---------------------------------------------------------------------------
 
+
 def _service_imagepath_cmd(cmdline: str) -> str:
     """
     Build a service ImagePath that runs cmd.exe /c <cmdline>.
     Use REG_EXPAND_SZ so %SystemRoot% and %SystemDrive% can expand.
     """
-    return r'%SystemRoot%\System32\cmd.exe /c ' + cmdline
+    return r"%SystemRoot%\System32\cmd.exe /c " + cmdline
 
 
 def _add_firstboot_service_system_hive(
@@ -653,8 +654,8 @@ def _add_firstboot_service_system_hive(
                 results["errors"].append(f"Failed to create Services\\{service_name}")
                 return results
 
-            _set_dword(h, svc, "Type", 0x10)          # SERVICE_WIN32_OWN_PROCESS
-            _set_dword(h, svc, "Start", int(start))  # AUTO_START by default
+            _set_dword(h, svc, "Type", 0x10)  # SERVICE_WIN32_OWN_PROCESS
+            _set_dword(h, svc, "Start", int(start))
             _set_dword(h, svc, "ErrorControl", 1)
             _set_expand_sz(h, svc, "ImagePath", _service_imagepath_cmd(cmdline))
             _set_sz(h, svc, "ObjectName", "LocalSystem")
@@ -679,13 +680,15 @@ def _add_firstboot_service_system_hive(
                     _download_hive_local(logger, g, system_hive_path, vlocal)
                     new_hash = hashlib.sha256(vlocal.read_bytes()).hexdigest()
 
-                results["success"] = (new_hash != orig_hash) or True
+                # NOTE: even if hash matches, we may have written identical content;
+                # keep "success" meaning "did not error".
+                results["success"] = True if new_hash else True
             else:
                 results["success"] = True
 
             results["notes"] += [
                 f"Service created at HKLM\\SYSTEM\\{cs_name}\\Services\\{service_name}",
-                "Service runs as LocalSystem at boot; script should self-delete via sc.exe delete.",
+                "Service runs as LocalSystem at boot; script should self-delete via sc.exe delete (1060 == already removed).",
                 "ImagePath written as REG_EXPAND_SZ to expand %SystemRoot% at runtime.",
             ]
             logger.info("Firstboot service %s: %s", action, service_name)
@@ -702,27 +705,20 @@ def _add_firstboot_service_system_hive(
 # VMware Tools removal (firstboot script block)
 # ---------------------------------------------------------------------------
 
+
 def _vmware_tools_removal_cmd_block() -> str:
+    r"""
+    CMD block to remove VMware Tools at first boot.
+
+    Fixes vs previous:
+      - Uninstall detection matches either DisplayName contains "VMware Tools" OR Publisher contains "VMware"
+      - Runs QuietUninstallString/UninstallString; if msiexec, enforces /qn /norestart
+      - After uninstall attempt, FORCE-REMOVE VMware Tools dirs with takeown+icacls+rmdir (deterministic)
+      - Adds clarity for sc.exe 1060 (service already removed)
     """
-    Returns a CMD script block (CRLF) that attempts to uninstall VMware Tools
-    *inside* Windows at first boot.
-
-    Why firstboot (not offline)?
-      - Product codes vary by version.
-      - Uninstall strings live in SOFTWARE hive and are best executed by Windows.
-
-    Approach:
-      1) Look for DisplayName containing "VMware Tools" in both 64-bit and WOW6432Node uninstall keys
-      2) Extract QuietUninstallString or UninstallString
-      3) Try to run it silently (best effort) and log output
-      4) Stop/delete common VMware services, and disable some known VMware drivers
-         (safe after migration; not a guarantee)
-
-    All operations are best-effort and never fail the whole firstboot.
-    """
-    # Keep it old-school CMD + PowerShell (present on Win7+). If PS missing, we just skip.
     return r"""
 echo --- VMware Tools removal (best-effort) --- >> "%LOG%"
+
 where powershell >> "%LOG%" 2>&1
 if %ERRORLEVEL%==0 (
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
@@ -731,16 +727,17 @@ if %ERRORLEVEL%==0 (
     "'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'," ^
     "'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'" ^
     ");" ^
-    "$apps=Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'VMware Tools' };" ^
-    "if(-not $apps){ 'No VMware Tools uninstall entry found' | Out-File -Append -Encoding ascii $env:LOG; exit 0 }" ^
+    "$apps=Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { ($_.DisplayName -match 'VMware Tools') -or ($_.Publisher -match 'VMware') };" ^
+    "if(-not $apps){ 'No VMware Tools uninstall entry found (DisplayName/Publisher)' | Out-File -Append -Encoding ascii $env:LOG; exit 0 }" ^
     "foreach($a in $apps){" ^
-    "  ('Found: ' + $a.DisplayName) | Out-File -Append -Encoding ascii $env:LOG;" ^
+    "  ('Found: ' + $a.DisplayName + ' [' + $a.Publisher + ']') | Out-File -Append -Encoding ascii $env:LOG;" ^
     "  $u=$a.QuietUninstallString; if(-not $u){ $u=$a.UninstallString };" ^
     "  if(-not $u){ 'No uninstall string' | Out-File -Append -Encoding ascii $env:LOG; continue }" ^
     "  ('UninstallString: ' + $u) | Out-File -Append -Encoding ascii $env:LOG;" ^
     "  try {" ^
     "    if($u -match 'msiexec'){ if($u -notmatch '/qn'){ $u += ' /qn' }; if($u -notmatch '/norestart'){ $u += ' /norestart' } }" ^
-    "    Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ' + $u) -Wait -PassThru | ForEach-Object { ('rc=' + $_.ExitCode) | Out-File -Append -Encoding ascii $env:LOG }" ^
+    "    $p=Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ' + $u) -Wait -PassThru;" ^
+    "    ('rc=' + $p.ExitCode) | Out-File -Append -Encoding ascii $env:LOG;" ^
     "  } catch { $_ | Out-File -Append -Encoding ascii $env:LOG }" ^
     "}" ^
     >> "%LOG%" 2>&1
@@ -757,7 +754,7 @@ for %%S in (VMTools VGAuthService vmvss vmware-aliases vmtoolsd) do (
   )
 )
 
-echo --- VMware driver/services cleanup (best-effort) --- >> "%LOG%"
+echo --- VMware driver/services disable (best-effort) --- >> "%LOG%"
 for %%D in (vm3dmp vmmouse vmusbmouse vmxnet3 vmhgfs vmci vmscsi pvscsi) do (
   reg query "HKLM\SYSTEM\CurrentControlSet\Services\%%D" >> "%LOG%" 2>&1
   if %ERRORLEVEL%==0 (
@@ -765,12 +762,23 @@ for %%D in (vm3dmp vmmouse vmusbmouse vmxnet3 vmhgfs vmci vmscsi pvscsi) do (
   )
 )
 
-echo --- VMware file cleanup (best-effort) --- >> "%LOG%"
-if exist "%ProgramFiles%\VMware\VMware Tools" (
-  dir /s /b "%ProgramFiles%\VMware\VMware Tools" >> "%LOG%" 2>&1
-)
-if exist "%ProgramFiles(x86)%\VMware\VMware Tools" (
-  dir /s /b "%ProgramFiles(x86)%\VMware\VMware Tools" >> "%LOG%" 2>&1
+echo --- VMware Tools directory cleanup (best-effort but deterministic) --- >> "%LOG%"
+for %%D in (
+  "%ProgramFiles%\VMware\VMware Tools"
+  "%ProgramFiles(x86)%\VMware\VMware Tools"
+) do (
+  if exist "%%~D" (
+    echo Removing %%~D >> "%LOG%"
+    dir /s /b "%%~D" >> "%LOG%" 2>&1
+    takeown /f "%%~D" /r /d y >> "%LOG%" 2>&1
+    icacls "%%~D" /grant Administrators:F /t >> "%LOG%" 2>&1
+    rmdir /s /q "%%~D" >> "%LOG%" 2>&1
+    if exist "%%~D" (
+      echo WARN: directory still exists after rmdir: %%~D >> "%LOG%"
+    ) else (
+      echo OK: removed %%~D >> "%LOG%"
+    )
+  )
 )
 """
 
@@ -795,7 +803,8 @@ def provision_firstboot_payload_and_service(
       4) Record what was uploaded (sha256 + bytes) in results["uploaded_files"]
 
     Optional:
-      - remove_vmware_tools=True: attempt to uninstall VMware Tools and disable common VMware services/drivers at first boot.
+      - remove_vmware_tools=True: attempt to uninstall VMware Tools, stop/delete common VMware services,
+        disable known VMware drivers, and remove VMware Tools directories (best-effort).
 
     IMPORTANT: This does NOT invent drivers. You should ensure your driver injection code
     actually uploads INF/CAT/SYS into driver_stage_dir before first boot.
@@ -836,7 +845,6 @@ def provision_firstboot_payload_and_service(
         return results
 
     # Build the firstboot script content (Windows CMD)
-    # Keep log path anchored to %SystemRoot%\Temp (matches your observed expectations).
     win_guest_dir = r"%SystemDrive%\vmdk2kvm"
     win_driver_dir = fr"{win_guest_dir}\drivers"
     win_log = r"%SystemRoot%\Temp\vmdk2kvm-firstboot.log"
@@ -852,7 +860,7 @@ def provision_firstboot_payload_and_service(
 
     vmware_block = ""
     if remove_vmware_tools:
-        # Ensure LOG env var is available for the PowerShell block.
+        # Ensure CRLF for cmd.exe friendliness.
         vmware_block = _vmware_tools_removal_cmd_block().replace("\n", "\r\n").strip() + "\r\n"
 
     firstboot_cmd = rf"""@echo off
@@ -903,9 +911,10 @@ if %ERRORLEVEL%==0 (
 echo --- Cleanup / self-delete --- >> "%LOG%"
 where sc.exe >> "%LOG%" 2>&1
 if %ERRORLEVEL%==0 (
-  echo Deleting service %SVC% >> "%LOG%"
+  echo Deleting service %SVC% (1060 == already removed) >> "%LOG%"
   sc.exe stop "%SVC%" >> "%LOG%" 2>&1
   sc.exe delete "%SVC%" >> "%LOG%" 2>&1
+  echo Service delete attempted (1060 == OK) >> "%LOG%"
 ) else (
   echo sc.exe not found; cannot delete service >> "%LOG%"
 )
@@ -952,7 +961,7 @@ exit /b 0
     ]
     if remove_vmware_tools:
         results["notes"].append(
-            "VMware Tools removal enabled: firstboot will attempt registry-based uninstall + stop/delete common VMware services and disable known VMware drivers (best-effort)."
+            "VMware Tools removal enabled: firstboot will attempt registry-based uninstall + stop/delete services + disable drivers + remove Tools dirs (best-effort)."
         )
 
     results["success"] = True
@@ -962,6 +971,7 @@ exit /b 0
 # ---------------------------------------------------------------------------
 # Public: SYSTEM hive edit (Services + CDD + StartOverride)
 # ---------------------------------------------------------------------------
+
 
 def edit_system_hive(
     self,
@@ -1246,6 +1256,7 @@ def edit_system_hive(
 # Public: SYSTEM hive generic DWORD setter (for CrashControl etc.)
 # ---------------------------------------------------------------------------
 
+
 def set_system_dword(
     self,
     g: guestfs.GuestFS,
@@ -1340,9 +1351,7 @@ def set_system_dword(
                     h = None
 
                 g.upload(str(local), hive_path)
-                out["uploaded_files"].append(
-                    {"guest_path": hive_path, "sha256_local": hashlib.sha256(local.read_bytes()).hexdigest()}
-                )
+                out["uploaded_files"].append({"guest_path": hive_path, "sha256_local": hashlib.sha256(local.read_bytes()).hexdigest()})
 
                 with tempfile.TemporaryDirectory() as vtd:
                     vlocal = Path(vtd) / "SYSTEM_verify"
@@ -1371,6 +1380,7 @@ def set_system_dword(
 # ---------------------------------------------------------------------------
 # Public: SOFTWARE hive DevicePath append
 # ---------------------------------------------------------------------------
+
 
 def append_devicepath_software_hive(
     self,
@@ -1468,9 +1478,7 @@ def append_devicepath_software_hive(
                     h = None
 
                 g.upload(str(local), software_hive_path)
-                out["uploaded_files"].append(
-                    {"guest_path": software_hive_path, "sha256_local": hashlib.sha256(local.read_bytes()).hexdigest()}
-                )
+                out["uploaded_files"].append({"guest_path": software_hive_path, "sha256_local": hashlib.sha256(local.read_bytes()).hexdigest()})
 
                 with tempfile.TemporaryDirectory() as vtd:
                     vlocal = Path(vtd) / "SOFTWARE_verify"
@@ -1500,6 +1508,7 @@ def append_devicepath_software_hive(
 # ---------------------------------------------------------------------------
 # Public: SOFTWARE hive RunOnce helper (kept, but SERVICE is preferred)
 # ---------------------------------------------------------------------------
+
 
 def add_software_runonce(
     self,
@@ -1596,9 +1605,7 @@ def add_software_runonce(
                     h = None
 
                 g.upload(str(local), software_hive_path)
-                out["uploaded_files"].append(
-                    {"guest_path": software_hive_path, "sha256_local": hashlib.sha256(local.read_bytes()).hexdigest()}
-                )
+                out["uploaded_files"].append({"guest_path": software_hive_path, "sha256_local": hashlib.sha256(local.read_bytes()).hexdigest()})
 
                 with tempfile.TemporaryDirectory() as vtd:
                     vlocal = Path(vtd) / "SOFTWARE_verify"
