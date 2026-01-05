@@ -5,7 +5,6 @@ import datetime as _dt
 import logging
 import os
 import sys
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -16,8 +15,26 @@ try:
 except Exception:  # pragma: no cover
     _colored = None
 
+# ---------------------------------------------------------------------------
+# TRACE level (additive)
+# ---------------------------------------------------------------------------
+
+TRACE = 5
+if not hasattr(logging, "TRACE"):
+    logging.TRACE = TRACE  # type: ignore[attr-defined]
+    logging.addLevelName(TRACE, "TRACE")
+
+
+def _logger_trace(self: logging.Logger, msg: str, *args, **kwargs) -> None:
+    if self.isEnabledFor(TRACE):
+        self._log(TRACE, msg, args, **kwargs)
+
+
+if not hasattr(logging.Logger, "trace"):
+    logging.Logger.trace = _logger_trace  # type: ignore[attr-defined]
 
 _LEVEL_EMOJI = {
+    "TRACE": "🧬",
     "DEBUG": "🔍",
     "INFO": "✅",
     "WARNING": "⚠️",
@@ -25,6 +42,7 @@ _LEVEL_EMOJI = {
     "CRITICAL": "🧨",
 }
 _LEVEL_COLOR = {
+    "TRACE": "cyan",
     "DEBUG": "blue",
     "INFO": "green",
     "WARNING": "yellow",
@@ -106,7 +124,6 @@ class EmojiFormatter(logging.Formatter):
         if self._style.show_pid:
             bits.append(f"pid={os.getpid()}")
         if self._style.show_thread:
-            # record.threadName is always present; keep short-ish.
             bits.append(record.threadName)
         if self._style.show_logger:
             bits.append(record.name)
@@ -123,7 +140,6 @@ class EmojiFormatter(logging.Formatter):
             return "\n" + exc_text
 
         indent = " " * max(0, int(self._style.exception_indent))
-        # Indent every line; optionally tint it red for TTY.
         lines = exc_text.splitlines()
         block = "\n".join(indent + ln for ln in lines)
         if color_ok:
@@ -160,21 +176,21 @@ class Log:
           -qq: ERROR
           -v: INFO
           -vv: DEBUG
+          -vvv: TRACE
         Quiet wins over verbose if both are set.
         """
         if quiet >= 2:
             return logging.ERROR
         if quiet == 1:
             return logging.WARNING
+        if verbose >= 3:
+            return TRACE
         if verbose >= 2:
             return logging.DEBUG
         return logging.INFO
 
     @staticmethod
     def banner(logger: logging.Logger, title: str, *, char: str = "─") -> None:
-        """
-        Pretty section separator for long workflows.
-        """
         width = 72
         t = f" {title.strip()} "
         line = (char * max(8, (width - len(t)) // 2)) + t + (char * max(8, (width - len(t)) // 2))
@@ -182,9 +198,6 @@ class Log:
 
     @staticmethod
     def step(logger: logging.Logger, msg: str) -> None:
-        """
-        A “doing X…” line that reads nicely in CLI output.
-        """
         logger.info("➡️  %s", msg)
 
     @staticmethod
@@ -198,6 +211,11 @@ class Log:
     @staticmethod
     def fail(logger: logging.Logger, msg: str) -> None:
         logger.error("💥 %s", msg)
+
+    @staticmethod
+    def trace(logger: logging.Logger, msg: str, *args) -> None:
+        # logger.trace exists (we add it above), but keep this helper for call-site consistency.
+        logger.trace(msg, *args)  # type: ignore[attr-defined]
 
     @staticmethod
     def setup(
@@ -214,19 +232,12 @@ class Log:
         indent_exceptions: bool = True,
         logger_name: str = "vmdk2kvm",
     ) -> logging.Logger:
-        """
-        Create/refresh logger:
-          - Avoids handler duplication on repeated setup()
-          - Stream handler always goes to stderr (CLI-friendly)
-          - Optional file handler (no ANSI color; richer context)
-        """
         logger = logging.getLogger(logger_name)
         logger.propagate = False
 
         level = Log._level_from_flags(verbose, quiet)
         logger.setLevel(level)
 
-        # Decide coloring: default on when termcolor exists, but only if TTY.
         if color is None:
             color = True
 
@@ -244,7 +255,6 @@ class Log:
             unicode=bool(unicode_ok),
         )
 
-        # Clear existing handlers safely (prevents dupes)
         for h in list(logger.handlers):
             logger.removeHandler(h)
             try:
@@ -261,7 +271,6 @@ class Log:
             fp = Path(log_file).expanduser().resolve()
             fp.parent.mkdir(parents=True, exist_ok=True)
 
-            # File format: disable color; include ms + source + pid for forensics.
             file_style = LogStyle(
                 color=False,
                 show_ms=True,
@@ -271,7 +280,7 @@ class Log:
                 show_logger=True,
                 utc=style.utc,
                 indent_exceptions=True,
-                unicode=style.unicode,  # keep emoji if encoding supports it
+                unicode=style.unicode,
             )
             fh = logging.FileHandler(fp, encoding="utf-8")
             fh.setLevel(level)
@@ -279,4 +288,5 @@ class Log:
             logger.addHandler(fh)
 
         logger.debug("Logger initialized (level=%s, pid=%s)", logging.getLevelName(level), os.getpid())
+        logger.trace("TRACE enabled (verbose >= 3)")  # type: ignore[attr-defined]
         return logger
