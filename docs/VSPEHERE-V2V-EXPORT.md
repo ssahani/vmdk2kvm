@@ -84,7 +84,7 @@ You *can* enable them later once you decide the host test harness.
 ### List VM names (inventory)
 
 ```bash
-export VC_PASSWORD='VCENTER@redhat2025'
+export VC_PASSWORD='xxyyxx'
 sudo -E ./vmdk2kvm.py --config v2v-rhel10.yaml vsphere list_vm_names
 ```
 
