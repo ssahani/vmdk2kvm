@@ -132,7 +132,7 @@ command: vsphere
 # ------------------------------------------------------------------
 # vCenter connection (pyvmomi control-plane)
 # ------------------------------------------------------------------
-vcenter: 10.73.213.134
+vcenter: 192.168.73.42
 vc_user: administrator@vsphere.local
 vc_password_env: VC_PASSWORD
 vc_insecure: true
