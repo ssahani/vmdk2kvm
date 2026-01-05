@@ -96,7 +96,7 @@ The important part is: since `vs_v2v: true`, it will follow the virt-v2v export 
 Example (adapt to your subcommand naming):
 
 ```bash
-export VC_PASSWORD='VCENTER@redhat2025'
+export VC_PASSWORD='xxyyxxyxxyx'
 sudo -E ./vmdk2kvm.py --config v2v-rhel10.yaml vsphere export
 ```
 
