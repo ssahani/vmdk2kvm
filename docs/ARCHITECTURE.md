@@ -1,11 +1,3 @@
-Alright, let’s tighten the bolts and add **govc** properly—not as a bolt-on, but as a *first-class control-plane primitive* that coexists cleanly with pyvmomi and VDDK.
-
-Below is an **enhanced ARCHITECTURE.md**, written as if it always knew govc would exist. I’ve **not changed your philosophy**, only sharpened the boundaries and made the invariants explicit.
-
-You can drop this in as a replacement or cherry-pick sections.
-
----
-
 # ARCHITECTURE.md — vmdk2kvm Internal Architecture
 
 ## Purpose
