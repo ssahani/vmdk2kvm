@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..core.utils import U
 
@@ -66,7 +66,6 @@ class MultiBootloaderFixer:
           reinstalling boot sectors is high blast-radius. We only tweak config text + add console.
     """
 
-    # Bootloader detection patterns (paths only; commands are probed via shell in guest)
     BOOTLOADER_PATTERNS: Dict[BootloaderType, Dict[str, List[str]]] = {
         BootloaderType.GRUB: {
             "configs": ["/boot/grub/grub.conf", "/boot/grub/menu.lst"],
@@ -81,8 +80,19 @@ class MultiBootloaderFixer:
             "efi": ["/boot/efi/EFI/grub2", "/boot/efi/EFI/grub", "/efi/EFI/grub2", "/efi/EFI/grub"],
         },
         BootloaderType.SYSTEMD_BOOT: {
-            "configs": ["/boot/loader/loader.conf", "/etc/kernel/cmdline"],
-            "dirs": ["/boot/loader", "/usr/lib/systemd/boot/efi"],
+            "configs": [
+                "/boot/loader/loader.conf",
+                "/boot/efi/loader/loader.conf",
+                "/efi/loader/loader.conf",
+                "/etc/kernel/cmdline",
+                "/usr/lib/kernel/cmdline",
+            ],
+            "dirs": [
+                "/boot/loader",
+                "/boot/efi/loader",
+                "/efi/loader",
+                "/usr/lib/systemd/boot/efi",
+            ],
             "binaries": ["bootctl", "kernel-install"],
             "efi": ["/boot/efi/EFI/systemd", "/boot/efi/EFI/BOOT", "/efi/EFI/systemd", "/efi/EFI/BOOT"],
         },
@@ -112,12 +122,10 @@ class MultiBootloaderFixer:
         },
     }
 
-    # A sane, broadly-compatible console set for VM debugging.
     SERIAL_CONSOLE_ARGS = "console=ttyS0,115200n8 console=tty0"
-    # GRUB-ish defaults for serial terminal (opt-in only if missing).
-    GRUB_SERIAL_TERMINAL = "GRUB_TERMINAL=\"console serial\""
+    GRUB_SERIAL_TERMINAL = 'GRUB_TERMINAL="console serial"'
     GRUB_SERIAL_COMMAND = (
-        "GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\""
+        'GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"'
     )
 
     def __init__(
@@ -158,13 +166,12 @@ class MultiBootloaderFixer:
             try:
                 self._backup_cb(p)
             except Exception:
-                # backup is best-effort; never fail the fixer because backups couldn’t be made
+                # best-effort
                 pass
         g.write(p, text.encode("utf-8"))
 
     def _guest_has_cmd(self, g, cmd: str) -> bool:
         try:
-            # Do NOT rely on which (often missing). `command -v` is POSIX-sh.
             g.command(["sh", "-c", f"command -v {cmd} >/dev/null 2>&1"])
             return True
         except Exception:
@@ -178,23 +185,32 @@ class MultiBootloaderFixer:
             return ""
 
     def _looks_uefi(self, g) -> bool:
-        # Heuristic: ESP directories or EFI vendor paths
         for p in ("/boot/efi/EFI", "/efi/EFI", "/boot/EFI"):
             if self._is_dir(g, p):
                 return True
-        # fstab vfat on /boot/efi
         if self._is_file(g, "/etc/fstab"):
             txt = self._read_text(g, "/etc/fstab")
             if re.search(r"^\S+\s+/boot/efi\s+vfat\b", txt, flags=re.M):
                 return True
         return False
 
+    def _first_existing_file(self, g, candidates: List[str]) -> Optional[str]:
+        for p in candidates:
+            if self._is_file(g, p):
+                return p
+        return None
+
+    def _first_existing_dir(self, g, candidates: List[str]) -> Optional[str]:
+        for p in candidates:
+            if self._is_dir(g, p):
+                return p
+        return None
+
     # ---------------------------
     # Detection
     # ---------------------------
 
     def detect_bootloaders(self, g) -> BootloaderFixResult:
-        """Detect all bootloaders present in the guest."""
         result = BootloaderFixResult()
 
         for bl_type, patterns in self.BOOTLOADER_PATTERNS.items():
@@ -245,12 +261,10 @@ class MultiBootloaderFixer:
         out = self._guest_run(g, cmd)
         if not out:
             return None
-        # extract a plausible version token
         m = re.search(r"(\d+\.\d+(?:\.\d+)?)", out)
         return m.group(1) if m else None
 
     def _detect_boot_partition(self, g, info: BootloaderInfo) -> Optional[str]:
-        # /etc/fstab: /boot is fairly canonical when separate
         if self._is_file(g, "/etc/fstab"):
             fstab = self._read_text(g, "/etc/fstab")
             for line in fstab.splitlines():
@@ -261,7 +275,6 @@ class MultiBootloaderFixer:
                 if len(parts) >= 2 and parts[1] == "/boot":
                     return parts[0]
 
-        # Otherwise, best-effort grep in configs for root=
         for cfg in info.config_files:
             txt = self._read_text(g, cfg)
             if not txt:
@@ -280,14 +293,18 @@ class MultiBootloaderFixer:
         uefi = self._looks_uefi(g)
         has = {b.type for b in bootloaders}
 
-        # UEFI: prefer systemd-boot/refind/grub2 if present
         if uefi:
             for t in (BootloaderType.SYSTEMD_BOOT, BootloaderType.REFIND, BootloaderType.GRUB2):
                 if t in has:
                     return t
 
-        # BIOS / general: grub2 then grub then syslinux/extlinux then lilo
-        for t in (BootloaderType.GRUB2, BootloaderType.GRUB, BootloaderType.SYSLINUX, BootloaderType.EXTLINUX, BootloaderType.LILO):
+        for t in (
+            BootloaderType.GRUB2,
+            BootloaderType.GRUB,
+            BootloaderType.SYSLINUX,
+            BootloaderType.EXTLINUX,
+            BootloaderType.LILO,
+        ):
             if t in has:
                 return t
 
@@ -298,12 +315,6 @@ class MultiBootloaderFixer:
     # ---------------------------
 
     def apply_kvm_fixes(self, g, *, root_dev: Optional[str] = None) -> BootloaderFixResult:
-        """
-        Detect + apply safe KVM-friendly tweaks:
-          - add serial console args where relevant
-          - add GRUB serial terminal settings (only if missing)
-          - set loader.conf timeout/editor for systemd-boot (only if missing)
-        """
         result = self.detect_bootloaders(g)
         applied: Dict[str, Any] = {}
 
@@ -318,7 +329,6 @@ class MultiBootloaderFixer:
                 elif bl.type in (BootloaderType.SYSLINUX, BootloaderType.EXTLINUX):
                     applied[bl.type.value] = self._fix_syslinux_extlinux(g, bl)
                 elif bl.type == BootloaderType.REFIND:
-                    # rEFInd config varies wildly; we only *report* here.
                     applied[bl.type.value] = {"note": "rEFInd detected; no safe generic edits applied."}
                 elif bl.type == BootloaderType.LILO:
                     applied[bl.type.value] = {"note": "LILO detected; avoiding edits (high risk, writes MBR on run)."}
@@ -330,21 +340,7 @@ class MultiBootloaderFixer:
         result.fixes_applied = applied
         return result
 
-    def _ensure_line_kv(self, lines: List[str], key: str, value: str) -> Tuple[List[str], bool]:
-        """
-        Ensure a KEY=... line exists. If key exists, do nothing (preserve user config).
-        """
-        for ln in lines:
-            if ln.strip().startswith(key + "="):
-                return lines, False
-        lines.append(f'{key}="{value}"')
-        return lines, True
-
     def _ensure_grub_serial_blocks(self, content: str) -> Tuple[str, Dict[str, Any]]:
-        """
-        Add GRUB serial terminal directives if missing.
-        Conservative: only add if key not present.
-        """
         fixes: Dict[str, Any] = {}
         lines = content.splitlines()
 
@@ -362,26 +358,54 @@ class MultiBootloaderFixer:
             fixes["GRUB_SERIAL_COMMAND"] = "added"
             changed = True
 
-        return ("\n".join(lines) + ("\n" if content.endswith("\n") else "")), fixes if changed else fixes
+        new = "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+        return new, fixes if changed else fixes
 
     def _append_console_args_to_grub_cmdline(self, content: str) -> Tuple[str, bool]:
-        """
-        Append console args to GRUB_CMDLINE_LINUX* lines if missing.
-        Preserves existing args.
-        """
         if "GRUB_CMDLINE_LINUX" not in content:
             return content, False
 
         def repl(m: re.Match[str]) -> str:
             line = m.group(0)
-            # line looks like: GRUB_CMDLINE_LINUX="...."
             if "console=ttyS0" in line or "ttyS0," in line:
                 return line
-            # insert before ending quote (works for "...")
             return re.sub(r'"(\s*)$', f' {self.SERIAL_CONSOLE_ARGS}"\\1', line)
 
         new = re.sub(r"^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?=.*)$", repl, content, flags=re.M)
         return new, (new != content)
+
+    def _append_console_args_to_cmdline_file(self, content: str) -> Tuple[str, bool]:
+        """
+        For files like /etc/kernel/cmdline or /usr/lib/kernel/cmdline:
+          - typically a single line of kernel args (comments sometimes appear)
+        Conservative rules:
+          - if any line already includes console=ttyS0 or ttyS0, do nothing
+          - otherwise, append to the last non-empty, non-comment line (or create one)
+        """
+        if "console=ttyS0" in content or "ttyS0," in content:
+            return content, False
+
+        lines = content.splitlines()
+        if not lines:
+            return self.SERIAL_CONSOLE_ARGS + "\n", True
+
+        # find last usable line
+        idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            s = lines[i].strip()
+            if not s or s.startswith("#"):
+                continue
+            idx = i
+            break
+
+        if idx is None:
+            # only comments/blank lines
+            new = content + ("" if content.endswith("\n") else "\n") + self.SERIAL_CONSOLE_ARGS + "\n"
+            return new, True
+
+        lines[idx] = lines[idx].rstrip() + " " + self.SERIAL_CONSOLE_ARGS
+        new = "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+        return new, True
 
     def _fix_grub2(self, g, bl: BootloaderInfo) -> Dict[str, Any]:
         fixes: Dict[str, Any] = {"changed": False, "files": {}}
@@ -393,23 +417,23 @@ class MultiBootloaderFixer:
         old = self._read_text(g, p)
         new = old
 
-        # Add serial console args to kernel cmdline lines (only if missing)
         new, cmdline_changed = self._append_console_args_to_grub_cmdline(new)
         if cmdline_changed:
-            fixes["files"][p] = fixes["files"].get(p, {})
+            fixes["files"].setdefault(p, {})
             fixes["files"][p]["cmdline_console"] = "added"
             fixes["changed"] = True
 
-        # Add GRUB_TERMINAL and GRUB_SERIAL_COMMAND if missing
         new2, added = self._ensure_grub_serial_blocks(new)
         if added:
-            fixes["files"][p] = fixes["files"].get(p, {})
+            fixes["files"].setdefault(p, {})
             fixes["files"][p].update(added)
             fixes["changed"] = True
             new = new2
 
         if fixes["changed"]:
-            self.logger.info(f"bootloader_fixer: GRUB2 tweaks in {p}" + (" (dry-run)" if self.dry_run else ""))
+            self.logger.info(
+                f"bootloader_fixer: GRUB2 tweaks in {p}" + (" (dry-run)" if self.dry_run else "")
+            )
             if not self.dry_run:
                 self._write_text(g, p, new)
 
@@ -424,7 +448,6 @@ class MultiBootloaderFixer:
             if not old:
                 continue
 
-            # Append console args to "kernel ..." lines if missing
             changed = False
             out_lines: List[str] = []
             for ln in old.splitlines():
@@ -437,7 +460,10 @@ class MultiBootloaderFixer:
             if changed:
                 fixes["changed"] = True
                 fixes["files"][p] = {"kernel_console": "added"}
-                self.logger.info(f"bootloader_fixer: GRUB legacy console tweak in {p}" + (" (dry-run)" if self.dry_run else ""))
+                self.logger.info(
+                    f"bootloader_fixer: GRUB legacy console tweak in {p}"
+                    + (" (dry-run)" if self.dry_run else "")
+                )
                 if not self.dry_run:
                     self._write_text(g, p, "\n".join(out_lines) + ("\n" if old.endswith("\n") else ""))
 
@@ -445,37 +471,95 @@ class MultiBootloaderFixer:
             fixes["note"] = "No legacy GRUB configs updated (none found or already had console)"
         return fixes
 
+    # ---------------------------
+    # systemd-boot
+    # ---------------------------
+
     def _fix_systemd_boot(self, g, bl: BootloaderInfo) -> Dict[str, Any]:
+        """
+        systemd-boot can source kernel cmdline from multiple places depending on distro + tooling:
+          - /etc/kernel/cmdline (systemd kernel-install workflow)
+          - /usr/lib/kernel/cmdline (vendor default)
+          - individual BLS entry files: /boot/loader/entries/*.conf (or on ESP mountpoint)
+
+        Safe approach:
+          1) If /etc/kernel/cmdline exists => append console args there (persistent across regenerations)
+          2) Else if /usr/lib/kernel/cmdline exists => append there (less ideal, but better than nothing)
+          3) Always also patch entry files if present (some setups ignore cmdline files entirely)
+          4) loader.conf tweaks: timeout/editor only if missing
+        """
         fixes: Dict[str, Any] = {"changed": False, "files": {}}
 
-        # loader.conf: set small timeout + disable editor (only if missing)
-        loader_conf = "/boot/loader/loader.conf"
-        if self._is_file(g, loader_conf):
+        # ---- loader.conf (support multiple mount layouts) ----
+        loader_conf = self._first_existing_file(
+            g,
+            [
+                "/boot/loader/loader.conf",
+                "/boot/efi/loader/loader.conf",
+                "/efi/loader/loader.conf",
+            ],
+        )
+        if loader_conf:
             old = self._read_text(g, loader_conf)
             lines = old.splitlines()
             changed = False
 
             if not any(l.strip().startswith("timeout") for l in lines):
                 lines.append("timeout 3")
-                changed = True
-                fixes["files"][loader_conf] = fixes["files"].get(loader_conf, {})
+                fixes["files"].setdefault(loader_conf, {})
                 fixes["files"][loader_conf]["timeout"] = "added"
+                changed = True
 
             if not any(l.strip().startswith("editor") for l in lines):
                 lines.append("editor 0")
-                changed = True
-                fixes["files"][loader_conf] = fixes["files"].get(loader_conf, {})
+                fixes["files"].setdefault(loader_conf, {})
                 fixes["files"][loader_conf]["editor"] = "disabled"
+                changed = True
 
             if changed:
                 fixes["changed"] = True
-                self.logger.info(f"bootloader_fixer: systemd-boot tweaks in {loader_conf}" + (" (dry-run)" if self.dry_run else ""))
+                self.logger.info(
+                    f"bootloader_fixer: systemd-boot tweaks in {loader_conf}"
+                    + (" (dry-run)" if self.dry_run else "")
+                )
                 if not self.dry_run:
                     self._write_text(g, loader_conf, "\n".join(lines) + ("\n" if old.endswith("\n") else ""))
 
-        # entries: add console args in "options ..." lines if missing
-        entries_dir = "/boot/loader/entries"
-        if self._is_dir(g, entries_dir):
+        # ---- cmdline file(s): prefer /etc/kernel/cmdline ----
+        cmdline_targets = [
+            "/etc/kernel/cmdline",
+            "/usr/lib/kernel/cmdline",
+        ]
+        for p in cmdline_targets:
+            if not self._is_file(g, p):
+                continue
+            old = self._read_text(g, p)
+            new, changed = self._append_console_args_to_cmdline_file(old)
+            if changed:
+                fixes["changed"] = True
+                fixes["files"].setdefault(p, {})
+                fixes["files"][p]["cmdline_console"] = "added"
+                self.logger.info(
+                    f"bootloader_fixer: systemd-boot cmdline tweak in {p}"
+                    + (" (dry-run)" if self.dry_run else "")
+                )
+                if not self.dry_run:
+                    self._write_text(g, p, new)
+                # If we successfully updated /etc/kernel/cmdline, we can stop (highest priority).
+                if p == "/etc/kernel/cmdline":
+                    break
+
+        # ---- entry files (BLS-style): support multiple mount layouts) ----
+        entries_dir = self._first_existing_dir(
+            g,
+            [
+                "/boot/loader/entries",
+                "/boot/efi/loader/entries",
+                "/efi/loader/entries",
+            ],
+        )
+
+        if entries_dir:
             try:
                 for ent in g.ls(entries_dir):
                     name = U.to_text(ent).strip()
@@ -484,6 +568,7 @@ class MultiBootloaderFixer:
                     p = f"{entries_dir}/{name}"
                     if not self._is_file(g, p):
                         continue
+
                     old = self._read_text(g, p)
                     if "console=ttyS0" in old or "ttyS0," in old:
                         continue
@@ -499,7 +584,10 @@ class MultiBootloaderFixer:
                     if changed:
                         fixes["changed"] = True
                         fixes["files"][p] = {"options_console": "added"}
-                        self.logger.info(f"bootloader_fixer: systemd-boot entry console tweak in {p}" + (" (dry-run)" if self.dry_run else ""))
+                        self.logger.info(
+                            f"bootloader_fixer: systemd-boot entry console tweak in {p}"
+                            + (" (dry-run)" if self.dry_run else "")
+                        )
                         if not self.dry_run:
                             self._write_text(g, p, "\n".join(out_lines) + ("\n" if old.endswith("\n") else ""))
 
@@ -534,7 +622,6 @@ class MultiBootloaderFixer:
             for ln in old.splitlines():
                 up = ln.upper()
                 if ("APPEND" in up or "KERNEL" in up) and "console=" not in ln:
-                    # Conservative: append args at end of line
                     ln = ln.rstrip() + " " + self.SERIAL_CONSOLE_ARGS
                     changed = True
                 out_lines.append(ln)
@@ -542,7 +629,10 @@ class MultiBootloaderFixer:
             if changed:
                 fixes["changed"] = True
                 fixes["files"][p] = {"console": "added"}
-                self.logger.info(f"bootloader_fixer: syslinux/extlinux console tweak in {p}" + (" (dry-run)" if self.dry_run else ""))
+                self.logger.info(
+                    f"bootloader_fixer: syslinux/extlinux console tweak in {p}"
+                    + (" (dry-run)" if self.dry_run else "")
+                )
                 if not self.dry_run:
                     self._write_text(g, p, "\n".join(out_lines) + ("\n" if old.endswith("\n") else ""))
 
