@@ -105,9 +105,7 @@ class VHD:
             U.die(logger, f"Unsupported source type (expected .vhd or tarball): {src}", 1)
             raise  # unreachable
 
-    # --------------------------
-    # tar extraction
-    # --------------------------
+
     @staticmethod
     def _extract_vhd_tar(
         logger: logging.Logger,
@@ -176,9 +174,7 @@ class VHD:
 
         return vhds
 
-    # --------------------------
-    # conversion + logging (same pattern as OVF)
-    # --------------------------
+
     @staticmethod
     def _convert_disks_to_qcow2(
         logger: logging.Logger,
@@ -273,9 +269,7 @@ class VHD:
             logger.warning(f"virt-filesystems failed for {image}: {e}")
             return {"ok": False, "error": str(e), "cmd": cmd}
 
-    # --------------------------
-    # helpers
-    # --------------------------
+
     @staticmethod
     def _looks_like_vhd(p: Path) -> bool:
         s = p.name.lower()

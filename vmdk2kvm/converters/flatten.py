@@ -155,9 +155,7 @@ class Flatten:
         assert last_err is not None
         raise last_err
 
-    # -----------------------------
     # Attempts (NO --target-is-zero)
-    # -----------------------------
 
     @staticmethod
     def _flatten_cmd_attempts(*, src: Path, tmp_dst: Path, fmt: str, in_fmt: Optional[str]) -> list[list[str]]:
@@ -186,9 +184,7 @@ class Flatten:
             ["qemu-img", "convert", "-p", "-f", "raw", "-O", fmt, str(raw_src), str(tmp_dst)],
         ]
 
-    # -----------------------------
     # Fast FLAT path (descriptor->extent byte copy)
-    # -----------------------------
 
     @staticmethod
     def _fast_path_flat(logger: logging.Logger, src: Path, outdir: Path, fmt: str) -> Optional[Path]:
@@ -277,9 +273,6 @@ class Flatten:
         assert last_err is not None
         raise last_err
 
-    # -----------------------------
-    # qemu-img runner (NEVER logs failure early; rc only after exit)
-    # -----------------------------
 
     @staticmethod
     def _run_qemu_img_with_live_progress(
@@ -509,9 +502,7 @@ class Flatten:
                     progress.update(task, advance=len(buf))
 
 
-# -----------------------------
 # Fetch (remote ESXi fetch helper)
-# -----------------------------
 
 class Fetch:
     @staticmethod

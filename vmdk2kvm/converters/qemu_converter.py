@@ -63,9 +63,7 @@ class Convert:
                 f"prealloc={self.preallocation or 'omit'}"
             )
 
-    # -----------------------------
     # Public API
-    # -----------------------------
 
     @staticmethod
     def convert_image_with_progress(
@@ -229,9 +227,7 @@ class Convert:
             logger.debug("stdout:\n" + (cp.stdout or ""))
             logger.debug("stderr:\n" + (cp.stderr or ""))
 
-    # -----------------------------
     # Fallback Policy
-    # -----------------------------
 
     @staticmethod
     def _fallback_plan(
@@ -318,9 +314,6 @@ class Convert:
             preallocation=None,
         )
 
-    # -----------------------------
-    # Process runner with "real" progress
-    # -----------------------------
 
     @staticmethod
     def _run_convert_process(

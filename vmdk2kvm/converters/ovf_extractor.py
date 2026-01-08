@@ -216,9 +216,6 @@ class OVF:
 
         return disks
 
-    # --------------------------
-    # Enhancements: conversion
-    # --------------------------
     @staticmethod
     def _convert_disks_to_qcow2(
         logger: logging.Logger,

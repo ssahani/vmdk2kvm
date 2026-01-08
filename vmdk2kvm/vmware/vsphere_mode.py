@@ -43,10 +43,6 @@ from .vmware_client import REQUESTS_AVAILABLE, VMwareClient
 from .govc_common import GovcRunner, extract_paths_from_datastore_ls_json, normalize_ds_path
 
 
-# --------------------------------------------------------------------------------------
-# Debug helpers
-# --------------------------------------------------------------------------------------
-
 _DEFAULT_HTTP_TIMEOUT = (10, 300)  # (connect, read) seconds
 _DEFAULT_CHUNK_SIZE = 1024 * 1024
 
@@ -302,10 +298,6 @@ class VsphereMode:
             except Exception:
                 pass
         return ok
-
-    # ----------------------------------------------------------------------------------
-    # Download transport selection
-    # ----------------------------------------------------------------------------------
 
     def _transport_preference(self) -> str:
         """

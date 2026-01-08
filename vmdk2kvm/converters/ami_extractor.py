@@ -109,9 +109,7 @@ class AMI:
             extract_nested_tar=extract_nested_tar,
         )
 
-    # --------------------------
     # extraction + discovery
-    # --------------------------
 
     @staticmethod
     def _extract_and_find_disks(

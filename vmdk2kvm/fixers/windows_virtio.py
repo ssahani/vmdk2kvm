@@ -236,9 +236,7 @@ def _guest_write_text(g: guestfs.GuestFS, path: str, content: str, *, dry_run: b
     g.write(path, content.encode("utf-8", errors="ignore"))
 
 
-# ---------------------------
 # VirtIO source materialization (dir OR ISO)
-# ---------------------------
 
 @contextmanager
 def _materialize_virtio_source(self, virtio_path: Path):
@@ -321,9 +319,7 @@ def _materialize_virtio_source(self, virtio_path: Path):
             pass
 
 
-# ---------------------------
 # Windows detection + version
-# ---------------------------
 
 def is_windows(self, g: guestfs.GuestFS) -> bool:
     logger = _safe_logger(self)
@@ -551,9 +547,7 @@ def _choose_driver_plan(self, win_info: Dict[str, Any]) -> WindowsVirtioPlan:
     return plan
 
 
-# ---------------------------
 # Driver discovery + staging
-# ---------------------------
 
 def _is_probably_driver_payload(p: Path) -> bool:
     ext = p.suffix.lower()
@@ -797,9 +791,7 @@ def _discover_virtio_drivers(self, virtio_src: Path, plan: WindowsVirtioPlan) ->
     return drivers
 
 
-# ---------------------------
 # Public: BCD backup + hints (offline-safe)
-# ---------------------------
 
 def windows_bcd_actual_fix(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     logger = _safe_logger(self)
@@ -861,10 +853,7 @@ def windows_bcd_actual_fix(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 
     return {"windows": True, "bcd": "found", "stores": found, "backups": backups, "notes": notes}
 
-
-# ---------------------------
 # Public: VirtIO injection
-# ---------------------------
 
 def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
     logger = _safe_logger(self)
@@ -1256,10 +1245,6 @@ def inject_virtio_drivers(self, g: guestfs.GuestFS) -> Dict[str, Any]:
 
     return result
 
-
-# ---------------------------
-# Optional wrapper (if your framework instantiates a class)
-# ---------------------------
 
 class WindowsFixer:
     def is_windows(self, g: guestfs.GuestFS) -> bool:

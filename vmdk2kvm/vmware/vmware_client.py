@@ -221,10 +221,6 @@ class GovmomiCLI(GovcRunner):
                 out.append(pp)
         return out
 
-    # -------------------------
-    # datastore download
-    # -------------------------
-
     def datastore_download(self, datastore: str, ds_path: str, local_path: Path) -> None:
         """
         Download a single datastore file via:
@@ -494,10 +490,6 @@ class VMwareClient:
                 self.logger.error("Exception in context: %s: %s", getattr(exc_type, "__name__", exc_type), exc_val)
         return False
 
-    # ---------------------------
-    # Connect / Disconnect
-    # ---------------------------
-
     def _require_pyvmomi(self) -> None:
         if not PYVMOMI_AVAILABLE:
             raise VMwareError("pyvmomi not installed. Install: pip install pyvmomi")
@@ -566,10 +558,6 @@ class VMwareClient:
             self._vm_name_cache = None
             self._vm_obj_by_name_cache = {}
 
-    # ---------------------------
-    # Inventory helpers
-    # ---------------------------
-
     def _content(self) -> Any:
         if not self.si:
             raise VMwareError("Not connected")
@@ -577,10 +565,6 @@ class VMwareClient:
             return self.si.RetrieveContent()
         except Exception as e:
             raise VMwareError(f"Failed to retrieve content: {e}")
-
-    # ---------------------------------------------------------------------
-    # Datacenter helpers
-    # ---------------------------------------------------------------------
 
     def _refresh_datacenter_cache(self) -> None:
         self._require_pyvmomi()
@@ -679,10 +663,6 @@ class VMwareClient:
             f"Available datacenters: {dcs}"
         )
 
-    # ---------------------------------------------------------------------
-    # Host helpers (FIXES compute path for libvirt ESX)
-    # ---------------------------------------------------------------------
-
     def _refresh_host_cache(self) -> None:
         self._require_pyvmomi()
         content = self._content()
@@ -701,10 +681,6 @@ class VMwareClient:
         if refresh or self._host_name_cache is None:
             self._refresh_host_cache()
         return list(self._host_name_cache or [])
-
-    # ---------------------------------------------------------------------
-    # VM lookup (cached optional)
-    # ---------------------------------------------------------------------
 
     def get_vm_by_name(self, name: str) -> Any:
         self._require_pyvmomi()
@@ -976,9 +952,6 @@ class VMwareClient:
             except Exception:
                 pass
 
-    # ---------------------------
-    # Tasks / disks / snapshots
-    # ---------------------------
 
     def wait_for_task(self, task: Any) -> None:
         self._require_pyvmomi()
@@ -1075,9 +1048,6 @@ class VMwareClient:
             changeId=change_id,
         )
 
-    # ---------------------------
-    # Datastore filename parsing
-    # ---------------------------
 
     @staticmethod
     def parse_backing_filename(file_name: str) -> Tuple[str, str]:
@@ -1101,9 +1071,7 @@ class VMwareClient:
         base = rel.rsplit("/", 1)[1] if "/" in rel else rel
         return ds, folder, base
 
-    # ---------------------------
     # Session cookie (for HTTPS /folder downloads)
-    # ---------------------------
 
     def _session_cookie(self) -> str:
         if not self.si:
@@ -1114,9 +1082,7 @@ class VMwareClient:
             raise VMwareError("Could not obtain session cookie")
         return str(cookie)
 
-    # ---------------------------
     # HTTP datastore download (requests) + ✅ prefer govc if present
-    # ---------------------------
 
     def download_datastore_file(
         self,
@@ -1199,9 +1165,7 @@ class VMwareClient:
                     except Exception:
                         pass
 
-    # =========================================================================
     # download-only mode (NO guest inspection) — SYNC, no concurrency
-    # =========================================================================
 
     def _get_vm_datastore_browser(self, vm_obj: Any) -> Any:
         """
@@ -1378,9 +1342,7 @@ class VMwareClient:
         self.logger.info("Download-only completed: %s", out_dir)
         return out_dir
 
-    # =========================================================================
     # govc-only directory download (NO pyvmomi listing)
-    # =========================================================================
 
     def govc_download_datastore_dir(
         self,
@@ -1429,9 +1391,7 @@ class VMwareClient:
         data["status"] = "success"
         return data
 
-    # =========================================================================
     # vddk_download mode (single disk direct pull via VDDK client) — SYNC
-    # =========================================================================
 
     def _require_vddk_client(self) -> None:
         if not VDDK_CLIENT_AVAILABLE:
@@ -1555,9 +1515,7 @@ class VMwareClient:
         finally:
             c.disconnect()
 
-    # =========================================================================
     # VDDK libdir validation / auto-resolution
-    # =========================================================================
 
     @staticmethod
     def _is_probably_vddk_libdir(p: Path) -> bool:
@@ -1643,9 +1601,6 @@ class VMwareClient:
                 return found
         return None
 
-    # =========================================================================
-    # virt-v2v integration (FIXED compute path + FAST by default) — SYNC
-    # =========================================================================
 
     @staticmethod
     def _normalize_thumbprint(tp: str) -> str:
@@ -1759,9 +1714,6 @@ class VMwareClient:
         argv += list(opt.extra_args)
         return argv
 
-    # ---------------------------------------------------------------------
-    # ✅ Rich progress subprocess runner (no threads, no asyncio)
-    # ---------------------------------------------------------------------
 
     def _run_logged_subprocess(self, argv: Sequence[str], *, env: Optional[Dict[str, str]] = None) -> int:
         # NOTE: never print secrets; argv should not contain passwords (we use -ip file)

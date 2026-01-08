@@ -13,10 +13,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .vmware_client import V2VExportOptions, VMwareClient, VMwareError
 
-# ---------------------------------------------------------------------------
-# ADDITIONS: stderr tail capture + verbose export (NO REMOVALS ABOVE)
-# ---------------------------------------------------------------------------
-
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -204,11 +200,6 @@ async def async_v2v_export_vm_verbose(self: VMwareClient, opt: V2VExportOptions)
 # Monkey-patch add-only (keeps your existing API intact)
 VMwareClient.async_v2v_export_vm_verbose = async_v2v_export_vm_verbose  # type: ignore[attr-defined]
 
-# ---------------------------------------------------------------------------
-# ADDITIONS: chunk-based subprocess pumping (fixes asyncio LimitOverrunError)
-# - Do NOT remove existing code; we override by monkey-patching at the end.
-# ---------------------------------------------------------------------------
-
 
 async def _pump_stream_chunked(
     stream: Optional[asyncio.StreamReader],
@@ -315,12 +306,6 @@ async def _run_logged_subprocess_with_tails_chunked(
 
     rc = int(await proc.wait())
     return rc, out_tail.text(), err_tail.text()
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch: upgrade existing methods to safe chunked versions
-# - No call sites need to change.
-# ---------------------------------------------------------------------------
 
 
 async def _vmwareclient__run_logged_subprocess_safe(

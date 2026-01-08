@@ -72,7 +72,6 @@ class Config:
         # Normalize keys deeply: dash -> underscore
         out = Config._normalize_keys(logger, data, path=str(p))
 
-        # ✅ NEW: alias canonicalization (keeps YAML 'command' usable everywhere)
         out = Config._canonicalize_aliases(out)
 
         logger.debug(f"Loaded config {p}:\n{U.json_dump(out)}")
@@ -191,7 +190,6 @@ class Config:
                 conf = Config.merge_dicts(conf, Config.load_one(logger, p), list_mode=list_mode)
                 progress.update(task, advance=1)
 
-        # ✅ NEW: canonicalize aliases on final merged view too (covers edge cases)
         conf = Config._canonicalize_aliases(conf)
 
         return conf
@@ -328,14 +326,9 @@ class Config:
 
                 progress.update(task, advance=1)
 
-        # ✅ NEW: canonicalize aliases across each vm config too
         vm_confs = [Config._canonicalize_aliases(c) for c in vm_confs]
 
         return vm_confs
-
-    # -----------------------------
-    # Internals
-    # -----------------------------
 
     @staticmethod
     def _canonicalize_aliases(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -473,9 +466,6 @@ class Config:
 
         return coerce_one(raw_val)
 
-    # -----------------------------
-    # Added: friendly missing-config handling
-    # -----------------------------
 
     @staticmethod
     def _precheck_missing_paths(logger: logging.Logger, paths: List[str]) -> None:
