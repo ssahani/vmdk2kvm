@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Sequence
@@ -15,6 +16,9 @@ from ..core.utils import U
 
 BootMode = Literal["bios", "uefi"]
 DisplayMode = Literal["none", "gtk", "sdl", "vnc"]
+
+GuestOS = Literal["linux", "windows"]
+WinStage = Literal["bootstrap", "final"]  # bootstrap=sata (safe), final=virtio (fast)
 
 
 @dataclass(frozen=True)
@@ -50,16 +54,41 @@ class QemuMachine:
     cpu: str = "host"
 
 
+@dataclass(frozen=True)
+class GuestProfile:
+    """
+    Guest OS profile.
+
+    Windows needs two-stage boot sometimes:
+      - bootstrap: disk SATA (boots even without virtio storage driver)
+      - final:     disk VirtIO (performance, requires virtio drivers)
+
+    Optional: attach virtio-win ISO during bootstrap.
+    """
+    os: GuestOS = "linux"
+    win_stage: WinStage = "final"
+    driver_iso: Optional[Path] = None
+
+    # Windows niceties
+    localtime_clock: bool = True
+    hyperv: bool = True
+
+
 class QemuTest:
     """
     QEMU smoke test runner.
 
-    What “improve” means here:
-      - robust qcow2/raw detection (don't hardcode format=qcow2)
-      - UEFI done correctly (OVMF_CODE + OVMF_VARS via -drive if=pflash)
-      - safe headless default (works over SSH with no XDG_RUNTIME_DIR drama)
-      - adds virtio devices + user networking
-      - prints a useful VNC hint if you enable VNC
+    Enhancements:
+      - richer logging (choices + resolved paths + final cmd)
+      - more defensive accel fallback and cleanup
+      - Windows support via GuestProfile:
+          * bootstrap (SATA disk) + optional virtio-win ISO
+          * final (VirtIO disk)
+      - Windows-friendly defaults:
+          * localtime clock (optional)
+          * Hyper-V enlightenments (optional)
+          * video defaults for early Windows boot (vga) when GUI enabled
+      - ensures temp OVMF VARS + tmp ISO copies are cleaned when possible
       - optional timeout so it can “smoke” and then stop
     """
 
@@ -94,92 +123,174 @@ class QemuTest:
         machine: Optional[QemuMachine] = None,
         timeout_s: Optional[int] = 20,
         extra_args: Optional[Sequence[str]] = None,
+
+        # ✅ Windows support (default remains Linux)
+        guest_os: GuestOS = "linux",
+        windows_stage: WinStage = "final",
+        windows_driver_iso: Optional[Path] = None,  # virtio-win.iso (bootstrap)
+        windows_hyperv: bool = True,
+        windows_localtime_clock: bool = True,
     ) -> None:
-        if U.which("qemu-system-x86_64") is None:
-            U.die(logger, "qemu-system-x86_64 not found.", 1)
+        qemu_bin = U.which("qemu-system-x86_64")
+        if qemu_bin is None:
+            U.die(logger, "💥 qemu-system-x86_64 not found.", 1)
 
         disk = Path(disk)
         if not disk.exists():
-            U.die(logger, f"Disk not found: {disk}", 1)
+            U.die(logger, f"💥 Disk not found: {disk}", 1)
 
         display = display or QemuDisplay(mode="none")
         net = net or QemuNet(enabled=True, ssh_forward_host_port=2222)
         machine = machine or QemuMachine(machine="q35", accel="kvm", cpu="host")
         extra_args = list(extra_args or [])
 
+        prof = GuestProfile(
+            os=guest_os,
+            win_stage=windows_stage,
+            driver_iso=Path(windows_driver_iso) if windows_driver_iso else None,
+            localtime_clock=windows_localtime_clock,
+            hyperv=windows_hyperv,
+        )
+
         # accel fallback: if /dev/kvm missing, auto-switch to tcg (slow but works)
         if machine.accel == "kvm" and not os.path.exists("/dev/kvm"):
-            logger.warning("/dev/kvm missing; falling back to TCG (no KVM acceleration).")
+            logger.warning("⚠️  /dev/kvm missing; falling back to TCG (no KVM acceleration).")
             machine = QemuMachine(machine=machine.machine, accel="tcg", cpu="max")
 
         img_fmt = QemuTest._detect_img_format(logger, disk)
 
-        cmd = [
-            "qemu-system-x86_64",
-            "-machine", f"{machine.machine},accel={machine.accel}",
-            "-m", str(int(memory_mib)),
-            "-smp", str(int(vcpus)),
-            "-cpu", machine.cpu,
-            # Use virtio-blk for speed/compat; add discard + cache defaults
-            "-drive", f"file={disk},if=virtio,format={img_fmt},cache=none,discard=unmap",
+        # Track temp files so we can clean them.
+        tmp_ovmf_vars: Optional[str] = None
+
+        # Disk bus selection:
+        # - Linux: virtio
+        # - Windows bootstrap: SATA (safe)
+        # - Windows final: virtio
+        disk_if = QemuTest._disk_if_for_profile(prof)
+
+        # Video defaults:
+        # If GUI is enabled for Windows bootstrap, VGA tends to be the least-surprising.
+        # We only add a video device explicitly when display != none, otherwise headless.
+        video_args = QemuTest._video_args_for_profile(prof, display)
+
+        cmd: list[str] = [
+            str(qemu_bin),
+            "-machine",
+            f"{machine.machine},accel={machine.accel}",
+            "-m",
+            str(int(memory_mib)),
+            "-smp",
+            str(int(vcpus)),
+            "-cpu",
+            machine.cpu,
+
+            # Disk
+            "-drive",
+            f"file={disk},if={disk_if},format={img_fmt},cache=none,discard=unmap",
+
             # Nice-to-have: show early boot logs on serial (and don't hang on graphics)
-            "-serial", "mon:stdio",
+            "-serial",
+            "mon:stdio",
         ]
 
         # Display handling
         cmd += QemuTest._display_args(display)
 
+        # Optional video args (primarily for Windows GUI sanity)
+        cmd += video_args
+
         # Networking (user-mode by default)
         if net.enabled:
             cmd += QemuTest._net_args(net)
 
+        # Windows niceties: clock + Hyper-V enlightenments
+        if prof.os == "windows":
+            if prof.localtime_clock:
+                cmd += ["-rtc", "base=localtime,clock=host"]
+            else:
+                cmd += ["-rtc", "base=utc,clock=host"]
+
+            if prof.hyperv:
+                # Keep conservative: avoid forcing vendor_id unless you need it.
+                # This helps performance and reduces odd guest timing issues.
+                cmd += ["-cpu", "host,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff"]
+
         # UEFI handling (correct way: pflash CODE + writable VARS)
         if uefi:
             ovmf_code, ovmf_vars = QemuTest._resolve_ovmf(logger)
-            # writable vars copy per-run (keeps tests isolated)
-            vars_copy = QemuTest._copy_ovmf_vars(logger, ovmf_vars)
+            tmp_ovmf_vars = QemuTest._copy_ovmf_vars(logger, ovmf_vars)
             cmd += [
-                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
-                "-drive", f"if=pflash,format=raw,file={vars_copy}",
+                "-drive",
+                f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+                "-drive",
+                f"if=pflash,format=raw,file={tmp_ovmf_vars}",
             ]
+
+        # Optional: attach virtio driver ISO for Windows bootstrap
+        if prof.os == "windows" and prof.driver_iso is not None:
+            cmd += QemuTest._cdrom_iso_args(logger, prof.driver_iso)
 
         # Extra args last so caller can override
         cmd += list(extra_args)
 
-        # “Smoke” semantics: run briefly then stop (so CI / automation doesn't hang forever)
-        # Use timeout if provided; otherwise run interactively until user exits QEMU.
-        U.banner(logger, "QEMU smoke test")
-        logger.info(f"Disk: {disk} (format={img_fmt})")
-        logger.info(f"Firmware: {'UEFI' if uefi else 'BIOS'} | Display: {display.mode} | Net: {'on' if net.enabled else 'off'}")
+        # ----------------------------
+        # Logging
+        # ----------------------------
+        U.banner(logger, "🧪 QEMU smoke test")
+        logger.info("🧾 QEMU: %s", qemu_bin)
+        logger.info("💽 Disk: %s (format=%s, if=%s)", disk, img_fmt, disk_if)
+        logger.info("🧠 CPU: %s | vCPUs=%s | RAM=%s MiB | accel=%s", machine.cpu, vcpus, memory_mib, machine.accel)
+        logger.info("🖥️  Display: %s | Net: %s", display.mode, "on" if net.enabled else "off")
+        logger.info("🧬 Firmware: %s", "UEFI" if uefi else "BIOS")
+
+        if prof.os == "windows":
+            logger.info("🪟 Guest: windows | stage=%s", prof.win_stage)
+            if prof.driver_iso:
+                logger.info("📀 virtio driver ISO: %s", prof.driver_iso)
+            logger.info("🕰️  Clock: %s", "localtime" if prof.localtime_clock else "utc")
+            logger.info("🧩 Hyper-V: %s", "on" if prof.hyperv else "off")
+        else:
+            logger.info("🐧 Guest: linux")
 
         if display.mode == "vnc":
             port = 5900 + int(display.vnc_display)
-            logger.info(f"VNC: {display.vnc_listen}:{port} (display :{display.vnc_display})")
+            logger.info("🔗 VNC: %s:%s (display :%s)", display.vnc_listen, port, display.vnc_display)
 
-        logger.debug("QEMU command:\n  " + " ".join(shlex.quote(x) for x in cmd))
+        logger.debug("🧾 QEMU command:\n  %s", " ".join(shlex.quote(x) for x in cmd))
 
-        if timeout_s is None:
-            logger.info("Launching QEMU (no timeout; exit manually)…")
-            U.run_cmd(logger, cmd, check=False, capture=False)
-            return
-
-        logger.info(f"Launching QEMU (smoke run for ~{timeout_s}s)…")
-        p = subprocess.Popen(cmd)
+        # ----------------------------
+        # Execute
+        # ----------------------------
         try:
-            p.wait(timeout=float(timeout_s))
-        except subprocess.TimeoutExpired:
-            logger.info("Smoke timeout reached; terminating QEMU…")
-            p.terminate()
-            try:
-                p.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                logger.warning("QEMU didn't exit on SIGTERM; killing…")
-                p.kill()
-                p.wait(timeout=5.0)
+            if timeout_s is None:
+                logger.info("🚀 Launching QEMU (no timeout; exit manually)…")
+                U.run_cmd(logger, cmd, check=False, capture=False)
+                return
 
-        # No enforced exit code for smoke test, but we log it.
-        rc = p.returncode
-        logger.info(f"QEMU exited with rc={rc} (not enforced).")
+            logger.info("🚀 Launching QEMU (smoke run for ~%ss)…", int(timeout_s))
+            p = subprocess.Popen(cmd)
+            try:
+                p.wait(timeout=float(timeout_s))
+            except subprocess.TimeoutExpired:
+                logger.info("⏱️  Smoke timeout reached; terminating QEMU…")
+                p.terminate()
+                try:
+                    p.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    logger.warning("⚠️  QEMU didn't exit on SIGTERM; killing…")
+                    p.kill()
+                    p.wait(timeout=5.0)
+
+            rc = p.returncode
+            logger.info("🏁 QEMU exited with rc=%s (not enforced).", rc)
+        finally:
+            # Cleanup temp OVMF vars copy.
+            if tmp_ovmf_vars:
+                try:
+                    U.safe_unlink(Path(tmp_ovmf_vars))
+                    logger.debug("🧽 Removed temp OVMF VARS: %s", tmp_ovmf_vars)
+                except Exception as e:
+                    logger.debug("Could not remove temp OVMF VARS %s: %s", tmp_ovmf_vars, e)
 
     # ----------------------------
     # Helpers
@@ -189,6 +300,7 @@ class QemuTest:
     def _detect_img_format(logger: logging.Logger, disk: Path) -> str:
         suf = disk.suffix.lower().lstrip(".")
         if suf in ("qcow2", "raw", "vmdk", "vdi"):
+            logger.debug("🧾 Image format from suffix: %s", suf)
             return suf
 
         if U.which("qemu-img"):
@@ -204,11 +316,12 @@ class QemuTest:
                     if c != -1 and q1 != -1 and q2 != -1:
                         fmt = seg[q1 + 1 : q2].strip().lower()
                         if fmt:
+                            logger.debug("🧾 Image format from qemu-img: %s", fmt)
                             return fmt
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("qemu-img info failed: %s", e)
 
-        logger.warning("Could not confidently detect image format; defaulting to qcow2.")
+        logger.warning("⚠️  Could not confidently detect image format; defaulting to qcow2.")
         return "qcow2"
 
     @staticmethod
@@ -230,20 +343,28 @@ class QemuTest:
         if n.ssh_forward_host_port is not None:
             hp = int(n.ssh_forward_host_port)
             return [
-                "-netdev", f"user,id=n0,hostfwd=tcp::{hp}-:22",
-                "-device", "virtio-net-pci,netdev=n0",
+                "-netdev",
+                f"user,id=n0,hostfwd=tcp::{hp}-:22",
+                "-device",
+                "virtio-net-pci,netdev=n0",
             ]
         return [
-            "-netdev", "user,id=n0",
-            "-device", "virtio-net-pci,netdev=n0",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0",
         ]
 
     @staticmethod
     def _resolve_ovmf(logger: logging.Logger) -> tuple[str, str]:
         code = next((p for p in QemuTest._OVMF_CODE_CANDIDATES if os.path.exists(p)), None)
         vars_ = next((p for p in QemuTest._OVMF_VARS_CANDIDATES if os.path.exists(p)), None)
+
+        logger.debug("🔎 OVMF probe: CODE=%s", code or "<missing>")
+        logger.debug("🔎 OVMF probe: VARS=%s", vars_ or "<missing>")
+
         if not code or not vars_:
-            U.die(logger, "UEFI requested but OVMF not found (CODE/VARS missing).", 1)
+            U.die(logger, "💥 UEFI requested but OVMF not found (CODE/VARS missing).", 1)
         return code, vars_
 
     @staticmethod
@@ -251,5 +372,49 @@ class QemuTest:
         # Put it under /tmp; caller doesn't need the path later.
         fd, dst = tempfile.mkstemp(prefix="vmdk2kvm-ovmf-vars-", suffix=".fd")
         os.close(fd)
+        logger.debug("🧬 Copying OVMF VARS: %s -> %s", ovmf_vars, dst)
         U.run_cmd(logger, ["cp", "-f", ovmf_vars, dst], check=True, capture=False)
         return dst
+
+    # ----------------------------
+    # Windows additions
+    # ----------------------------
+
+    @staticmethod
+    def _disk_if_for_profile(prof: GuestProfile) -> str:
+        if prof.os != "windows":
+            return "virtio"
+        # Bootstrap uses SATA (IDE works too, SATA is fine on q35)
+        return "sata" if prof.win_stage == "bootstrap" else "virtio"
+
+    @staticmethod
+    def _video_args_for_profile(prof: GuestProfile, display: QemuDisplay) -> list[str]:
+        # Only bother when GUI/VNC is enabled.
+        if display.mode == "none":
+            return []
+
+        # Linux: keep QEMU defaults (less surprise).
+        if prof.os != "windows":
+            return []
+
+        # Windows bootstrap: VGA is the “works basically everywhere” pick.
+        # Windows final: virtio-vga is nice if drivers exist, but VGA still works.
+        if prof.win_stage == "bootstrap":
+            return ["-vga", "std"]
+
+        # Prefer virtio-vga if available; otherwise std is fine.
+        # (If host QEMU doesn't support virtio-vga, it will error; user can override via extra_args.)
+        return ["-vga", "virtio"]
+
+    @staticmethod
+    def _cdrom_iso_args(logger: logging.Logger, iso: Path) -> list[str]:
+        iso = Path(iso)
+        if not iso.exists():
+            U.die(logger, f"💥 Driver ISO not found: {iso}", 1)
+
+        # Attach as SATA CDROM (broadly compatible).
+        # NOTE: we don't force boot order; Windows can mount it after boot.
+        return [
+            "-drive",
+            f"file={iso},media=cdrom,if=sata,readonly=on",
+        ]
