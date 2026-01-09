@@ -334,17 +334,7 @@ class Config:
     def _canonicalize_aliases(d: Dict[str, Any]) -> Dict[str, Any]:
         """
         Canonicalize common alias keys so YAML can stay stable while code evolves.
-
-        Existing policy:
-          - Keep 'command' canonical for new project readability,
-            but populate 'cmd' for legacy/compat dispatchers.
-          - Keep 'vs_action' canonical but populate 'action' (and vice-versa).
-
-        Added policy (govc / control-plane):
-          - Accept either 'vs_control_plane' or 'control_plane' and mirror to the other.
-          - Accept either govc_* keys or GOVC_* style names (after normalization).
-          - If govc_url not provided, allow vcenter to imply https://<vcenter>/sdk (used later).
-          - If govc_user/password missing, allow falling back to vc_user/vc_password at runtime.
+        
         """
         # command <-> cmd
         if "command" in d and "cmd" not in d:
