@@ -2,11 +2,11 @@
 
 **VMware → KVM/QEMU conversion, repair, and automation toolkit**
 
-`vmdk2kvm` is a production-oriented toolkit for migrating VMware virtual machines  
-(VMDK / OVA / OVF / ESXi / vCenter) into **KVM/QEMU-bootable images**  
+`vmdk2kvm` is a production-oriented toolkit for migrating VMware virtual machines
+(VMDK / OVA / OVF / ESXi / vCenter) into **KVM/QEMU-bootable images**
 **without relying on boot-time luck**.
 
-It exists to solve the problems that appear *after* a “successful” conversion:
+This project exists to solve the problems that show up *after* a “successful” conversion:
 
 * broken boots
 * unstable device naming
@@ -14,33 +14,33 @@ It exists to solve the problems that appear *after* a “successful” conversio
 * corrupted or misleading snapshot chains
 * Windows guests that blue-screen on first KVM boot
 
-This repository is intentionally **not** “click migrate and pray”.  
-It is “convert, repair, validate — and make it repeatable”.
+This repository is intentionally **not** “click migrate and pray”.
+It is **convert, repair, validate — and make it repeatable**.
 
 ---
 
 ## Table of contents
 
-1. Scope and non-goals  
-2. Design principles  
-3. Supported inputs and execution modes  
-4. Pipeline model  
-5. Control-plane vs data-plane (vSphere, govc, VDDK, HTTP, SSH)  
-6. Linux fixes  
-7. Windows handling  
-8. Snapshots and flattening  
-9. Output formats and validation  
-10. YAML configuration model  
-11. Multi-VM and batch processing  
-12. Live-fix mode (SSH)  
-13. ESXi and vSphere integration (govc + APIs)  
-14. virt-v2v integration strategy  
-15. Safety mechanisms  
-16. Daemon mode and automation  
-17. Testing and verification  
-18. Failure modes and troubleshooting  
-19. When not to use this tool  
-20. Documentation index  
+1. Scope and non-goals
+2. Design principles
+3. Supported inputs and execution modes
+4. Pipeline model
+5. Control-plane vs data-plane (vSphere, govc, VDDK, HTTP, SSH)
+6. Linux fixes
+7. Windows handling
+8. Snapshots and flattening
+9. Output formats and validation
+10. YAML configuration model
+11. Multi-VM and batch processing
+12. Live-fix mode (SSH)
+13. ESXi and vSphere integration
+14. virt-v2v integration strategy
+15. Safety mechanisms
+16. Daemon mode and automation
+17. Testing and verification
+18. Failure modes and troubleshooting
+19. When not to use this tool
+20. Documentation index
 
 ---
 
@@ -59,11 +59,11 @@ It is “convert, repair, validate — and make it repeatable”.
 
 ### What this tool **does not**
 
-* Not a GUI wizard
-* Not a cloud importer
-* Not a thin wrapper around `virt-v2v`
-* Not a promise of zero-touch Windows fixes
-* Not a complexity hider
+* No GUI wizard
+* No cloud importer
+* No thin wrapper around `virt-v2v`
+* No promise of zero-touch Windows fixes
+* No attempt to hide complexity
 
 If you want *fast over correct*, this repo will argue with you — politely, and with logs.
 
@@ -71,13 +71,13 @@ If you want *fast over correct*, this repo will argue with you — politely, and
 
 ## 2. Design principles
 
-1. **Boot failures are configuration problems, not copy problems**
-2. **Device naming must survive hypervisor changes**
-3. **Snapshot chains lie unless flattened or verified**
-4. **Windows storage must be BOOT_START before first KVM boot**
-5. **Every destructive step needs a safe mode**
-6. **Configurations must be replayable**
-7. **Control-plane and data-plane must not be mixed**
+1. Boot failures are configuration problems, not copy problems
+2. Device naming must survive hypervisor changes
+3. Snapshot chains lie unless flattened or verified
+4. Windows storage must be **BOOT_START** before first KVM boot
+5. Every destructive step needs a safe mode
+6. Configurations must be replayable
+7. Control-plane and data-plane must never be mixed
 
 These rules are enforced structurally, not by convention.
 
@@ -107,9 +107,10 @@ These rules are enforced structurally, not by convention.
 
 ### API and CLI based (vSphere)
 
-* vCenter / ESXi via:
-  * **govc** (primary CLI control-plane)
-  * pyvmomi / pyVim (API fallback and deep inspection)
+vCenter / ESXi via:
+
+* **govc** (primary CLI control-plane)
+* pyvmomi / pyVim (API fallback and deep inspection)
 
 Used for:
 
@@ -126,21 +127,19 @@ Used for:
 All execution modes map to a **single internal pipeline**:
 
 ```
-
 FETCH → FLATTEN → INSPECT → FIX → CONVERT → VALIDATE
+```
 
-````
-
-Stages are optional.  
+Stages are optional.
 **Order is not.**
 
-| Stage    | Meaning                     |
-|----------|-----------------------------|
+| Stage    | Purpose                     |
+| -------- | --------------------------- |
 | FETCH    | Obtain disks and metadata   |
 | FLATTEN  | Collapse snapshot chains    |
 | INSPECT  | Detect OS, layout, firmware |
 | FIX      | Apply deterministic repairs |
-| CONVERT  | Produce qcow2/raw/etc       |
+| CONVERT  | Produce qcow2 / raw / etc   |
 | VALIDATE | Boot-test and verify        |
 
 The pipeline is explicit, inspectable, and restart-safe.
@@ -153,15 +152,13 @@ This separation is the **spine** of the project.
 
 ```mermaid
 flowchart TB
-  %% GitHub-safe Mermaid
-
   subgraph CP
     CP_TITLE["CONTROL PLANE<br/>(what exists, what to do)"]
-    GOVC["govc<br/>(primary control-plane)"]
-    PYVM["pyvmomi / pyVim<br/>(fallback + deep inspection)"]
+    GOVC["govc"]
+    PYVM["pyvmomi / pyVim"]
     INV["inventory & snapshots"]
-    CBT["CBT planning<br/>(ranges, change IDs)"]
-    DS["datastore inspection<br/>(paths, artifacts)"]
+    CBT["CBT planning"]
+    DS["datastore inspection"]
 
     GOVC --> INV
     GOVC --> CBT
@@ -171,15 +168,15 @@ flowchart TB
     PYVM --> DS
   end
 
-  META["plans, ranges,<br/>metadata"]
+  META["plans & metadata"]
 
   subgraph DP
-    DP_TITLE["DATA PLANE<br/>(move bytes reliably)"]
+    DP_TITLE["DATA PLANE<br/>(move bytes safely)"]
     V2V["virt-v2v"]
-    VDDK["VDDK reads"]
-    HTTP["HTTP /folder<br/>(+ Range GET)"]
+    VDDK["VDDK"]
+    HTTP["HTTP /folder"]
     SSH["SSH / SCP"]
-    RESUME["resume & verify<br/>.part → final"]
+    RESUME["resume & verify"]
   end
 
   CP --> META --> DP
@@ -187,16 +184,16 @@ flowchart TB
   VDDK --> RESUME
   HTTP --> RESUME
   SSH --> RESUME
-````
+```
 
-* Control-plane **never** moves large data
+* Control-plane **never** moves bulk data
 * Data-plane **never** makes inventory decisions
 
 ---
 
 ### 5.1 Control-plane responsibilities (govc-first)
 
-`govc` is treated as a **first-class control-plane tool**, not a convenience wrapper.
+`govc` is treated as a **first-class control-plane**, not a convenience wrapper.
 
 Used for:
 
@@ -210,7 +207,7 @@ Used for:
 Why govc?
 
 * Stable CLI semantics
-* Strong vSphere feature coverage
+* Broad vSphere feature coverage
 * Predictable, JSON-friendly output
 * Easier to reason about than opaque SDK state
 
@@ -224,33 +221,22 @@ Why govc?
 
 ### 5.2 Data-plane transports
 
-Data-plane answers one question only:
+The data-plane answers one question only:
 
 **How do bytes move safely?**
 
 Supported transports:
 
-#### virt-v2v
-
-Guest-aware semantic conversion engine.
-
-#### HTTP `/folder`
-
-Datastore artifact downloads, including ranged reads for CBT.
-
-#### VDDK
-
-High-throughput raw disk access when permitted.
-
-#### SSH / SCP
-
-Fallback transport for locked-down environments.
+* **virt-v2v** — semantic, guest-aware conversion
+* **HTTP `/folder`** — datastore artifact downloads, CBT range reads
+* **VDDK** — high-throughput raw disk access
+* **SSH / SCP** — locked-down environment fallback
 
 ---
 
 ### 5.3 Decision matrix
 
-| Goal                 | Recommended      |
+| Goal                 | Preferred method |
 | -------------------- | ---------------- |
 | Convert and boot VM  | virt-v2v         |
 | Inventory + planning | govc             |
@@ -263,14 +249,14 @@ Fallback transport for locked-down environments.
 
 ### 5.4 Incremental migration (CBT)
 
-CBT usage is explicit and audited.
+CBT usage is explicit and audited:
 
 ```
 CONTROL PLANE:
-  govc → query changed block ranges
+  govc → changed block ranges
         ↓
 DATA PLANE:
-  HTTP Range GETs
+  HTTP Range GET
         ↓
 LOCAL DISK PATCH
 ```
@@ -282,7 +268,7 @@ It does not pretend.
 
 ### 5.5 Resume, integrity, and checkpoints
 
-All data-plane operations support failure recovery:
+All data-plane operations support recovery:
 
 * resumable transfers
 * `.part → final` promotion
@@ -328,13 +314,13 @@ Snapshot flattening is strongly recommended.
 
 ## 9. Output formats and validation
 
-Formats:
+**Formats**
 
 * qcow2 (recommended)
 * raw
 * vdi
 
-Validation:
+**Validation**
 
 * checksums
 * libvirt smoke boots
@@ -362,10 +348,10 @@ YAML is treated as **code**:
 
 * batch processing
 * live-fix mode
-* ESXi + vSphere via govc
-* virt-v2v integration
+* ESXi + vSphere integration
+* virt-v2v coordination
 * safety mechanisms
-* daemon / automation
+* daemon and automation modes
 * testing and failure analysis
 * explicit non-goals
 
@@ -373,11 +359,14 @@ YAML is treated as **code**:
 
 ## 20. Documentation index
 
-All detailed documentation, workflows, examples, and reference material live here:
+All detailed documentation, workflows, examples, and references live here:
 
 👉 **[https://github.com/ssahani/vmdk2kvm/tree/main/docs](https://github.com/ssahani/vmdk2kvm/tree/main/docs)**
 
 ---
 
-*Convert with intent. Repair with evidence. Boot without luck.*
+**Convert with intent. Repair with evidence. Boot without luck.**
 
+---
+
+If you want, the next natural step is a **short “Why this exists” preface** or a **one-page quick-start flow** for people skimming before committing to the deep read.
