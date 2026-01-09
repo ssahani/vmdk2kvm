@@ -80,7 +80,9 @@ _VixDiskLibHandle = ctypes.c_void_p
 _SECTOR_SIZE = 512
 
 
+# -----------------------------------------------------------------------------
 # ctypes structures
+# -----------------------------------------------------------------------------
 
 class _VixDiskLibConnectParams(ctypes.Structure):
     """
@@ -167,7 +169,6 @@ def _peek_tls_cert_sha1(host: str, port: int, timeout: float) -> Tuple[Optional[
                 info = ssock.getpeercert() or {}
         sha1 = hashlib.sha1(der).hexdigest()
         tp = ":".join(sha1[i:i + 2] for i in range(0, 40, 2))
-        # subject can be nested tuples; stringify safely
         subj = str(info.get("subject", "")) if info else ""
         return tp, subj
     except Exception:
@@ -244,13 +245,9 @@ def _fmt_eta(seconds: float) -> str:
     return f"{h}h{m:02d}m{s:02d}s"
 
 
-def _redact(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return "***"
-
-
+# -----------------------------------------------------------------------------
 # Dynamic loading & symbol binding
+# -----------------------------------------------------------------------------
 
 def _candidate_lib_names() -> Tuple[str, ...]:
     return (
@@ -289,7 +286,6 @@ def _load_vddk_cdll(
                 except Exception as e:
                     last = e
 
-    # Fallback to loader path
     for n in _candidate_lib_names():
         try:
             return ctypes.CDLL(n, mode=ctypes.RTLD_GLOBAL)
@@ -423,7 +419,9 @@ def _is_likely_transient_error(msg: str) -> bool:
     return True
 
 
+# -----------------------------------------------------------------------------
 # VDDK logging callbacks (critical for diagnosing ConnectEx)
+# -----------------------------------------------------------------------------
 
 _VDDK_LOG_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
 
@@ -443,7 +441,6 @@ def _mk_vddk_log_cb(logger: logging.Logger, level: str) -> _VDDK_LOG_CB:
         if not s:
             return
 
-        # Keep the prefix tight; VDDK is chatty.
         if level == "debug":
             logger.debug("VDDK: %s", s)
         elif level == "warning":
@@ -498,8 +495,9 @@ def vddk_init_once(logger: logging.Logger, lib: ctypes.CDLL, *, vddk_libdir: Opt
         logger.debug("VDDK: InitEx OK (api=%d.%d)", _VIXDISKLIB_API_VERSION_MAJOR, _VIXDISKLIB_API_VERSION_MINOR)
 
 
-
+# -----------------------------------------------------------------------------
 # Public API
+# -----------------------------------------------------------------------------
 
 ProgressFn = Callable[[int, int, float], None]
 CancelFn = Callable[[], bool]
@@ -547,7 +545,6 @@ class VDDKESXClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.disconnect()
 
-    
     # Setup / Connect
 
     def _ensure_loaded(self) -> None:
@@ -580,8 +577,10 @@ class VDDKESXClient:
         if not s.debug_preflight:
             return
 
-        self.logger.debug("VDDK: preflight host=%r port=%d user=%r insecure=%s transports=%r",
-                          s.host, s.port, s.user, s.insecure, s.transport_modes)
+        self.logger.debug(
+            "VDDK: preflight host=%r port=%d user=%r insecure=%s transports=%r",
+            s.host, s.port, s.user, s.insecure, s.transport_modes
+        )
 
         ok_res, res = _resolve_host(s.host)
         if ok_res:
@@ -601,7 +600,6 @@ class VDDKESXClient:
         else:
             self.logger.debug("VDDK: TLS peer cert fetch failed (may still work if network blocks TLS inspect)")
 
-        # If user provided thumbprint, show normalized vs raw (without changing behavior)
         if s.thumbprint:
             try:
                 self.logger.debug("VDDK: thumbprint raw=%r normalized=%r", s.thumbprint, normalize_thumbprint(s.thumbprint))
@@ -633,7 +631,6 @@ class VDDKESXClient:
         if (not tp) and (not s.insecure):
             raise VDDKError("Thumbprint is required unless insecure=True")
 
-        # Dump sanitized connect params
         self.logger.debug(
             "VDDK: ConnectEx params: serverName=%r port=%d user=%r pass=%s thumbprint=%r transport=%r insecure=%s",
             s.host,
@@ -667,7 +664,6 @@ class VDDKESXClient:
 
         if rc != 0:
             msg = _err_text(self._lib, rc)
-            # With callbacks enabled, VDDK will often log additional detail already.
             self.logger.error(
                 "VDDK: ConnectEx FAILED rc=%d dt=%.3fs msg=%s (host=%s port=%d transport=%s insecure=%s user=%s thumbprint=%s)",
                 int(rc), dt, msg, s.host, int(s.port), transport, bool(s.insecure), s.user, "set" if tp else "none"
@@ -689,9 +685,8 @@ class VDDKESXClient:
         finally:
             self._conn = _VixDiskLibConnection()
 
- 
     # Disk ops
- 
+
     def _require_connected(self) -> None:
         if self._lib is None:
             raise VDDKError("VDDK library not loaded")
@@ -741,8 +736,7 @@ class VDDKESXClient:
 
         try:
             cap = int(info_p.contents.capacity)
-            self.logger.debug("VDDK: GetInfo OK capacity_sectors=%d (%.2f GiB)",
-                              cap, (cap * _SECTOR_SIZE) / (1024**3))
+            self.logger.debug("VDDK: GetInfo OK capacity_sectors=%d (%.2f GiB)", cap, (cap * _SECTOR_SIZE) / (1024**3))
             return cap
         finally:
             try:
@@ -846,10 +840,12 @@ class VDDKESXClient:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = local_path.with_suffix(local_path.suffix + ".part")
 
-        h = self._open_ro(remote_vmdk)
+        h: Optional[_VixDiskLibHandle] = None
         sha256 = hashlib.sha256() if compute_sha256 else None
 
         try:
+            h = self._open_ro(remote_vmdk)
+
             cap_sectors = self._capacity_sectors(h)
             total_bytes = cap_sectors * _SECTOR_SIZE
             if cap_sectors <= 0:
@@ -929,10 +925,10 @@ class VDDKESXClient:
                         cancel=cancel,
                     )
 
-                    chunk = bytes(buf[:chunk_bytes])
-                    f.write(chunk)
+                    mv = memoryview(buf)[:chunk_bytes]
+                    f.write(mv)
                     if sha256 is not None:
-                        sha256.update(chunk)
+                        sha256.update(mv)
 
                     sector += int(n)
                     done += chunk_bytes
@@ -1013,4 +1009,5 @@ class VDDKESXClient:
             self.logger.warning("VDDK: download cancelled; partial kept at %s", tmp)
             raise
         finally:
-            self._close(h)
+            if h:
+                self._close(h)
