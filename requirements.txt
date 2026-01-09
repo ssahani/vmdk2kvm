@@ -4,3 +4,5 @@ watchdog
 PyYAML
 requests
 pyvmomi
+libguestfs
+hivex
