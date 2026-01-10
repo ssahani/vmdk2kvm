@@ -17,26 +17,6 @@ Runtime requirements:
   - VDDK dependencies available to dynamic loader (often via LD_LIBRARY_PATH)
   - Network access to ESXi on 443 and VDDK transport ports (NBD/NBDSSL) as needed
 
-Key features:
-  ✅ ctypes wrapper around libvixDiskLib.so (no external python deps)
-  ✅ global InitEx once + process-safe lock
-  ✅ ConnectEx/Open/Read/Close/Disconnect lifecycle
-  ✅ capacity discovery via GetInfo
-  ✅ VDDK internal log/warn/panic callbacks (huge for diagnosing ConnectEx failures)
-  ✅ extra preflight debug logs for connection diagnosis:
-        - DNS resolution + TCP connect to 443 (and optional NBD ports if provided)
-        - TLS peer cert fetch + SHA1 thumbprint print (even if insecure)
-        - dump of sanitized connect params (host, port, user, thumbprint, transports)
-        - ldd "not found" hints (optional, no subprocess)
-  ✅ robust error text extraction via VixDiskLib_GetErrorText
-  ✅ optional SHA1 thumbprint generation (TLS) using Python ssl socket
-  ✅ atomic output: .part -> rename (with optional fsync durability)
-  ✅ resume support: continue from existing .part
-  ✅ retry/backoff on transient read failures
-  ✅ progress callback + throttled progress logs + ETA
-  ✅ cancellation hook + clean stop preserving .part
-  ✅ context manager support (with connect/disconnect)
-
 Caveats:
   - VDDK API is C; symbol availability can vary by VDDK version.
   - This module binds only the minimal symbols it uses.
@@ -50,6 +30,7 @@ import hashlib
 import logging
 import os
 import random
+import signal
 import socket
 import ssl
 import threading
@@ -67,7 +48,7 @@ class VDDKCancelled(VDDKError):
     """Raised when a caller cancels an in-progress download."""
 
 
-_VIXDISKLIB_API_VERSION_MAJOR = 7
+_VIXDISKLIB_API_VERSION_MAJOR = 9
 _VIXDISKLIB_API_VERSION_MINOR = 0
 
 # Open flags (stable)
@@ -79,10 +60,14 @@ _VixDiskLibHandle = ctypes.c_void_p
 
 _SECTOR_SIZE = 512
 
+# Global list to keep callback references alive
+_VDDK_CALLBACK_REFS: list[object] = []
+
 
 # -----------------------------------------------------------------------------
 # ctypes structures
 # -----------------------------------------------------------------------------
+
 
 class _VixDiskLibConnectParams(ctypes.Structure):
     """
@@ -97,6 +82,7 @@ class _VixDiskLibConnectParams(ctypes.Structure):
       - userName/password
       - port
     """
+
     _fields_ = [
         ("vmxSpec", ctypes.c_char_p),
         ("serverName", ctypes.c_char_p),
@@ -113,11 +99,12 @@ class _VixDiskLibInfo(ctypes.Structure):
 
     We only rely on 'capacity' (in sectors), but keep the early fields correct.
     """
+
     _fields_ = [
         ("magic", ctypes.c_uint32),
         ("version", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
-        ("capacity", ctypes.c_uint64),   # sectors
+        ("capacity", ctypes.c_uint64),  # sectors
         # More fields exist (geometry, adapterType, etc.) but we stop here.
     ]
 
@@ -137,13 +124,11 @@ def normalize_thumbprint(tp: str) -> str:
     raw = (tp or "").strip().replace(" ", "").replace(":", "").lower()
     if len(raw) != 40 or any(c not in "0123456789abcdef" for c in raw):
         raise VDDKError(f"Invalid thumbprint (expected SHA1 40 hex chars): {tp!r}")
-    return ":".join(raw[i:i + 2] for i in range(0, 40, 2))
+    return ":".join(raw[i : i + 2] for i in range(0, 40, 2))
 
 
 def compute_server_thumbprint_sha1(host: str, port: int = 443, timeout: float = 10.0) -> str:
-    """
-    Fetch the server certificate (DER) and return SHA1 thumbprint (colon-separated).
-    """
+    """Fetch the server certificate (DER) and return SHA1 thumbprint (colon-separated)."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -151,7 +136,7 @@ def compute_server_thumbprint_sha1(host: str, port: int = 443, timeout: float = 
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
             der = ssock.getpeercert(binary_form=True)
     sha1 = hashlib.sha1(der).hexdigest()
-    return ":".join(sha1[i:i + 2] for i in range(0, 40, 2))
+    return ":".join(sha1[i : i + 2] for i in range(0, 40, 2))
 
 
 def _peek_tls_cert_sha1(host: str, port: int, timeout: float) -> Tuple[Optional[str], Optional[str]]:
@@ -167,8 +152,9 @@ def _peek_tls_cert_sha1(host: str, port: int, timeout: float) -> Tuple[Optional[
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
                 der = ssock.getpeercert(binary_form=True)
                 info = ssock.getpeercert() or {}
+
         sha1 = hashlib.sha1(der).hexdigest()
-        tp = ":".join(sha1[i:i + 2] for i in range(0, 40, 2))
+        tp = ":".join(sha1[i : i + 2] for i in range(0, 40, 2))
         subj = str(info.get("subject", "")) if info else ""
         return tp, subj
     except Exception:
@@ -176,9 +162,7 @@ def _peek_tls_cert_sha1(host: str, port: int, timeout: float) -> Tuple[Optional[
 
 
 def _tcp_probe(host: str, port: int, timeout: float) -> Tuple[bool, str]:
-    """
-    Best-effort TCP connect probe. Returns (ok, detail).
-    """
+    """Best-effort TCP connect probe. Returns (ok, detail)."""
     try:
         t0 = time.time()
         with socket.create_connection((host, port), timeout=timeout):
@@ -189,9 +173,7 @@ def _tcp_probe(host: str, port: int, timeout: float) -> Tuple[bool, str]:
 
 
 def _resolve_host(host: str) -> Tuple[bool, str]:
-    """
-    Best-effort DNS resolution. Returns (ok, detail string).
-    """
+    """Best-effort DNS resolution. Returns (ok, detail string)."""
     try:
         infos = socket.getaddrinfo(host, None)
         addrs = sorted({i[4][0] for i in infos})
@@ -249,9 +231,11 @@ def _fmt_eta(seconds: float) -> str:
 # Dynamic loading & symbol binding
 # -----------------------------------------------------------------------------
 
+
 def _candidate_lib_names() -> Tuple[str, ...]:
     return (
         "libvixDiskLib.so",
+        "libvixDiskLib.so.9",
         "libvixDiskLib.so.7",
         "libvixDiskLib.so.6",
         "libvixDiskLib.so.5",
@@ -276,7 +260,7 @@ def _load_vddk_cdll(
         p = Path(vddk_libdir).expanduser().resolve()
 
         if mutate_env:
-            os.environ["LD_LIBRARY_PATH"] = f"{str(p)}:{os.environ.get('LD_LIBRARY_PATH', '')}".rstrip(":")
+            os.environ["LD_LIBRARY_PATH"] = f"{p}:{os.environ.get('LD_LIBRARY_PATH', '')}".rstrip(":")
 
         for n in _candidate_lib_names():
             cand = p / n
@@ -420,35 +404,62 @@ def _is_likely_transient_error(msg: str) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# VDDK logging callbacks (critical for diagnosing ConnectEx)
+# VDDK logging callbacks
 # -----------------------------------------------------------------------------
+#
+# NOTE: This keeps your current (working) behavior: InitEx is attempted without
+# callbacks first, then API 7.0, then dummy callbacks.
+#
 
-_VDDK_LOG_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
+_VDDK_LOG_CB_SIMPLE = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
+_VDDK_LOG_CB_VARARGS = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
-# Keep global refs so callbacks aren't GC'd (VDDK will call them from C)
-_g_vddk_log_cb: Optional[_VDDK_LOG_CB] = None
-_g_vddk_warn_cb: Optional[_VDDK_LOG_CB] = None
-_g_vddk_panic_cb: Optional[_VDDK_LOG_CB] = None
+_g_vddk_log_cb: Optional[_VDDK_LOG_CB_SIMPLE] = None
+_g_vddk_warn_cb: Optional[_VDDK_LOG_CB_SIMPLE] = None
+_g_vddk_panic_cb: Optional[_VDDK_LOG_CB_SIMPLE] = None
 
 
-def _mk_vddk_log_cb(logger: logging.Logger, level: str) -> _VDDK_LOG_CB:
+def _mk_vddk_log_cb_simple(logger: logging.Logger, level: str) -> _VDDK_LOG_CB_SIMPLE:
+    """Simple callback that attempts to decode a char* message safely."""
+
     def _cb(msg_p: ctypes.c_char_p) -> None:
         try:
-            raw = ctypes.cast(msg_p, ctypes.c_char_p).value
-            s = raw.decode("utf-8", "replace").rstrip() if raw else ""
-        except Exception:
-            s = "<unparseable vddk log>"
-        if not s:
-            return
+            if msg_p:
+                msg_bytes = msg_p.value
+                if msg_bytes:
+                    msg = msg_bytes.decode("utf-8", "replace").rstrip()
+                else:
+                    msg = "<empty message>"
+            else:
+                msg = "<NULL pointer>"
 
-        if level == "debug":
-            logger.debug("VDDK: %s", s)
-        elif level == "warning":
-            logger.warning("VDDK: %s", s)
-        else:
-            logger.error("VDDK: %s", s)
+            if level == "debug":
+                logger.debug("VDDK: %s", msg)
+            elif level == "warning":
+                logger.warning("VDDK: %s", msg)
+            else:
+                logger.error("VDDK: %s", msg)
+        except Exception as e:
+            # Never raise from a C callback.
+            try:
+                logger.error("VDDK callback error: %s", e)
+            except Exception:
+                pass
 
-    return _VDDK_LOG_CB(_cb)
+    cb = _VDDK_LOG_CB_SIMPLE(_cb)
+    _VDDK_CALLBACK_REFS.append(cb)
+    return cb
+
+
+def _mk_dummy_callback() -> _VDDK_LOG_CB_SIMPLE:
+    """Create a dummy callback that does nothing."""
+
+    def _cb(_: ctypes.c_char_p) -> None:
+        return
+
+    cb = _VDDK_LOG_CB_SIMPLE(_cb)
+    _VDDK_CALLBACK_REFS.append(cb)
+    return cb
 
 
 # -----------------------------------------------------------------------------
@@ -463,8 +474,8 @@ def vddk_init_once(logger: logging.Logger, lib: ctypes.CDLL, *, vddk_libdir: Opt
     """
     Initialize VDDK once per process. Thread-safe.
 
-    IMPORTANT: We pass log/warn/panic callbacks so VDDK emits details about
-    ConnectEx/Open failures (otherwise you often get useless "error").
+    Based on observed behavior: callbacks may receive NULL/invalid pointers.
+    We try InitEx with NULL callbacks first, then API 7.0, then dummy callbacks.
     """
     global _vddk_inited, _g_vddk_log_cb, _g_vddk_warn_cb, _g_vddk_panic_cb
 
@@ -472,27 +483,66 @@ def vddk_init_once(logger: logging.Logger, lib: ctypes.CDLL, *, vddk_libdir: Opt
         if _vddk_inited:
             return
 
-        _g_vddk_log_cb = _mk_vddk_log_cb(logger, "debug")
-        _g_vddk_warn_cb = _mk_vddk_log_cb(logger, "warning")
-        _g_vddk_panic_cb = _mk_vddk_log_cb(logger, "error")
-
         libdir_c = _as_cstr(str(Path(vddk_libdir).expanduser().resolve())) if vddk_libdir else None
         logger.debug("VDDK: InitEx(libdir=%r)", str(vddk_libdir) if vddk_libdir else None)
 
+        logger.debug("VDDK: Trying InitEx without callbacks...")
         rc = lib.VixDiskLib_InitEx(
             _VIXDISKLIB_API_VERSION_MAJOR,
             _VIXDISKLIB_API_VERSION_MINOR,
-            _g_vddk_log_cb,    # logFunc
-            _g_vddk_warn_cb,   # warnFunc
-            _g_vddk_panic_cb,  # panicFunc
+            None,
+            None,
+            None,
             libdir_c,
-            None,  # configFile
+            None,
         )
+
         if rc != 0:
-            raise VDDKError(f"VixDiskLib_InitEx failed: {_err_text(lib, rc)}")
+            logger.debug("VDDK: Trying API 7.0 without callbacks...")
+            rc = lib.VixDiskLib_InitEx(
+                7,
+                0,
+                None,
+                None,
+                None,
+                libdir_c,
+                None,
+            )
+
+            if rc != 0:
+                logger.debug("VDDK: Trying with dummy callbacks...")
+                _g_vddk_log_cb = _mk_dummy_callback()
+                _g_vddk_warn_cb = _mk_dummy_callback()
+                _g_vddk_panic_cb = _mk_dummy_callback()
+
+                rc = lib.VixDiskLib_InitEx(
+                    _VIXDISKLIB_API_VERSION_MAJOR,
+                    _VIXDISKLIB_API_VERSION_MINOR,
+                    _g_vddk_log_cb,
+                    _g_vddk_warn_cb,
+                    _g_vddk_panic_cb,
+                    libdir_c,
+                    None,
+                )
+
+                if rc != 0:
+                    raise VDDKError(f"VixDiskLib_InitEx failed: {_err_text(lib, rc)}")
+                logger.debug("VDDK: InitEx OK (with dummy callbacks)")
+            else:
+                logger.debug("VDDK: InitEx OK (API 7.0, no callbacks)")
+        else:
+            logger.debug("VDDK: InitEx OK (API 9.0, no callbacks)")
 
         _vddk_inited = True
-        logger.debug("VDDK: InitEx OK (api=%d.%d)", _VIXDISKLIB_API_VERSION_MAJOR, _VIXDISKLIB_API_VERSION_MINOR)
+
+
+def vddk_cleanup() -> None:
+    """Clean up VDDK resources."""
+    global _vddk_inited
+    with _vddk_lock:
+        if _vddk_inited:
+            _VDDK_CALLBACK_REFS.clear()
+            _vddk_inited = False
 
 
 # -----------------------------------------------------------------------------
@@ -537,6 +587,7 @@ class VDDKESXClient:
 
         self._lib: Optional[ctypes.CDLL] = None
         self._conn: _VixDiskLibConnection = _VixDiskLibConnection()
+        self._connect_strings: dict[str, Optional[bytes]] = {}
 
     def __enter__(self) -> "VDDKESXClient":
         self.connect()
@@ -570,16 +621,18 @@ class VDDKESXClient:
         self._lib = lib
 
     def _preflight_debug(self) -> None:
-        """
-        Extra diagnostics before ConnectEx. Never raises; logs only.
-        """
+        """Extra diagnostics before ConnectEx. Never raises; logs only."""
         s = self.spec
         if not s.debug_preflight:
             return
 
         self.logger.debug(
             "VDDK: preflight host=%r port=%d user=%r insecure=%s transports=%r",
-            s.host, s.port, s.user, s.insecure, s.transport_modes
+            s.host,
+            s.port,
+            s.user,
+            s.insecure,
+            s.transport_modes,
         )
 
         ok_res, res = _resolve_host(s.host)
@@ -602,7 +655,11 @@ class VDDKESXClient:
 
         if s.thumbprint:
             try:
-                self.logger.debug("VDDK: thumbprint raw=%r normalized=%r", s.thumbprint, normalize_thumbprint(s.thumbprint))
+                self.logger.debug(
+                    "VDDK: thumbprint raw=%r normalized=%r",
+                    s.thumbprint,
+                    normalize_thumbprint(s.thumbprint),
+                )
             except Exception as e:
                 self.logger.error("VDDK: thumbprint invalid: %r (%s)", s.thumbprint, e)
 
@@ -613,26 +670,30 @@ class VDDKESXClient:
         s = self.spec
         self._preflight_debug()
 
-        transport = s.transport_modes
-        if not transport:
-            transport = "nbdssl:nbd" if not s.insecure else "nbd:nbdssl"
+        transport = s.transport_modes or "nbd"
+        if s.insecure:
+            transport = "nbd"
 
-        tp = (s.thumbprint or "").strip()
-        if not tp and not s.insecure:
-            self.logger.info("VDDK: computing SHA1 thumbprint for %s:%d", s.host, s.port)
-            tp = compute_server_thumbprint_sha1(
-                s.host,
-                s.port,
-                timeout=float(s.tls_thumbprint_timeout),
-            )
-        if tp:
-            tp = normalize_thumbprint(tp)
+        self.logger.debug("VDDK: Using transport: %s", transport)
 
-        if (not tp) and (not s.insecure):
-            raise VDDKError("Thumbprint is required unless insecure=True")
+        tp: Optional[str] = None
+        if "nbdssl" in transport and not s.insecure:
+            tp = (s.thumbprint or "").strip()
+            if not tp:
+                try:
+                    tp = compute_server_thumbprint_sha1(
+                        s.host,
+                        s.port,
+                        timeout=float(s.tls_thumbprint_timeout),
+                    )
+                    tp = normalize_thumbprint(tp)
+                except Exception as e:
+                    self.logger.error("VDDK: Failed to compute thumbprint: %s", e)
+                    raise VDDKError(f"Cannot compute thumbprint for SSL transport: {e}") from e
 
         self.logger.debug(
-            "VDDK: ConnectEx params: serverName=%r port=%d user=%r pass=%s thumbprint=%r transport=%r insecure=%s",
+            "VDDK: ConnectEx params: serverName=%r port=%d user=%r pass=%s thumbprint=%r "
+            "transport=%r insecure=%s",
             s.host,
             int(s.port),
             s.user,
@@ -642,36 +703,72 @@ class VDDKESXClient:
             bool(s.insecure),
         )
 
+        # Keep bytes alive for duration of the connection.
+        self._connect_strings = {
+            "server_name": _as_cstr(s.host),
+            "thumb_print": _as_cstr(tp) if tp else None,
+            "user_name": _as_cstr(s.user),
+            "password": _as_cstr(s.password),
+            "transport_modes": _as_cstr(transport) if transport else None,
+        }
+
         params = _VixDiskLibConnectParams(
             vmxSpec=None,
-            serverName=_as_cstr(s.host),
-            thumbPrint=_as_cstr(tp) if tp else None,
-            userName=_as_cstr(s.user),
-            password=_as_cstr(s.password),
+            serverName=self._connect_strings["server_name"],
+            thumbPrint=self._connect_strings["thumb_print"],
+            userName=self._connect_strings["user_name"],
+            password=self._connect_strings["password"],
             port=ctypes.c_uint32(int(s.port)),
         )
 
         conn = _VixDiskLibConnection()
         t0 = time.time()
-        rc = self._lib.VixDiskLib_ConnectEx(
-            ctypes.byref(params),
-            None,  # identity
-            None,  # snapshotRef
-            _as_cstr(transport) if transport else None,
-            ctypes.byref(conn),
-        )
+
+        def _sigsegv_handler(signum, frame) -> None:  # pragma: no cover
+            self.logger.error("VDDK: SIGSEGV caught during ConnectEx!")
+            raise VDDKError("Segmentation fault in VDDK ConnectEx")
+
+        old_handler = signal.signal(signal.SIGSEGV, _sigsegv_handler)
+        try:
+            rc = self._lib.VixDiskLib_ConnectEx(
+                ctypes.byref(params),
+                None,  # identity
+                None,  # snapshotRef
+                self._connect_strings["transport_modes"],
+                ctypes.byref(conn),
+            )
+        except Exception as e:
+            dt = max(0.0, time.time() - t0)
+            self.logger.error("VDDK: ConnectEx EXCEPTION dt=%.3fs: %s", dt, e)
+            raise VDDKError(f"VixDiskLib_ConnectEx raised exception: {e}") from e
+        finally:
+            signal.signal(signal.SIGSEGV, old_handler)
+
         dt = max(0.0, time.time() - t0)
 
         if rc != 0:
             msg = _err_text(self._lib, rc)
             self.logger.error(
-                "VDDK: ConnectEx FAILED rc=%d dt=%.3fs msg=%s (host=%s port=%d transport=%s insecure=%s user=%s thumbprint=%s)",
-                int(rc), dt, msg, s.host, int(s.port), transport, bool(s.insecure), s.user, "set" if tp else "none"
+                "VDDK: ConnectEx FAILED rc=%d dt=%.3fs msg=%s (host=%s port=%d transport=%s insecure=%s user=%s)",
+                int(rc),
+                dt,
+                msg,
+                s.host,
+                int(s.port),
+                transport,
+                bool(s.insecure),
+                s.user,
             )
             raise VDDKError(f"VixDiskLib_ConnectEx failed: {msg}")
 
         self._conn = conn
-        self.logger.info("VDDK: connected to ESXi %s:%d (transport=%s) (dt=%.3fs)", s.host, s.port, transport, dt)
+        self.logger.info(
+            "VDDK: connected to ESXi %s:%d (transport=%s) (dt=%.3fs)",
+            s.host,
+            s.port,
+            transport,
+            dt,
+        )
 
     def disconnect(self) -> None:
         if self._lib is None:
@@ -684,6 +781,7 @@ class VDDKESXClient:
             self.logger.debug("VDDK: disconnect error ignored: %s", e)
         finally:
             self._conn = _VixDiskLibConnection()
+            self._connect_strings.clear()
 
     # Disk ops
 
@@ -736,7 +834,11 @@ class VDDKESXClient:
 
         try:
             cap = int(info_p.contents.capacity)
-            self.logger.debug("VDDK: GetInfo OK capacity_sectors=%d (%.2f GiB)", cap, (cap * _SECTOR_SIZE) / (1024**3))
+            self.logger.debug(
+                "VDDK: GetInfo OK capacity_sectors=%d (%.2f GiB)",
+                cap,
+                (cap * _SECTOR_SIZE) / (1024**3),
+            )
             return cap
         finally:
             try:
@@ -785,10 +887,15 @@ class VDDKESXClient:
                 )
 
             backoff = min(max_backoff_s, base_backoff_s * (2 ** (attempt - 1)))
-            backoff = backoff + random.uniform(0.0, max(0.0, jitter_s))
+            backoff += random.uniform(0.0, max(0.0, jitter_s))
             self.logger.warning(
                 "VDDK: transient read error at sector=%d count=%d: %s (retry %d/%d in %.2fs)",
-                start_sector, num_sectors, msg, attempt, max_retries, backoff
+                start_sector,
+                num_sectors,
+                msg,
+                attempt,
+                max_retries,
+                backoff,
             )
             time.sleep(backoff)
 
@@ -797,7 +904,7 @@ class VDDKESXClient:
         remote_vmdk: str,
         local_path: Path,
         *,
-        sectors_per_read: int = 2048,   # 1 MiB (2048 * 512)
+        sectors_per_read: int = 2048,  # 1 MiB (2048 * 512)
         progress: Optional[ProgressFn] = None,
         progress_interval_s: float = 0.5,
         log_every_bytes: int = 256 * 1024 * 1024,
@@ -874,7 +981,10 @@ class VDDKESXClient:
                         mode = "r+b"
                         self.logger.info(
                             "VDDK: resuming from %s (%.2f GiB, sector=%d/%d)",
-                            tmp, done / (1024**3), sector, cap_sectors
+                            tmp,
+                            done / (1024**3),
+                            sector,
+                            cap_sectors,
                         )
                 else:
                     self.logger.warning("VDDK: existing .part is not sector-aligned; restarting: %s", tmp)
@@ -975,8 +1085,8 @@ class VDDKESXClient:
                     sz = tmp.stat().st_size
                     if sz != total_bytes:
                         raise VDDKError(f"Downloaded size mismatch for {tmp}: got={sz} expected={total_bytes}")
-                except FileNotFoundError:
-                    raise VDDKError(f"Temporary file missing after write: {tmp}")
+                except FileNotFoundError as e:
+                    raise VDDKError(f"Temporary file missing after write: {tmp}") from e
 
             _atomic_write_replace(tmp, local_path)
 
@@ -988,11 +1098,11 @@ class VDDKESXClient:
                     sz2 = local_path.stat().st_size
                     if sz2 != total_bytes:
                         raise VDDKError(f"Final size mismatch for {local_path}: got={sz2} expected={total_bytes}")
-                except FileNotFoundError:
-                    raise VDDKError(f"Final file missing after rename: {local_path}")
+                except FileNotFoundError as e:
+                    raise VDDKError(f"Final file missing after rename: {local_path}") from e
 
-            elapsed = max(0.001, time.time() - start)
-            mib_s_total = (done / (1024**2)) / elapsed
+            elapsed = max(0.0, time.time() - start)
+            mib_s_total = (done / (1024**2)) / elapsed if elapsed > 0 else 0.0
 
             if sha256 is not None:
                 self.logger.info("VDDK: sha256 %s  %s", sha256.hexdigest(), local_path)
