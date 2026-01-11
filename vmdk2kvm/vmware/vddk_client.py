@@ -20,12 +20,13 @@ Runtime requirements:
 Caveats:
   - VDDK API is C; symbol availability can vary by VDDK version.
   - This module binds only the minimal symbols it uses.
+  - VDDK is NOT thread-safe. Do NOT call VDDK functions from multiple threads.
   - For best reliability, open the *descriptor* VMDK (not -flat.vmdk).
 
-FIXED: free(): invalid size memory corruption by:
-  1. Proper structure alignment with _pack_ = 1
-  2. Better library loading with dependency resolution
-  3. Safer ConnectEx parameter handling
+Notes on historical crash fix (free(): invalid size / memory corruption):
+  1) Proper structure alignment with _pack_ = 1
+  2) Better library loading with dependency resolution
+  3) Safer ConnectEx parameter handling
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ import signal
 import socket
 import ssl
 import sys
-import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -76,7 +76,7 @@ faulthandler.enable()
 
 
 # -----------------------------------------------------------------------------
-# ctypes structures - FIXED: Proper alignment to prevent memory corruption
+# ctypes structures
 # -----------------------------------------------------------------------------
 
 
@@ -84,10 +84,10 @@ class _VixDiskLibConnectParams(ctypes.Structure):
     """
     Minimal connect params struct.
     
-    FIX: Use 1-byte packing to match VDDK's expected layout exactly.
-    Some VDDK versions expect tight packing without padding.
+    Important: Use _pack_ = 1 to match VDDK's internal structure exactly.
+    Some VDDK versions require tight packing without padding.
     """
-    _pack_ = 1  # CRITICAL FIX: Prevent padding-induced memory corruption
+    _pack_ = 1
     _fields_ = [
         ("vmxSpec", ctypes.c_char_p),
         ("serverName", ctypes.c_char_p),
@@ -95,7 +95,6 @@ class _VixDiskLibConnectParams(ctypes.Structure):
         ("userName", ctypes.c_char_p),
         ("password", ctypes.c_char_p),
         ("port", ctypes.c_uint32),
-        # No padding field - let packing handle it
     ]
 
 
@@ -233,52 +232,42 @@ def _fmt_eta(seconds: float) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Enhanced crash handler for debugging memory corruption
+# Crash handler (for debugging memory corruption)
 # -----------------------------------------------------------------------------
 
-def _setup_crash_handler(logger: logging.Logger):
+
+def _setup_crash_handler(logger: logging.Logger) -> None:
     """Setup comprehensive crash handlers for memory corruption debugging."""
-    
+
     def sigsegv_handler(signum, frame):
         logger.critical("=" * 80)
         logger.critical("SIGSEGV DETECTED - Memory Corruption in VDDK")
         logger.critical("=" * 80)
-        
-        # Log stack trace
+
         logger.critical("\nStack trace at crash:")
         for filename, lineno, name, line in traceback.extract_stack(frame):
-            logger.critical(f"  {filename}:{lineno} in {name}")
+            logger.critical("  %s:%s in %s", filename, lineno, name)
             if line:
-                logger.critical(f"    {line.strip()}")
-        
-        # Dump thread stacks
-        logger.critical("\nAll thread stacks:")
-        for thread_id, thread_frame in sys._current_frames().items():
-            if thread_id != threading.current_thread().ident:
-                logger.critical(f"\nThread {thread_id}:")
-                for filename, lineno, name, line in traceback.extract_stack(thread_frame):
-                    logger.critical(f"  {filename}:{lineno} in {name}")
-        
-        # Try to dump VDDK state
+                logger.critical("    %s", line.strip())
+
         try:
-            logger.critical(f"\nVDDK Connection state: initialized")
-            logger.critical(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
-            logger.critical(f"VDDK_HOME: {os.environ.get('VDDK_HOME')}")
-        except:
+            logger.critical("\nVDDK Connection state: initialized")
+            logger.critical("LD_LIBRARY_PATH: %s", os.environ.get("LD_LIBRARY_PATH"))
+            logger.critical("VDDK_HOME: %s", os.environ.get("VDDK_HOME"))
+        except Exception:
             pass
-        
+
         logger.critical("\n" + "=" * 80)
         logger.critical("Attempting safe termination...")
-        
-        # Original handler will terminate
+
         signal.signal(signal.SIGSEGV, signal.SIG_DFL)
         os.kill(os.getpid(), signal.SIGSEGV)
-    
+
     signal.signal(signal.SIGSEGV, sigsegv_handler)
 
 
 # -----------------------------------------------------------------------------
-# Dynamic loading & symbol binding - FIXED: Better dependency handling
+# Dynamic loading & symbol binding
 # -----------------------------------------------------------------------------
 
 
@@ -295,20 +284,20 @@ def _candidate_lib_names() -> Tuple[str, ...]:
 def _load_vddk_cdll(
     vddk_libdir: Optional[Path],
     *,
-    mutate_env: bool = True,  # CHANGED: Default to True for VDDK
+    mutate_env: bool = True,
 ) -> ctypes.CDLL:
     """
     Load libvixDiskLib.so. If vddk_libdir is provided, try it first.
-    
-    FIXED: VDDK requires proper LD_LIBRARY_PATH setup for its dependencies.
-    We now always set up the environment properly.
+
+    VDDK often requires LD_LIBRARY_PATH setup for its dependencies.
+    This function sets VDDK_HOME and builds an LD_LIBRARY_PATH when vddk_libdir is provided.
     """
-    # Always set VDDK_HOME for VDDK internal use
+    # NOTE: mutate_env is intentionally kept for API compatibility.
+    # Current behavior always mutates env when vddk_libdir is provided.
     if vddk_libdir:
         vddk_path = Path(vddk_libdir).expanduser().resolve()
         os.environ["VDDK_HOME"] = str(vddk_path)
-        
-        # Build comprehensive library path
+
         lib_paths = [
             str(vddk_path),
             str(vddk_path / "lib64"),
@@ -316,22 +305,20 @@ def _load_vddk_cdll(
             str(vddk_path / "bin"),
             "/usr/lib64",
             "/usr/lib",
-            "/lib64", 
+            "/lib64",
             "/lib",
-            os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ.get("LD_LIBRARY_PATH", ""),
         ]
-        
-        # Filter out empty paths and join
-        new_ld_path = ":".join([p for p in lib_paths if p and os.path.exists(p.split(':')[0])])
+
+        new_ld_path = ":".join([p for p in lib_paths if p and os.path.exists(p.split(":")[0])])
         os.environ["LD_LIBRARY_PATH"] = new_ld_path
-        
+
         logger = logging.getLogger(__name__)
-        logger.debug(f"VDDK: Set LD_LIBRARY_PATH={new_ld_path}")
-        logger.debug(f"VDDK: Set VDDK_HOME={vddk_path}")
-    
+        logger.debug("VDDK: Set LD_LIBRARY_PATH=%s", new_ld_path)
+        logger.debug("VDDK: Set VDDK_HOME=%s", vddk_path)
+
     last_error: Optional[Exception] = None
-    
-    # Try loading from explicit path first
+
     if vddk_libdir:
         vddk_path = Path(vddk_libdir).expanduser().resolve()
         for n in _candidate_lib_names():
@@ -339,22 +326,20 @@ def _load_vddk_cdll(
             if cand.exists():
                 try:
                     logger = logging.getLogger(__name__)
-                    logger.debug(f"VDDK: Trying explicit path: {cand}")
-                    # Use RTLD_GLOBAL for VDDK to resolve its internal symbols
+                    logger.debug("VDDK: Trying explicit path: %s", cand)
                     return ctypes.CDLL(str(cand), mode=ctypes.RTLD_GLOBAL)
                 except Exception as e:
                     last_error = e
-                    logger.debug(f"VDDK: Failed to load {cand}: {e}")
-    
-    # Try loading from system paths
+                    logger.debug("VDDK: Failed to load %s: %s", cand, e)
+
     for n in _candidate_lib_names():
         try:
             logger = logging.getLogger(__name__)
-            logger.debug(f"VDDK: Trying system load: {n}")
+            logger.debug("VDDK: Trying system load: %s", n)
             return ctypes.CDLL(n, mode=ctypes.RTLD_GLOBAL)
         except Exception as e:
             last_error = e
-    
+
     raise VDDKError(
         "Failed to load VDDK library (libvixDiskLib.so).\n"
         "Ensure:\n"
@@ -368,7 +353,6 @@ def _load_vddk_cdll(
 
 def _bind_symbols(lib: ctypes.CDLL) -> None:
     """Bind minimal VDDK symbols used by this module."""
-    # Test if InitEx exists with proper signature
     try:
         lib.VixDiskLib_InitEx.argtypes = [
             ctypes.c_uint32,
@@ -381,7 +365,6 @@ def _bind_symbols(lib: ctypes.CDLL) -> None:
         ]
         lib.VixDiskLib_InitEx.restype = ctypes.c_int
     except AttributeError:
-        # Fallback to older Init
         lib.VixDiskLib_Init.argtypes = [
             ctypes.c_uint32,
             ctypes.c_uint32,
@@ -394,7 +377,6 @@ def _bind_symbols(lib: ctypes.CDLL) -> None:
     lib.VixDiskLib_Exit.argtypes = []
     lib.VixDiskLib_Exit.restype = None
 
-    # ConnectEx is preferred but might not exist
     try:
         lib.VixDiskLib_ConnectEx.argtypes = [
             ctypes.POINTER(_VixDiskLibConnectParams),
@@ -405,7 +387,6 @@ def _bind_symbols(lib: ctypes.CDLL) -> None:
         ]
         lib.VixDiskLib_ConnectEx.restype = ctypes.c_int
     except AttributeError:
-        # Fallback to Connect
         lib.VixDiskLib_Connect.argtypes = [
             ctypes.POINTER(_VixDiskLibConnectParams),
             ctypes.POINTER(_VixDiskLibConnection),
@@ -453,16 +434,24 @@ def _bind_symbols(lib: ctypes.CDLL) -> None:
 def _err_text(lib: ctypes.CDLL, rc: int) -> str:
     """Best-effort conversion of VDDK error codes to text."""
     try:
-        p = lib.VixDiskLib_GetErrorText(int(rc), None)
-        if not p:
+        # Try to get error text with buffer first (safer)
+        buf = ctypes.create_string_buffer(256)
+        p = lib.VixDiskLib_GetErrorText(int(rc), buf)
+        
+        if p:
+            # Some versions return pointer
+            raw = ctypes.cast(p, ctypes.c_char_p).value
+            msg = raw.decode("utf-8", errors="replace") if raw else f"VDDK rc={rc}"
+            try:
+                lib.VixDiskLib_FreeErrorText(p)
+            except Exception:
+                pass
+            return msg
+        elif buf.value:
+            # Buffer was filled directly
+            return buf.value.decode("utf-8", errors="replace")
+        else:
             return f"VDDK rc={rc}"
-        raw = ctypes.cast(p, ctypes.c_char_p).value
-        msg = raw.decode("utf-8", errors="replace") if raw else f"VDDK rc={rc}"
-        try:
-            lib.VixDiskLib_FreeErrorText(p)
-        except Exception:
-            pass
-        return msg
     except Exception:
         return f"VDDK rc={rc}"
 
@@ -524,10 +513,7 @@ def _mk_vddk_log_cb_simple(logger: logging.Logger, level: str) -> _VDDK_LOG_CB_S
         try:
             if msg_p:
                 msg_bytes = msg_p.value
-                if msg_bytes:
-                    msg = msg_bytes.decode("utf-8", "replace").rstrip()
-                else:
-                    msg = "<empty message>"
+                msg = msg_bytes.decode("utf-8", "replace").rstrip() if msg_bytes else "<empty message>"
             else:
                 msg = "<NULL pointer>"
 
@@ -538,7 +524,6 @@ def _mk_vddk_log_cb_simple(logger: logging.Logger, level: str) -> _VDDK_LOG_CB_S
             else:
                 logger.error("VDDK: %s", msg)
         except Exception as e:
-            # Never raise from a C callback.
             try:
                 logger.error("VDDK callback error: %s", e)
             except Exception:
@@ -561,118 +546,109 @@ def _mk_dummy_callback() -> _VDDK_LOG_CB_SIMPLE:
 
 
 # -----------------------------------------------------------------------------
-# Global init (InitEx once) - FIXED: Safer initialization
+# Global init (InitEx once) - SINGLE THREAD ONLY
 # -----------------------------------------------------------------------------
 
-_vddk_lock = threading.Lock()
 _vddk_inited = False
 
 
 def vddk_init_once(logger: logging.Logger, lib: ctypes.CDLL, *, vddk_libdir: Optional[Path]) -> None:
     """
-    Initialize VDDK once per process. Thread-safe.
+    Initialize VDDK once per process. 
     
-    FIXED: Try multiple API versions and handle failures gracefully.
+    WARNING: VDDK is NOT thread-safe. Do NOT call this from multiple threads.
     """
     global _vddk_inited, _g_vddk_log_cb, _g_vddk_warn_cb, _g_vddk_panic_cb
 
-    with _vddk_lock:
-        if _vddk_inited:
-            return
+    if _vddk_inited:
+        return
 
-        libdir_c = _as_cstr(str(Path(vddk_libdir).expanduser().resolve())) if vddk_libdir else None
-        
-        # Setup crash handler
-        _setup_crash_handler(logger)
-        
-        # Try different initialization strategies
-        api_versions = [
-            (_VIXDISKLIB_API_VERSION_MAJOR, _VIXDISKLIB_API_VERSION_MINOR),
-            (7, 0),
-            (6, 7),
-            (6, 5),
-        ]
-        
-        for major, minor in api_versions:
+    libdir_c = _as_cstr(str(Path(vddk_libdir).expanduser().resolve())) if vddk_libdir else None
+
+    _setup_crash_handler(logger)
+
+    api_versions = [
+        (_VIXDISKLIB_API_VERSION_MAJOR, _VIXDISKLIB_API_VERSION_MINOR),
+        (7, 0),
+        (6, 7),
+        (6, 5),
+    ]
+
+    for major, minor in api_versions:
+        try:
+            logger.debug("VDDK: Trying InitEx API %d.%d...", major, minor)
+            rc = lib.VixDiskLib_InitEx(
+                major,
+                minor,
+                None,
+                None,
+                None,
+                libdir_c,
+                None,
+            )
+            if rc == 0:
+                logger.debug("VDDK: InitEx OK (API %d.%d, no callbacks)", major, minor)
+                _vddk_inited = True
+                return
+        except AttributeError:
             try:
-                logger.debug(f"VDDK: Trying InitEx API {major}.{minor}...")
-                
-                # Try with no callbacks first (safest)
-                rc = lib.VixDiskLib_InitEx(
+                logger.debug("VDDK: Trying Init API %d.%d...", major, minor)
+                rc = lib.VixDiskLib_Init(
                     major,
                     minor,
                     None,
                     None,
                     None,
-                    libdir_c,
-                    None,
                 )
-                
                 if rc == 0:
-                    logger.debug(f"VDDK: InitEx OK (API {major}.{minor}, no callbacks)")
+                    logger.debug("VDDK: Init OK (API %d.%d, no callbacks)", major, minor)
                     _vddk_inited = True
                     return
-                    
             except AttributeError:
-                # Try older Init function
-                try:
-                    logger.debug(f"VDDK: Trying Init API {major}.{minor}...")
-                    rc = lib.VixDiskLib_Init(
-                        major,
-                        minor,
-                        None,
-                        None,
-                        None,
-                    )
-                    
-                    if rc == 0:
-                        logger.debug(f"VDDK: Init OK (API {major}.{minor}, no callbacks)")
-                        _vddk_inited = True
-                        return
-                        
-                except AttributeError:
-                    continue
-        
-        # If all else fails, try with dummy callbacks
-        logger.debug("VDDK: Trying with dummy callbacks...")
-        _g_vddk_log_cb = _mk_dummy_callback()
-        _g_vddk_warn_cb = _mk_dummy_callback()
-        _g_vddk_panic_cb = _mk_dummy_callback()
-        
-        # Try the highest API version with callbacks
-        rc = lib.VixDiskLib_InitEx(
-            _VIXDISKLIB_API_VERSION_MAJOR,
-            _VIXDISKLIB_API_VERSION_MINOR,
-            _g_vddk_log_cb,
-            _g_vddk_warn_cb,
-            _g_vddk_panic_cb,
-            libdir_c,
-            None,
-        )
-        
-        if rc != 0:
-            raise VDDKError(f"VixDiskLib_InitEx failed with all API versions")
-        
-        logger.debug("VDDK: InitEx OK (with dummy callbacks)")
-        _vddk_inited = True
+                continue
+
+    logger.debug("VDDK: Trying with dummy callbacks...")
+    _g_vddk_log_cb = _mk_dummy_callback()
+    _g_vddk_warn_cb = _mk_dummy_callback()
+    _g_vddk_panic_cb = _mk_dummy_callback()
+
+    rc = lib.VixDiskLib_InitEx(
+        _VIXDISKLIB_API_VERSION_MAJOR,
+        _VIXDISKLIB_API_VERSION_MINOR,
+        _g_vddk_log_cb,
+        _g_vddk_warn_cb,
+        _g_vddk_panic_cb,
+        libdir_c,
+        None,
+    )
+    if rc != 0:
+        raise VDDKError("VixDiskLib_InitEx failed with all API versions")
+
+    logger.debug("VDDK: InitEx OK (with dummy callbacks)")
+    _vddk_inited = True
 
 
 def vddk_cleanup() -> None:
     """Clean up VDDK resources."""
     global _vddk_inited
-    with _vddk_lock:
-        if _vddk_inited:
-            try:
-                # Find and call VixDiskLib_Exit if possible
-                import ctypes.util
-                lib = ctypes.CDLL("libvixDiskLib.so", mode=ctypes.RTLD_GLOBAL)
-                if hasattr(lib, 'VixDiskLib_Exit'):
-                    lib.VixDiskLib_Exit()
-            except:
-                pass
-            finally:
-                _VDDK_CALLBACK_REFS.clear()
-                _vddk_inited = False
+    if _vddk_inited:
+        try:
+            # Try to load the library to call Exit
+            lib = None
+            for n in _candidate_lib_names():
+                try:
+                    lib = ctypes.CDLL(n, mode=ctypes.RTLD_GLOBAL)
+                    break
+                except Exception:
+                    continue
+            
+            if lib and hasattr(lib, "VixDiskLib_Exit"):
+                lib.VixDiskLib_Exit()
+        except Exception:
+            pass
+        finally:
+            _VDDK_CALLBACK_REFS.clear()
+            _vddk_inited = False
 
 
 # -----------------------------------------------------------------------------
@@ -694,7 +670,7 @@ class VDDKConnectionSpec:
     transport_modes: Optional[str] = None  # e.g. "nbdssl:nbd"
     vddk_libdir: Optional[Path] = None
     tls_thumbprint_timeout: float = 10.0
-    mutate_ld_library_path: bool = True  # CHANGED: Default to True for VDDK
+    mutate_ld_library_path: bool = True
 
     # Debug / diagnostics
     debug_preflight: bool = True
@@ -704,6 +680,8 @@ class VDDKConnectionSpec:
 class VDDKESXClient:
     """
     Minimal ESXi VDDK reader.
+    
+    WARNING: This class is NOT thread-safe. VDDK API is single-threaded only.
     
     Lifecycle:
       - connect()
@@ -725,8 +703,6 @@ class VDDKESXClient:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.disconnect()
-
-    # Setup / Connect
 
     def _ensure_loaded(self) -> None:
         if self._lib is not None:
@@ -777,11 +753,13 @@ class VDDKESXClient:
         else:
             self.logger.error("VDDK: TCP connect failed %s:%d -> %s", s.host, s.port, tcp)
 
-        tp, subj = _peek_tls_cert_sha1(s.host, int(s.port), float(s.preflight_timeout))
-        if tp:
-            self.logger.debug("VDDK: TLS peer cert sha1=%s subject=%s", tp, subj)
-        else:
-            self.logger.debug("VDDK: TLS peer cert fetch failed (may still work if network blocks TLS inspect)")
+        # Only check TLS if not insecure
+        if not s.insecure:
+            tp, subj = _peek_tls_cert_sha1(s.host, int(s.port), float(s.preflight_timeout))
+            if tp:
+                self.logger.debug("VDDK: TLS peer cert sha1=%s subject=%s", tp, subj)
+            else:
+                self.logger.debug("VDDK: TLS peer cert fetch failed")
 
         if s.thumbprint:
             try:
@@ -801,31 +779,44 @@ class VDDKESXClient:
         s = self.spec
         self._preflight_debug()
 
-        # Use simpler transport for initial connection
-        # nbd is more reliable than nbdssl for initial testing
-        transport = "nbd"  # Start simple
-        if not s.insecure and s.thumbprint:
-            transport = "nbdssl,nbd"  # Fallback chain
+        # FIX: Use correct transport mode based on insecure flag
+        if s.insecure:
+            transport = "nbd"  # Plain NBD without SSL
+        else:
+            transport = "nbdssl"  # NBD with SSL
         
-        self.logger.debug("VDDK: Using transport: %s", transport)
+        # Allow override from spec
+        if s.transport_modes:
+            transport = s.transport_modes
 
-        # Prepare connection parameters with proper memory management
-        server_bytes = s.host.encode('utf-8')
-        user_bytes = s.user.encode('utf-8')
-        password_bytes = s.password.encode('utf-8')
-        transport_bytes = transport.encode('utf-8')
+        self.logger.debug("VDDK: Using transport: %s (insecure=%s)", transport, s.insecure)
+
+        # Encode strings and keep references
+        server_bytes = s.host.encode("utf-8")
+        user_bytes = s.user.encode("utf-8")
+        password_bytes = s.password.encode("utf-8")
+        transport_bytes = transport.encode("utf-8")
         
+        # Store thumbprint if provided and not insecure
+        thumbprint_bytes = None
+        if not s.insecure and s.thumbprint:
+            try:
+                thumbprint_bytes = normalize_thumbprint(s.thumbprint).encode("utf-8")
+            except Exception as e:
+                self.logger.warning("VDDK: Invalid thumbprint, will not verify TLS: %s", e)
+
         # Keep references to prevent garbage collection
         self._connect_strings = {
             "server": server_bytes,
             "user": user_bytes,
             "password": password_bytes,
             "transport": transport_bytes,
+            "thumbprint": thumbprint_bytes,
         }
-        
-        # Create parameters with explicit NULL for unused fields
+
+        # Initialize connection parameters
         params = _VixDiskLibConnectParams()
-        # Zero out the structure first
+        # Zero out the structure
         ctypes.memset(ctypes.byref(params), 0, ctypes.sizeof(params))
         
         # Set fields
@@ -834,24 +825,29 @@ class VDDKESXClient:
         params.password = ctypes.c_char_p(password_bytes)
         params.port = ctypes.c_uint32(int(s.port))
         
-        # vmxSpec and thumbPrint should be NULL
+        # These should be NULL/NONE for ESXi connections
         params.vmxSpec = None
-        params.thumbPrint = None
+        
+        # Set thumbprint if provided and not insecure
+        if thumbprint_bytes and not s.insecure:
+            params.thumbPrint = ctypes.c_char_p(thumbprint_bytes)
+        else:
+            params.thumbPrint = None
 
         conn = _VixDiskLibConnection()
         t0 = time.time()
 
         self.logger.debug(
-            "VDDK: ConnectEx params: serverName=%r port=%d user=%r transport=%r",
+            "VDDK: ConnectEx params: serverName=%r port=%d user=%r transport=%r thumbPrint=%r",
             s.host,
             int(s.port),
             s.user,
             transport,
+            "****" if thumbprint_bytes else None,
         )
 
         try:
-            # Try ConnectEx first (preferred)
-            if hasattr(self._lib, 'VixDiskLib_ConnectEx'):
+            if hasattr(self._lib, "VixDiskLib_ConnectEx"):
                 rc = self._lib.VixDiskLib_ConnectEx(
                     ctypes.byref(params),
                     None,  # identity
@@ -860,23 +856,21 @@ class VDDKESXClient:
                     ctypes.byref(conn),
                 )
             else:
-                # Fallback to Connect
                 rc = self._lib.VixDiskLib_Connect(
                     ctypes.byref(params),
                     ctypes.byref(conn),
                 )
-                
         except Exception as e:
             dt = max(0.0, time.time() - t0)
-            self.logger.error("VDDK: ConnectEx EXCEPTION dt=%.3fs: %s", dt, e)
-            raise VDDKError(f"VixDiskLib_ConnectEx raised exception: {e}") from e
+            self.logger.error("VDDK: Connect EXCEPTION dt=%.3fs: %s", dt, e)
+            raise VDDKError(f"VixDiskLib_Connect raised exception: {e}") from e
 
         dt = max(0.0, time.time() - t0)
 
         if rc != 0:
             msg = _err_text(self._lib, rc)
             self.logger.error(
-                "VDDK: ConnectEx FAILED rc=%d dt=%.3fs msg=%s (host=%s port=%d transport=%s insecure=%s user=%s)",
+                "VDDK: Connect FAILED rc=%d dt=%.3fs msg=%s (host=%s port=%d transport=%s insecure=%s user=%s)",
                 int(rc),
                 dt,
                 msg,
@@ -886,20 +880,23 @@ class VDDKESXClient:
                 bool(s.insecure),
                 s.user,
             )
-            raise VDDKError(f"VixDiskLib_ConnectEx failed: {msg}")
+            raise VDDKError(f"VixDiskLib_Connect failed: {msg}")
 
         self._conn = conn
         self.logger.info(
-            "VDDK: connected to ESXi %s:%d (transport=%s) (dt=%.3fs)",
+            "VDDK: connected to ESXi %s:%d (transport=%s, insecure=%s) (dt=%.3fs)",
             s.host,
             s.port,
             transport,
+            s.insecure,
             dt,
         )
 
     def disconnect(self) -> None:
+        """Disconnect from ESXi host."""
         if self._lib is None:
             return
+        
         try:
             if self._conn:
                 self.logger.debug("VDDK: disconnecting")
@@ -909,8 +906,6 @@ class VDDKESXClient:
         finally:
             self._conn = _VixDiskLibConnection()
             self._connect_strings.clear()
-
-    # Disk ops
 
     def _require_connected(self) -> None:
         if self._lib is None:
@@ -1048,6 +1043,8 @@ class VDDKESXClient:
     ) -> Path:
         """
         Stream a remote VMDK into a local file by reading sectors.
+        
+        WARNING: VDDK is NOT thread-safe. Do NOT call this from multiple threads.
 
         remote_vmdk should typically be the descriptor:
           "[datastore] vm/vm.vmdk"
@@ -1089,7 +1086,6 @@ class VDDKESXClient:
             buf = (ctypes.c_ubyte * (spr * _SECTOR_SIZE))()
             buf_p = ctypes.cast(buf, ctypes.c_void_p)
 
-            # Resume logic
             done = 0
             sector = 0
             mode = "wb"
