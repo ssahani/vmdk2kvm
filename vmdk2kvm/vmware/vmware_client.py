@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # vmdk2kvm/vmware/vsphere_client.py
 from __future__ import annotations
+
 import fnmatch
 import hashlib
 import logging
@@ -17,83 +18,110 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
+
 try:
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
     RICH_AVAILABLE = True
-except Exception: # pragma: no cover
-    Console = None # type: ignore
-    Progress = None # type: ignore
-    SpinnerColumn = None # type: ignore
-    TextColumn = None # type: ignore
-    TimeElapsedColumn = None # type: ignore
+except Exception:  # pragma: no cover
+    Console = None  # type: ignore
+    Progress = None  # type: ignore
+    SpinnerColumn = None  # type: ignore
+    TextColumn = None  # type: ignore
+    TimeElapsedColumn = None  # type: ignore
     RICH_AVAILABLE = False
+
 try:
     import select
+
     SELECT_AVAILABLE = True
-except Exception: # pragma: no cover
-    select = None # type: ignore
+except Exception:  # pragma: no cover
+    select = None  # type: ignore
     SELECT_AVAILABLE = False
+
 try:
     from .govc_common import GovcRunner, extract_paths_from_datastore_ls_json, normalize_ds_path
-except Exception: # pragma: no cover
-    GovcRunner = None # type: ignore
-    def normalize_ds_path(datastore: str, ds_path: str) -> Tuple[str, str]: # type: ignore
+except Exception:  # pragma: no cover
+    GovcRunner = None  # type: ignore
+
+    def normalize_ds_path(datastore: str, ds_path: str) -> Tuple[str, str]:  # type: ignore
         raise RuntimeError("govc_common.normalize_ds_path unavailable")
-    def extract_paths_from_datastore_ls_json(obj: Any) -> List[str]: # type: ignore
+
+    def extract_paths_from_datastore_ls_json(obj: Any) -> List[str]:  # type: ignore
         return []
+
 try:
     # Your repo says: from ..core.exceptions import VMwareError
-    from ..core.exceptions import VMwareError # type: ignore
-except Exception: # pragma: no cover
+    from ..core.exceptions import VMwareError  # type: ignore
+except Exception:  # pragma: no cover
+
     class VMwareError(RuntimeError):
         pass
+
+
 # ✅ shared credential resolver (supports vs_password_env + vc_password_env)
 # NOTE: if your file is core/creds.py, change to: from ..core.creds import resolve_vsphere_creds
 try:
-    from ..core.cred import resolve_vsphere_creds # type: ignore
-except Exception: # pragma: no cover
+    from ..core.cred import resolve_vsphere_creds  # type: ignore
+except Exception:  # pragma: no cover
     try:
-        from ..core.creds import resolve_vsphere_creds # type: ignore
-    except Exception: # pragma: no cover
-        resolve_vsphere_creds = None # type: ignore
+        from ..core.creds import resolve_vsphere_creds  # type: ignore
+    except Exception:  # pragma: no cover
+        resolve_vsphere_creds = None  # type: ignore
+
+
 # Optional: vSphere / vCenter integration (pyvmomi)
 try:
-    from pyVim.connect import Disconnect, SmartConnect # type: ignore
-    from pyVmomi import vim, vmodl # type: ignore
+    from pyVim.connect import Disconnect, SmartConnect  # type: ignore
+    from pyVmomi import vim, vmodl  # type: ignore
+
     PYVMOMI_AVAILABLE = True
-except Exception: # pragma: no cover
-    SmartConnect = None # type: ignore
-    Disconnect = None # type: ignore
-    vim = None # type: ignore
-    vmodl = None # type: ignore
+except Exception:  # pragma: no cover
+    SmartConnect = None  # type: ignore
+    Disconnect = None  # type: ignore
+    vim = None  # type: ignore
+    vmodl = None  # type: ignore
     PYVMOMI_AVAILABLE = False
+
+
 # Optional: HTTP download (requests)
 try:
-    import requests # type: ignore
+    import requests  # type: ignore
+
     REQUESTS_AVAILABLE = True
-except Exception: # pragma: no cover
-    requests = None # type: ignore
+except Exception:  # pragma: no cover
+    requests = None  # type: ignore
     REQUESTS_AVAILABLE = False
+
+
 # Optional: silence urllib3 TLS warnings when verify=False
-try: # pragma: no cover
-    import urllib3 # type: ignore
-except Exception: # pragma: no cover
-    urllib3 = None # type: ignore
+try:  # pragma: no cover
+    import urllib3  # type: ignore
+except Exception:  # pragma: no cover
+    urllib3 = None  # type: ignore
+
+
 try:
-    from .vddk_client import VDDKConnectionSpec, VDDKESXClient # type: ignore
+    from .vddk_client import VDDKConnectionSpec, VDDKESXClient  # type: ignore
+
     VDDK_CLIENT_AVAILABLE = True
-except Exception: # pragma: no cover
-    VDDKESXClient = None # type: ignore
-    VDDKConnectionSpec = None # type: ignore
+except Exception:  # pragma: no cover
+    VDDKESXClient = None  # type: ignore
+    VDDKConnectionSpec = None  # type: ignore
     VDDK_CLIENT_AVAILABLE = False
+
+
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------
 _BACKING_RE = re.compile(r"\[(.+?)\]\s+(.*)")
 _HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{40,128}$")
+
 # ✅ parse VMware-style backing filename "[ds] path" (for govc normalization too)
 _DS_BACKING_RE = re.compile(r"^\[(?P<ds>[^\]]+)\]\s*(?P<path>.+)$")
+
+
 def _normalize_ds_path(datastore: str, ds_path: str) -> Tuple[str, str]:
     """
     Normalize datastore paths for govc.
@@ -113,6 +141,8 @@ def _normalize_ds_path(datastore: str, ds_path: str) -> Tuple[str, str]:
         path = (m.group("path") or "").strip()
         return (ds or datastore), path.lstrip("/")
     return datastore, s.lstrip("/")
+
+
 class GovmomiCLI(GovcRunner):
     """
     Best-effort integration with govmomi CLI (`govc`).
@@ -122,15 +152,20 @@ class GovmomiCLI(GovcRunner):
         (inventory traversal + datastore listing/downloading).
     Common env + execution logic is centralized in govc_common.py.
     """
+
     def __init__(self, logger: Any, **kwargs: Any):
         super().__init__(logger=logger, **kwargs)
+
     # Backwards-compatible aliases (older code called these)
     def _env(self) -> Dict[str, str]:
         return self.env()
+
     def _run_text(self, cmd: List[str]) -> str:
         return self.run_text(cmd)
+
     def _run_json(self, cmd: List[str]) -> Any:
         return self.run_json(cmd)
+
     def _run(self, cmd: List[str]) -> subprocess.CompletedProcess[str]:
         full = [self.govc_bin] + cmd
         try:
@@ -138,6 +173,7 @@ class GovmomiCLI(GovcRunner):
         except Exception:
             pass
         return subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env(), text=True)
+
     def list_vm_names(self) -> List[str]:
         data = self.run_json(["find", "-type", "m", "-json", "."]) or {}
         elems = data.get("Elements") or []
@@ -145,9 +181,11 @@ class GovmomiCLI(GovcRunner):
             elems = []
         names = [str(p).split("/")[-1] for p in elems if p]
         return sorted({n for n in names if n})
+
     def datastore_ls(self, datastore: str, ds_dir: str) -> List[str]:
         """Text-mode listing (one name per line)."""
         return self.datastore_ls_text(datastore, ds_dir)
+
     def datastore_ls_json(self, datastore: str, ds_dir: str) -> List[str]:
         """
         JSON-mode listing via `govc datastore.ls -json`.
@@ -167,6 +205,7 @@ class GovmomiCLI(GovcRunner):
             if pp:
                 out.append(pp)
         return out
+
     def datastore_download(self, datastore: str, ds_path: str, local_path: Path) -> None:
         """
         Download a single datastore file via:
@@ -179,6 +218,7 @@ class GovmomiCLI(GovcRunner):
         p = self._run(["datastore.download", "-ds", str(ds), remote, str(local_path)])
         if p.returncode != 0:
             raise VMwareError(f"govc datastore.download failed ({p.returncode}): {p.stderr.strip()}")
+
     def datastore_download_dir(
         self,
         datastore: str,
@@ -226,22 +266,28 @@ class GovmomiCLI(GovcRunner):
             "files_downloaded": len(picked),
             "files": picked,
         }
+
+
 @dataclass
 class V2VExportOptions:
     """
     Export / download options.
+
     Modes:
       1) export_mode="v2v" (default):
          - Uses virt-v2v (VDDK or SSH) which *may* inspect and modify the guest as part of conversion.
          - Writes local output (qcow2/raw) under output_dir.
+
       2) export_mode="download_only":
          - Uses pyvmomi control-plane ONLY + HTTPS /folder downloads (session cookie) OR govc.
          - Downloads VM directory files from datastore (VMDKs, VMX, NVRAM, logs, snapshots, etc.)
          - NO guest inspection, NO virt-v2v, NO libguestfs mutation.
+
       3) export_mode="vddk_download":
          - Uses pyvmomi control-plane to locate ESXi host + disk backing path
          - Uses a VDDK data-plane client to download one disk (remote VMDK) to local storage
          - NO guest inspection, NO virt-v2v
+
     IMPORTANT defaults:
       - datacenter defaults to "auto" (never hardcode ha-datacenter for vCenter)
       - compute defaults to "auto" and we resolve a HOST SYSTEM path:
@@ -249,26 +295,33 @@ class V2VExportOptions:
         because libvirt ESX driver rejects cluster-only paths:
           "Path ... does not specify a host system"
     """
+
     vm_name: str
+
     # ✅ knob
-    export_mode: str = "v2v" # "v2v" | "download_only" | "vddk_download"
+    export_mode: str = "v2v"  # "v2v" | "download_only" | "vddk_download"
+
     datacenter: str = "auto"
     compute: str = "auto"
+
     # v2v (virt-v2v) options
-    transport: str = "vddk" # prefer vddk
+    transport: str = "vddk"  # prefer vddk
     no_verify: bool = False
     vddk_libdir: Optional[Path] = None
     vddk_thumbprint: Optional[str] = None
     vddk_snapshot_moref: Optional[str] = None
     vddk_transports: Optional[str] = None
+
     output_dir: Path = Path("./out")
-    output_format: str = "qcow2" # qcow2|raw
+    output_format: str = "qcow2"  # qcow2|raw
     extra_args: Tuple[str, ...] = ()
+
     # Optional: inventory gets printed (otherwise: FAST, no scan)
     print_vm_names: Tuple[str, ...] = ()
     vm_list_limit: int = 120
     vm_list_columns: int = 3
     prefer_cached_vm_lookup: bool = False
+
     # download-only options (NO guest inspection)
     download_only_include_globs: Tuple[str, ...] = ("*",)
     download_only_exclude_globs: Tuple[str, ...] = (
@@ -283,12 +336,15 @@ class V2VExportOptions:
     )
     download_only_max_files: int = 5000
     download_only_fail_on_missing: bool = False
+
     # vddk_download options (single-disk raw pull via VDDK client)
-    vddk_download_disk: Optional[str] = None # None or label/index for single, 'all' for all disks
+    vddk_download_disk: Optional[str] = None  # None or label/index for single, 'all' for all disks
     vddk_download_output: Optional[Path] = None
-    vddk_download_sectors_per_read: int = 2048 # 1 MiB chunks (2048 * 512)
+    vddk_download_sectors_per_read: int = 2048  # 1 MiB chunks (2048 * 512)
     vddk_download_log_every_bytes: int = 256 * 1024 * 1024
     vddk_thumbprint_algorithm: str = "sha1"
+
+
 class VMwareClient:
     """
     Minimal vSphere/vCenter client (SYNC, no threads, no asyncio):
@@ -301,6 +357,7 @@ class VMwareClient:
           - datastore downloads (robust; avoids /folder cookie + dcPath bugs)
           - optional datastore.ls / dir downloads (helpers)
     """
+
     def __init__(
         self,
         logger: logging.Logger,
@@ -320,19 +377,24 @@ class VMwareClient:
         self.insecure = bool(insecure)
         self.timeout = timeout
         self.si: Any = None
+
         # caches
         self._dc_cache: Optional[List[Any]] = None
         self._dc_name_cache: Optional[List[str]] = None
         self._host_name_cache: Optional[List[str]] = None
+
         # optional acceleration caches
         self._vm_name_cache: Optional[List[str]] = None
         self._vm_obj_by_name_cache: Dict[str, Any] = {}
+
         # govc preference (auto if present)
         self.govc_bin = os.environ.get("GOVC_BIN", "govc")
         self.no_govmomi = False
         self._govc_client: Optional[GovmomiCLI] = None
+
         # rich console for progress UI (stderr is conventional for progress)
         self._rich_console = Console(stderr=True) if (RICH_AVAILABLE and Console is not None) else None
+
     # ---------------------------------------------------------------------
     # build from config using shared resolver (vs_* + vc_* + *_env)
     # ---------------------------------------------------------------------
@@ -357,20 +419,21 @@ class VMwareClient:
             insecure
             if insecure is not None
             else (
-                cfg.get("vc_insecure")
-                if cfg.get("vc_insecure") is not None
-                else cfg.get("vs_insecure", False)
+                cfg.get("vc_insecure") if cfg.get("vc_insecure") is not None else cfg.get("vs_insecure", False)
             )
         )
         c = cls(logger, creds.host, creds.user, creds.password, port=p, insecure=ins, timeout=timeout)
         if isinstance(c.password, str):
             c.password = c.password.strip()
+
         # govc knobs (additive)
         c.govc_bin = str(cfg.get("govc_bin") or os.environ.get("GOVC_BIN") or "govc")
         c.no_govmomi = bool(cfg.get("no_govmomi", False))
         return c
+
     def has_creds(self) -> bool:
         return bool((self.host or "").strip() and (self.user or "").strip() and (self.password or "").strip())
+
     def _govc(self) -> Optional[GovmomiCLI]:
         """
         Return a govc wrapper if govc is available and not disabled.
@@ -387,12 +450,14 @@ class VMwareClient:
                 govc_bin=self.govc_bin,
             )
         return self._govc_client if self._govc_client.available() else None
+
     # ---------------------------
     # Context managers
     # ---------------------------
     def __enter__(self) -> "VMwareClient":
         self.connect()
         return self
+
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         try:
             self.disconnect()
@@ -400,9 +465,11 @@ class VMwareClient:
             if exc_type is not None:
                 self.logger.error("Exception in context: %s: %s", getattr(exc_type, "__name__", exc_type), exc_val)
         return False
+
     def _require_pyvmomi(self) -> None:
         if not PYVMOMI_AVAILABLE:
             raise VMwareError("pyvmomi not installed. Install: pip install pyvmomi")
+
     def _ssl_context(self) -> ssl.SSLContext:
         if self.insecure:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -410,6 +477,7 @@ class VMwareClient:
             ctx.verify_mode = ssl.CERT_NONE
             return ctx
         return ssl.create_default_context()
+
     def connect(self) -> None:
         self._require_pyvmomi()
         ctx = self._ssl_context()
@@ -418,7 +486,7 @@ class VMwareClient:
                 old_timeout = socket.getdefaulttimeout()
                 socket.setdefaulttimeout(self.timeout)
                 try:
-                    self.si = SmartConnect( # type: ignore[misc]
+                    self.si = SmartConnect(  # type: ignore[misc]
                         host=self.host,
                         user=self.user,
                         pwd=self.password,
@@ -428,13 +496,14 @@ class VMwareClient:
                 finally:
                     socket.setdefaulttimeout(old_timeout)
             else:
-                self.si = SmartConnect( # type: ignore[misc]
+                self.si = SmartConnect(  # type: ignore[misc]
                     host=self.host,
                     user=self.user,
                     pwd=self.password,
                     port=self.port,
                     sslContext=ctx,
                 )
+
             # warm caches (best-effort, small)
             try:
                 self._refresh_datacenter_cache()
@@ -444,14 +513,16 @@ class VMwareClient:
                 self._refresh_host_cache()
             except Exception as e:
                 self.logger.debug("Host cache warmup failed (non-fatal): %s", e)
+
             self.logger.info("Connected to vSphere: %s:%s", self.host, self.port)
         except Exception as e:
             self.si = None
             raise VMwareError(f"Failed to connect to vSphere: {e}")
+
     def disconnect(self) -> None:
         try:
             if self.si is not None:
-                Disconnect(self.si) # type: ignore[misc]
+                Disconnect(self.si)  # type: ignore[misc]
         except Exception as e:
             self.logger.error("Error during disconnect: %s", e)
         finally:
@@ -461,6 +532,7 @@ class VMwareClient:
             self._host_name_cache = None
             self._vm_name_cache = None
             self._vm_obj_by_name_cache = {}
+
     def _content(self) -> Any:
         if not self.si:
             raise VMwareError("Not connected")
@@ -468,10 +540,11 @@ class VMwareClient:
             return self.si.RetrieveContent()
         except Exception as e:
             raise VMwareError(f"Failed to retrieve content: {e}")
+
     def _refresh_datacenter_cache(self) -> None:
         self._require_pyvmomi()
         content = self._content()
-        view = content.viewManager.CreateContainerView( # type: ignore[attr-defined]
+        view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
             content.rootFolder, [vim.Datacenter], True
         )
         try:
@@ -484,10 +557,12 @@ class VMwareClient:
                 view.Destroy()
             except Exception:
                 pass
+
     def list_datacenters(self, *, refresh: bool = False) -> List[str]:
         if refresh or self._dc_name_cache is None:
             self._refresh_datacenter_cache()
         return list(self._dc_name_cache or [])
+
     def get_datacenter_by_name(self, name: str, *, refresh: bool = False) -> Any:
         if refresh or self._dc_cache is None:
             self._refresh_datacenter_cache()
@@ -496,27 +571,31 @@ class VMwareClient:
             if str(getattr(dc, "name", "")).strip() == target:
                 return dc
         return None
+
     def datacenter_exists(self, name: str, *, refresh: bool = False) -> bool:
         n = (name or "").strip()
         if not n:
             return False
         return self.get_datacenter_by_name(n, refresh=refresh) is not None
+
     def vm_to_datacenter(self, vm_obj: Any) -> Any:
         self._require_pyvmomi()
         obj = vm_obj
         for _ in range(0, 64):
             if obj is None:
                 break
-            if isinstance(obj, vim.Datacenter): # type: ignore[attr-defined]
+            if isinstance(obj, vim.Datacenter):  # type: ignore[attr-defined]
                 return obj
             obj = getattr(obj, "parent", None)
         return None
+
     def vm_datacenter_name(self, vm_obj: Any) -> Optional[str]:
         dc = self.vm_to_datacenter(vm_obj)
         if dc is None:
             return None
         name = getattr(dc, "name", None)
         return str(name) if name else None
+
     def guess_default_datacenter(self) -> str:
         dcs = self.list_datacenters(refresh=False)
         if len(dcs) == 1:
@@ -527,6 +606,7 @@ class VMwareClient:
         if dcs:
             return sorted(dcs)[0]
         raise VMwareError("No datacenters found in inventory (unexpected).")
+
     # DC resolution (authoritative: VM parent walk)
     def resolve_datacenter_for_vm(self, vm_name: str, preferred: Optional[str]) -> str:
         pref = (preferred or "").strip()
@@ -551,10 +631,11 @@ class VMwareClient:
             f"Could not resolve datacenter for VM={vm_name!r}. Preferred={pref!r}, VM_dc={vm_dc!r}. "
             f"Available datacenters: {dcs}"
         )
+
     def _refresh_host_cache(self) -> None:
         self._require_pyvmomi()
         content = self._content()
-        view = content.viewManager.CreateContainerView( # type: ignore[attr-defined]
+        view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
             content.rootFolder, [vim.HostSystem], True
         )
         try:
@@ -564,10 +645,12 @@ class VMwareClient:
                 view.Destroy()
             except Exception:
                 pass
+
     def list_host_names(self, *, refresh: bool = False) -> List[str]:
         if refresh or self._host_name_cache is None:
             self._refresh_host_cache()
         return list(self._host_name_cache or [])
+
     def get_vm_by_name(self, name: str) -> Any:
         self._require_pyvmomi()
         n = (name or "").strip()
@@ -576,7 +659,7 @@ class VMwareClient:
         if n in self._vm_obj_by_name_cache:
             return self._vm_obj_by_name_cache[n]
         content = self._content()
-        view = content.viewManager.CreateContainerView( # type: ignore[attr-defined]
+        view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
             content.rootFolder, [vim.VirtualMachine], True
         )
         try:
@@ -590,6 +673,7 @@ class VMwareClient:
                 view.Destroy()
             except Exception:
                 pass
+
     def list_vm_names(self) -> List[str]:
         """
         Prefer govc for inventory listing if present (fast).
@@ -605,7 +689,7 @@ class VMwareClient:
                 self.logger.warning("govc list_vm_names failed; falling back to pyvmomi: %s", e)
         self._require_pyvmomi()
         content = self._content()
-        view = content.viewManager.CreateContainerView( # type: ignore[attr-defined]
+        view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
             content.rootFolder, [vim.VirtualMachine], True
         )
         try:
@@ -617,9 +701,11 @@ class VMwareClient:
                 view.Destroy()
             except Exception:
                 pass
+
     def _vm_runtime_host(self, vm_obj: Any) -> Any:
         rt = getattr(vm_obj, "runtime", None)
         return getattr(rt, "host", None) if rt else None
+
     def _host_parent_compute_name(self, host_obj: Any) -> Optional[str]:
         """
         HostSystem.parent is usually a ComputeResource or ClusterComputeResource.
@@ -635,6 +721,7 @@ class VMwareClient:
         except Exception:
             return None
         return None
+
     def resolve_host_system_for_vm(self, vm_name: str) -> str:
         """
         Prefer *host system path* (not cluster-only).
@@ -663,6 +750,7 @@ class VMwareClient:
         if cr_name and cr_name.lower() != host_name.lower():
             return f"host/{cr_name}/{host_name}"
         return f"host/{host_name}"
+
     def resolve_compute_for_vm(self, vm_name: str, preferred: Optional[str]) -> str:
         """
         Normalize compute:
@@ -678,6 +766,7 @@ class VMwareClient:
         if "/" not in p:
             return f"host/{p}"
         return p
+
     # ---------------------------------------------------------------------
     # FAST printing helpers (OPT-IN)
     # ---------------------------------------------------------------------
@@ -689,7 +778,7 @@ class VMwareClient:
         content = self._content()
         only_set = {((n or "").strip()) for n in (only or []) if (n or "").strip()}
         filter_enabled = bool(only_set)
-        view = content.viewManager.CreateContainerView( # type: ignore[attr-defined]
+        view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
             content.rootFolder, [vim.VirtualMachine], True
         )
         out: Dict[str, Optional[str]] = {}
@@ -711,6 +800,7 @@ class VMwareClient:
                 view.Destroy()
             except Exception:
                 pass
+
     @staticmethod
     def _format_vm_table(names: Sequence[str], cols: int = 3, width: int = 44) -> str:
         if not names:
@@ -722,9 +812,11 @@ class VMwareClient:
             row = row + ([""] * (cols - len(row)))
             rows.append(" " + " ".join(s[:width].ljust(width) for s in row).rstrip())
         return "\n".join(rows)
+
     def _vm_dc_json(self, vm_name: str, dc_name: Optional[str]) -> Dict[str, Any]:
         # Keep both spellings for legacy consumers.
         return {"name": vm_name, "datacenter": dc_name, "data_centre": dc_name}
+
     def log_inventory_pretty(
         self,
         *,
@@ -760,13 +852,14 @@ class VMwareClient:
             out_json.append(self._vm_dc_json(n, dc))
         self.logger.info("\n".join(lines))
         return out_json
+
     def list_vm_summaries(self, *, include_datacenter: bool = True) -> List[Dict[str, Any]]:
         """
         JSON-friendly VM summaries. Adds 'data_centre' custom field.
         """
         self._require_pyvmomi()
         content = self._content()
-        view = content.viewManager.CreateContainerView( # type: ignore[attr-defined]
+        view = content.viewManager.CreateContainerView(  # type: ignore[attr-defined]
             content.rootFolder, [vim.VirtualMachine], True
         )
         out: List[Dict[str, Any]] = []
@@ -806,20 +899,23 @@ class VMwareClient:
                 view.Destroy()
             except Exception:
                 pass
+
     def wait_for_task(self, task: Any) -> None:
         self._require_pyvmomi()
-        while task.info.state not in (vim.TaskInfo.State.success, vim.TaskInfo.State.error): # type: ignore[attr-defined]
+        while task.info.state not in (vim.TaskInfo.State.success, vim.TaskInfo.State.error):  # type: ignore[attr-defined]
             time.sleep(1)
-        if task.info.state == vim.TaskInfo.State.error: # type: ignore[attr-defined]
+        if task.info.state == vim.TaskInfo.State.error:  # type: ignore[attr-defined]
             raise VMwareError(str(task.info.error))
+
     def vm_disks(self, vm_obj: Any) -> List[Any]:
         self._require_pyvmomi()
         disks: List[Any] = []
         devices = getattr(getattr(getattr(vm_obj, "config", None), "hardware", None), "device", []) or []
         for dev in devices:
-            if isinstance(dev, vim.vm.device.VirtualDisk): # type: ignore[attr-defined]
+            if isinstance(dev, vim.vm.device.VirtualDisk):  # type: ignore[attr-defined]
                 disks.append(dev)
         return disks
+
     def select_disk(self, vm_obj: Any, label_or_index: Optional[str]) -> Any:
         self._require_pyvmomi()
         disks = self.vm_disks(vm_obj)
@@ -839,6 +935,7 @@ class VMwareClient:
             if sl in str(label).lower():
                 return d
         raise VMwareError(f"No disk matching label: {s}")
+
     def create_snapshot(
         self,
         vm_obj: Any,
@@ -849,7 +946,7 @@ class VMwareClient:
         description: str = "Created by vmdk2kvm",
     ) -> Any:
         self._require_pyvmomi()
-        task = vm_obj.CreateSnapshot_Task( # type: ignore[attr-defined]
+        task = vm_obj.CreateSnapshot_Task(  # type: ignore[attr-defined]
             name=name,
             description=description,
             memory=memory,
@@ -857,22 +954,25 @@ class VMwareClient:
         )
         self.wait_for_task(task)
         return task.info.result
+
     @staticmethod
     def snapshot_moref(snapshot_obj: Any) -> str:
         moid = getattr(snapshot_obj, "_moId", None)
         if not moid:
             raise VMwareError("Could not determine snapshot MoRef (_moId missing)")
         return str(moid)
+
     def enable_cbt(self, vm_obj: Any) -> None:
         self._require_pyvmomi()
         if not getattr(getattr(vm_obj, "capability", None), "changeTrackingSupported", False):
             raise VMwareError("CBT not supported on this VM")
         if getattr(getattr(vm_obj, "config", None), "changeTrackingEnabled", False):
             return
-        spec = vim.vm.ConfigSpec() # type: ignore[attr-defined]
+        spec = vim.vm.ConfigSpec()  # type: ignore[attr-defined]
         spec.changeTrackingEnabled = True
-        task = vm_obj.ReconfigVM_Task(spec) # type: ignore[attr-defined]
+        task = vm_obj.ReconfigVM_Task(spec)  # type: ignore[attr-defined]
         self.wait_for_task(task)
+
     def query_changed_disk_areas(
         self,
         vm_obj: Any,
@@ -883,12 +983,13 @@ class VMwareClient:
         change_id: str = "*",
     ) -> Any:
         self._require_pyvmomi()
-        return vm_obj.QueryChangedDiskAreas( # type: ignore[attr-defined]
+        return vm_obj.QueryChangedDiskAreas(  # type: ignore[attr-defined]
             snapshot=snapshot,
             deviceKey=device_key,
             startOffset=start_offset,
             changeId=change_id,
         )
+
     @staticmethod
     def parse_backing_filename(file_name: str) -> Tuple[str, str]:
         """
@@ -897,8 +998,9 @@ class VMwareClient:
         """
         m = _BACKING_RE.match(file_name or "")
         if not m:
-            raise VMwareError(f"Could not parse backing filename: {file_name}")
+            raise VMwareError(f"VDDK backing parse failed (expected '[ds] path'): {file_name!r}")
         return m.group(1), m.group(2)
+
     @staticmethod
     def _split_ds_path(path: str) -> Tuple[str, str, str]:
         """
@@ -909,6 +1011,7 @@ class VMwareClient:
         folder = rel.rsplit("/", 1)[0] if "/" in rel else ""
         base = rel.rsplit("/", 1)[-1] if "/" in rel else rel
         return ds, folder, base
+
     # Session cookie (for HTTPS /folder downloads)
     def _session_cookie(self) -> str:
         if not self.si:
@@ -918,6 +1021,7 @@ class VMwareClient:
         if not cookie:
             raise VMwareError("Could not obtain session cookie")
         return str(cookie)
+
     # HTTP datastore download (requests) + ✅ prefer govc if present
     def download_datastore_file(
         self,
@@ -937,25 +1041,31 @@ class VMwareClient:
                 return
             except Exception as e:
                 self.logger.warning("govc datastore.download failed; falling back to /folder HTTP: %s", e)
+
         if not REQUESTS_AVAILABLE:
             raise VMwareError("requests not installed. Install: pip install requests")
+
         dc_use = (dc_name or "").strip()
         if dc_use and not self.datacenter_exists(dc_use, refresh=False):
             self.logger.warning("Requested dc_name=%r not found; will auto-resolve", dc_use)
             dc_use = ""
         if not dc_use:
             dc_use = self.guess_default_datacenter()
+
         url = f"https://{self.host}/folder/{quote(ds_path)}?dcPath={quote(dc_use)}&dsName={quote(datastore)}"
         headers = {"Cookie": self._session_cookie()}
         verify = not self.insecure
-        if not verify and urllib3 is not None: # pragma: no cover
+
+        if not verify and urllib3 is not None:  # pragma: no cover
             try:
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning) # type: ignore[attr-defined]
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # type: ignore[attr-defined]
             except Exception:
                 pass
+
         local_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger.info("Downloading datastore file: [%s] %s (dc=%s) -> %s", datastore, ds_path, dc_use, local_path)
-        with requests.get( # type: ignore[union-attr]
+
+        with requests.get(  # type: ignore[union-attr]
             url,
             headers=headers,
             stream=True,
@@ -992,6 +1102,7 @@ class VMwareClient:
                         tmp.unlink()
                     except Exception:
                         pass
+
     # download-only mode (NO guest inspection) — SYNC, no concurrency
     def _get_vm_datastore_browser(self, vm_obj: Any) -> Any:
         """
@@ -1011,6 +1122,7 @@ class VMwareClient:
         if browser is None:
             raise VMwareError("Datastore has no browser (unexpected)")
         return browser
+
     def _vmx_pathname(self, vm_obj: Any) -> str:
         """
         Returns the VMX path string: "[ds] folder/vm.vmx"
@@ -1027,6 +1139,7 @@ class VMwareClient:
         if not vmx:
             raise VMwareError("Could not determine VMX path (summary.config.vmPathName missing)")
         return str(vmx)
+
     def _list_vm_directory_files(self, vm_obj: Any) -> Tuple[str, str, List[str]]:
         """
         Returns: (datastore_name, folder_rel, [files...]) where files are *relative to folder_rel*.
@@ -1039,13 +1152,13 @@ class VMwareClient:
         # Search path must be "[ds] folder"
         search_root = f"[{ds_name}] {folder_rel}" if folder_rel else f"[{ds_name}]"
         browser = self._get_vm_datastore_browser(vm_obj)
-        q = vim.HostDatastoreBrowserSearchSpec() # type: ignore[attr-defined]
+        q = vim.HostDatastoreBrowserSearchSpec()  # type: ignore[attr-defined]
         q.matchPattern = ["*"]
-        q.details = vim.HostDatastoreBrowserFileInfoDetails() # type: ignore[attr-defined]
+        q.details = vim.HostDatastoreBrowserFileInfoDetails()  # type: ignore[attr-defined]
         q.details.fileSize = True
         q.details.modification = True
         q.details.fileType = True
-        task = browser.SearchDatastoreSubFolders_Task(search_root, q) # type: ignore[attr-defined]
+        task = browser.SearchDatastoreSubFolders_Task(search_root, q)  # type: ignore[attr-defined]
         self.wait_for_task(task)
         results = getattr(task.info, "result", None) or []
         files: List[str] = []
@@ -1056,9 +1169,11 @@ class VMwareClient:
                     files.append(name)
         files = sorted(set(files))
         return ds_name, folder_rel, files
+
     @staticmethod
     def _glob_any(name: str, globs: Sequence[str]) -> bool:
         return any(fnmatch.fnmatch(name, g) for g in globs) if globs else False
+
     def _filter_download_only_files(
         self,
         files: Sequence[str],
@@ -1080,6 +1195,7 @@ class VMwareClient:
                 "Tune download_only_max_files / include/exclude globs."
             )
         return out
+
     def download_only_vm(self, opt: V2VExportOptions) -> Path:
         """
         Download-only: NO virt-v2v, NO guest inspection.
@@ -1137,6 +1253,7 @@ class VMwareClient:
             raise VMwareError("One or more downloads failed:\n" + "\n".join(failures))
         self.logger.info("Download-only completed: %s", out_dir)
         return out_dir
+
     # govc-only directory download (NO pyvmomi listing)
     def govc_download_datastore_dir(
         self,
@@ -1157,6 +1274,7 @@ class VMwareClient:
           - govc datastore.download (per file)
         NOTE: If govc isn't available, we raise (caller can fall back to pyvmomi flow).
         """
+        _ = datacenter  # kept for compatibility
         g = self._govc()
         if g is None:
             raise VMwareError("govc not available (or disabled via no_govmomi); cannot run govc-only download")
@@ -1181,6 +1299,7 @@ class VMwareClient:
         data.setdefault("used_govmomi", True)
         data["status"] = "success"
         return data
+
     # vddk_download mode (single-disk raw pull via VDDK client) — SYNC
     def _require_vddk_client(self) -> None:
         if not VDDK_CLIENT_AVAILABLE:
@@ -1188,6 +1307,7 @@ class VMwareClient:
                 "VDDK raw download requested but vddk_client is not importable. "
                 "Ensure vmdk2kvm/vsphere/vddk_client.py exists and imports cleanly."
             )
+
     def _vm_disk_backing_filename(self, disk_obj: Any) -> str:
         """Return backing.fileName for a vim.vm.device.VirtualDisk."""
         backing = getattr(disk_obj, "backing", None)
@@ -1195,6 +1315,7 @@ class VMwareClient:
         if not fn:
             raise VMwareError("Selected disk has no backing.fileName (unexpected)")
         return str(fn)
+
     def _resolve_esx_host_for_vm(self, vm_obj: Any) -> str:
         """Resolve ESXi hostname for runtime.host (used as VDDK endpoint)."""
         host_obj = self._vm_runtime_host(vm_obj)
@@ -1204,11 +1325,13 @@ class VMwareClient:
         if not name:
             raise VMwareError("Could not resolve ESXi host name for VM runtime.host")
         return name
+
     def _default_vddk_download_path(self, opt: V2VExportOptions, *, disk_index: int) -> Path:
         out_dir = Path(opt.output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         safe_vm = re.sub(r"[^A-Za-z0-9_.-]+", "_", opt.vm_name or "vm")
         return out_dir / f"{safe_vm}-disk{disk_index}.vmdk"
+
     def vddk_download_disk(self, opt: V2VExportOptions) -> List[Path]:
         """
         export_mode="vddk_download"
@@ -1243,7 +1366,12 @@ class VMwareClient:
             )
         thumb = (opt.vddk_thumbprint or "").strip() or None
         if (not thumb) and (not opt.no_verify):
-            self.logger.info("VDDK: computing TLS thumbprint (%s) for ESXi %s:%d ...", opt.vddk_thumbprint_algorithm.upper(), esx_host, 443)
+            self.logger.info(
+                "VDDK: computing TLS thumbprint (%s) for ESXi %s:%d ...",
+                opt.vddk_thumbprint_algorithm.upper(),
+                esx_host,
+                443,
+            )
             thumb = self.compute_server_thumbprint(esx_host, 443, 10.0, opt.vddk_thumbprint_algorithm)
         spec = VDDKConnectionSpec(
             host=esx_host,
@@ -1260,7 +1388,7 @@ class VMwareClient:
         out_paths: List[Path] = []
         try:
             for idx, disk_obj in to_download:
-                remote_vmdk = self._vm_disk_backing_filename(disk_obj) # "[ds] folder/disk.vmdk"
+                remote_vmdk = self._vm_disk_backing_filename(disk_obj)  # "[ds] folder/disk.vmdk"
                 if opt.vddk_download_output:
                     if len(to_download) > 1:
                         local_dir = opt.vddk_download_output
@@ -1272,6 +1400,7 @@ class VMwareClient:
                         local_path.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     local_path = self._default_vddk_download_path(opt, disk_index=idx)
+
                 def _progress(done: int, total: int, pct: float) -> None:
                     le = int(opt.vddk_download_log_every_bytes or 0)
                     if total and done and le > 0:
@@ -1282,6 +1411,7 @@ class VMwareClient:
                                 done / (1024**3),
                                 total / (1024**3),
                             )
+
                 self.logger.info(
                     "VDDK download: vm=%s disk=%s esx=%s remote=%s -> %s",
                     opt.vm_name,
@@ -1301,89 +1431,266 @@ class VMwareClient:
             return out_paths
         finally:
             c.disconnect()
-    # VDDK libdir validation / auto-resolution
+
+    # ---------------------------------------------------------------------
+    # ✅ Full-proof VDDK detection
+    # ---------------------------------------------------------------------
     @staticmethod
-    def _is_probably_vddk_libdir(p: Path) -> bool:
+    def _is_probably_vddk_root(p: Path) -> bool:
+        """
+        Decide if `p` is a VDDK *root* directory.
+
+        Root heuristics:
+          - has bin64/ with at least one known tool
+          - AND has a plausible libdir (lib64/lib/lib32) that passes libdir checks
+        """
+        log = logging.getLogger(__name__)
+        try:
+            p = Path(p)
+        except Exception:
+            log.debug("VDDK root detect: reject (invalid path object): %r", p)
+            return False
         if not p.exists() or not p.is_dir():
             return False
-        names = (
-            "libvixDiskLib.so",
-            "libvixDiskLib.so.7",
-            "libvixDiskLib.so.6",
-            "libvixDiskLib.so.5",
+        b = p / "bin64"
+        if not b.exists() or not b.is_dir():
+            return False
+        # At least one common VDDK tool
+        if not any((b / n).exists() for n in ("vmware-vdiskmanager", "vixDiskCheck", "vddkReporter")):
+            return False
+        # Must have a valid libdir underneath
+        for cand in (p / "lib64", p / "lib", p / "lib32"):
+            if VMwareClient._is_probably_vddk_libdir(cand):
+                return True
+        return False
+
+    @staticmethod
+    def _is_probably_vddk_libdir(p: Path) -> bool:
+        """
+        Decide if `p` is a VDDK library directory.
+
+        "Full-proof" here means: reject directories that only contain a copied
+        libvixDiskLib.so without the surrounding runtime deps that VMware ships.
+
+        Your real VDDK 9.x lib64 contains at least:
+          - libvixDiskLib.so* (core)
+          - libssl.so(.3) + libcrypto.so(.3)
+          - libcurl.so(.4)
+          - libz.so(.1)
+          - libstdc++.so(.6) + libgcc_s.so(.1)
+
+        We DO NOT dlopen here (loader conflicts are nasty). Pure filesystem checks.
+        """
+        log = logging.getLogger(__name__)
+
+        try:
+            p = Path(p)
+        except Exception:
+            log.debug("VDDK detect: reject (invalid path object): %r", p)
+            return False
+
+        log.debug("VDDK detect: checking libdir candidate: %s", p)
+
+        if not p.exists() or not p.is_dir():
+            log.debug("VDDK detect: reject (missing/not dir): %s", p)
+            return False
+
+        # core library
+        core_hits: List[str] = []
+        try:
+            for c in p.glob("libvixDiskLib.so*"):
+                try:
+                    if c.exists():
+                        core_hits.append(c.name)
+                except Exception:
+                    continue
+        except Exception:
+            if (p / "libvixDiskLib.so").exists():
+                core_hits.append("libvixDiskLib.so")
+
+        if not core_hits:
+            log.debug("VDDK detect: reject (no libvixDiskLib.so*): %s", p)
+            return False
+
+        log.debug("VDDK detect: core OK in %s (hits=%s)", p, core_hits)
+
+        # minimal dep groups (accept either "soname" or unversioned)
+        must_have_any = (
+            ("libssl.so.3", "libssl.so"),
+            ("libcrypto.so.3", "libcrypto.so"),
+            ("libcurl.so.4", "libcurl.so"),
+            ("libz.so.1", "libz.so"),
+            ("libstdc++.so.6", "libstdc++.so"),
+            ("libgcc_s.so.1", "libgcc_s.so"),
         )
-        return any((p / n).exists() for n in names)
+
+        missing: List[str] = []
+        matched: List[str] = []
+        for group in must_have_any:
+            hit = None
+            for n in group:
+                try:
+                    if (p / n).exists():
+                        hit = n
+                        break
+                except Exception:
+                    continue
+            if hit is None:
+                missing.append("|".join(group))
+            else:
+                matched.append(hit)
+
+        if missing:
+            log.debug("VDDK detect: reject (missing deps in %s): %s", p, missing)
+            return False
+
+        log.debug("VDDK detect: deps OK in %s (matched=%s)", p, matched)
+        log.debug("VDDK detect: accept libdir: %s", p)
+        return True
+
     @classmethod
-    def _find_vddk_libdir_under(cls, root: Path, *, max_depth: int = 7) -> Optional[Path]:
+    def _vddk_root_to_libdir(cls, root: Path) -> Optional[Path]:
+        """Given a VDDK root, pick the best libdir (prefer lib64)."""
+        for cand in (root / "lib64", root / "lib", root / "lib32"):
+            if cls._is_probably_vddk_libdir(cand):
+                return cand
+        return None
+
+    @classmethod
+    def _find_vddk_under(cls, root: Path, *, max_depth: int = 7) -> Tuple[Optional[Path], Optional[Path]]:
+        """
+        Search under `root` for either:
+          - a VDDK root (bin64 tools + lib64), or
+          - a VDDK libdir (libvixDiskLib.so* + required deps)
+
+        Returns (vddk_root, vddk_libdir). Either may be None, but libdir is what callers want.
+        """
         try:
             root = root.expanduser()
         except Exception:
             pass
+
+        # Direct hit: user points to root
+        if cls._is_probably_vddk_root(root):
+            return root, cls._vddk_root_to_libdir(root)
+
+        # Direct hit: user points to libdir
         if cls._is_probably_vddk_libdir(root):
-            return root
+            parent = root.parent
+            if cls._is_probably_vddk_root(parent):
+                return parent, root
+            return None, root
+
+        # Fast common candidates under the provided root
         common = (
             root / "lib64",
             root / "lib",
+            root / "lib32",
+            root / "vddk",
             root / "vddk" / "lib64",
             root / "vddk" / "lib",
+            root / "vmware-vix-disklib-distrib",
             root / "vmware-vix-disklib-distrib" / "lib64",
             root / "vmware-vix-disklib-distrib" / "lib",
         )
         for c in common:
+            if cls._is_probably_vddk_root(c):
+                return c, cls._vddk_root_to_libdir(c)
             if cls._is_probably_vddk_libdir(c):
-                return c
+                parent = c.parent
+                if cls._is_probably_vddk_root(parent):
+                    return parent, c
+                return None, c
+
+        # Walk: stop at max_depth, detect either root markers or lib markers
         try:
             root_res = root.resolve()
         except Exception:
             root_res = root
+
         base_parts = len(root_res.parts)
-        targets = {"libvixDiskLib.so", "libvixDiskLib.so.7", "libvixDiskLib.so.6", "libvixDiskLib.so.5"}
+
+        def _has_vixdisklib(files: List[str]) -> bool:
+            return any(f == "libvixDiskLib.so" or f.startswith("libvixDiskLib.so.") for f in files)
+
+        def _has_bin64_tools(dirpath: Path) -> bool:
+            b = dirpath / "bin64"
+            if not b.exists():
+                return False
+            return any((b / n).exists() for n in ("vmware-vdiskmanager", "vixDiskCheck", "vddkReporter"))
+
+        best_root: Optional[Path] = None
+        best_lib: Optional[Path] = None
+
         for dirpath, dirnames, filenames in os.walk(str(root_res)):
             cur = Path(dirpath)
+
             if (len(cur.parts) - base_parts) > max_depth:
                 dirnames[:] = []
                 continue
-            if targets.intersection(set(filenames)):
-                if cls._is_probably_vddk_libdir(cur):
-                    return cur
-        return None
+
+            # Root found? Prefer returning root->libdir
+            if _has_bin64_tools(cur) and cls._is_probably_vddk_root(cur):
+                libdir = cls._vddk_root_to_libdir(cur)
+                if libdir:
+                    return cur, libdir
+                best_root = best_root or cur
+
+            # Libdir found?
+            if _has_vixdisklib(list(filenames)) and cls._is_probably_vddk_libdir(cur):
+                parent = cur.parent
+                if cls._is_probably_vddk_root(parent):
+                    return parent, cur
+                best_lib = best_lib or cur
+
+        return best_root, best_lib
+
     def _resolve_vddk_libdir(self, opt: V2VExportOptions) -> Optional[Path]:
         # 1) explicit option
         if opt.vddk_libdir:
             base = Path(opt.vddk_libdir)
-            found = self._find_vddk_libdir_under(base)
-            if found:
-                return found
-            raise VMwareError(f"‘-io vddk-libdir={str(base)}’ invalid: no libvixDiskLib.so found under that path")
+            _vddk_root, libdir = self._find_vddk_under(base)
+            if libdir:
+                return libdir
+            raise VMwareError(
+                f"‘-io vddk-libdir={str(base)}’ invalid: "
+                "no VDDK root (bin64/*) or full VDDK libdir (libvixDiskLib.so* + deps) found under that path"
+            )
+
         # 2) env override
         envp = (os.environ.get("VDDK_LIBDIR") or "").strip()
         if envp:
             base = Path(envp)
-            found = self._find_vddk_libdir_under(base)
-            if found:
-                return found
-            raise VMwareError(f"VDDK_LIBDIR={envp!r} invalid: no libvixDiskLib.so found under that path")
-        # 3) typical locations
+            _vddk_root, libdir = self._find_vddk_under(base)
+            if libdir:
+                return libdir
+            raise VMwareError(
+                f"VDDK_LIBDIR={envp!r} invalid: "
+                "no VDDK root (bin64/*) or full VDDK libdir (libvixDiskLib.so* + deps) found under that path"
+            )
+
+        # 3) typical locations (include your exact install root)
         guesses = (
+            Path("/opt/vmware/vmware-vix-disklib-distrib"),  # <-- your current install root
+            Path("/opt/vmware/vmware-vix-disklib-distrib/lib64"),  # <-- explicit libdir
             Path("/opt/vmware-vix-disklib-distrib"),
-            Path("/opt/vmware-vix-disklib-distrib/vmware-vix-disklib-distrib"),
             Path("/usr/lib/vmware-vix-disklib"),
             Path("/usr/local/lib/vmware-vix-disklib"),
         )
         for g in guesses:
-            found = self._find_vddk_libdir_under(g)
-            if found:
-                return found
+            _root, libdir = self._find_vddk_under(g)
+            if libdir:
+                return libdir
+
         return None
+
     # ---------------------------------------------------------------------
     # ✅ VDDK feature detection + datastore-file VDDK download (additive)
     # ---------------------------------------------------------------------
     def has_vddk(self, vddk_libdir: Optional[Path] = None) -> bool:
         """
         Return True if the optional Python VDDK client is importable *and* we can
-        resolve a usable VDDK libdir (directory containing libvixDiskLib.so).
-        This is intentionally conservative so callers can safely prefer VDDK and
-        fall back to HTTPS /folder if unavailable.
+        resolve a usable VDDK libdir (directory containing libvixDiskLib.so + deps).
         """
         if not VDDK_CLIENT_AVAILABLE:
             return False
@@ -1392,6 +1699,7 @@ class VMwareClient:
             return self._resolve_vddk_libdir(opt) is not None
         except Exception:
             return False
+
     def _vddk_remote_path(self, datastore: str, ds_path: str) -> str:
         """Build a VDDK-friendly remote VMDK path: "[ds] folder/disk.vmdk"."""
         s = (ds_path or "").strip()
@@ -1401,15 +1709,16 @@ class VMwareClient:
         if not dsn:
             raise VMwareError("datastore is required for VDDK datastore download")
         return f"[{dsn}] {s.lstrip('/')}" if s else f"[{dsn}]"
+
     def download_datastore_file_vddk(
         self,
         *,
         datastore: str,
         ds_path: str,
         local_path: Path,
-        dc_name: Optional[str] = None, # kept for call-site compatibility (unused by VDDK)
-        chunk_size: int = 1024 * 1024, # mapped to sectors_per_read
-        on_bytes: Optional[Any] = None, # progress callback (delta_bytes, total_bytes)
+        dc_name: Optional[str] = None,  # kept for call-site compatibility (unused by VDDK)
+        chunk_size: int = 1024 * 1024,  # mapped to sectors_per_read
+        on_bytes: Optional[Any] = None,  # progress callback (delta_bytes, total_bytes)
         allow_flat: bool = False,
         resume: bool = True,
         durable: bool = False,
@@ -1419,23 +1728,29 @@ class VMwareClient:
         thumbprint: Optional[str] = None,
         no_verify: Optional[bool] = None,
     ) -> Path:
-        _ = dc_name # intentionally unused (compat)
+        _ = dc_name  # intentionally unused (compat)
+
         if not VDDK_CLIENT_AVAILABLE:
             raise VMwareError("VDDK client not available (vddk_client.py import failed)")
+
         # Resolve VDDK libdir using the same logic as virt-v2v transport.
         opt = V2VExportOptions(vm_name="__vddk_datastore_file__", vddk_libdir=None)
         vddk_dir = self._resolve_vddk_libdir(opt)
         if vddk_dir is None:
             raise VMwareError(
-                "VDDK not detected (libvixDiskLib.so not found). "
+                "VDDK not detected (libvixDiskLib.so + deps not found). "
                 "Set VDDK_LIBDIR or pass vddk_libdir in config."
             )
+
         remote = self._vddk_remote_path(datastore, ds_path)
+
         try:
             sectors_per_read = max(1, int(int(chunk_size) // 512))
         except Exception:
             sectors_per_read = 2048
+
         last_done = {"n": 0}
+
         def _progress(done: int, total: int, pct: float) -> None:
             if on_bytes is None:
                 return
@@ -1447,15 +1762,20 @@ class VMwareClient:
                 on_bytes(delta, int(total))
             except Exception:
                 pass
+
         use_no_verify = bool(self.insecure) if no_verify is None else bool(no_verify)
+
         # Thumbprint is required for secure nbdssl flows in many setups. If caller
         # didn’t provide one and they didn’t disable verification, compute it.
         tp = (thumbprint or "").strip() or None
         if (not tp) and (not use_no_verify):
             try:
-                tp = self.compute_server_thumbprint(self.host, int(self.port or 443), 10.0, opt.vddk_thumbprint_algorithm)
+                tp = self.compute_server_thumbprint(
+                    self.host, int(self.port or 443), 10.0, opt.vddk_thumbprint_algorithm
+                )
             except Exception as e:
                 raise VMwareError(f"Failed to compute TLS thumbprint for {self.host}:{self.port}: {e}")
+
         spec = VDDKConnectionSpec(
             host=str(getattr(self, "host", "")),
             user=str(getattr(self, "user", "")),
@@ -1466,8 +1786,10 @@ class VMwareClient:
             transport_modes=(transport_modes or "nbdssl:nbd"),
             thumbprint=tp,
         )
+
         local_path = Path(local_path).expanduser().resolve()
         local_path.parent.mkdir(parents=True, exist_ok=True)
+
         with VDDKESXClient(self.logger, spec) as c:
             return Path(
                 c.download_vmdk(
@@ -1482,6 +1804,7 @@ class VMwareClient:
                     compute_sha256=bool(compute_sha256),
                 )
             )
+
     @staticmethod
     def _normalize_thumbprint(tp: str, algorithm: str = "sha1") -> str:
         raw = (tp or "").strip().replace(" ", "").replace(":", "").lower()
@@ -1489,6 +1812,7 @@ class VMwareClient:
         if expected_len == 0 or not re.match(r"^[0-9a-f]{" + str(expected_len) + r"}$", raw):
             raise VMwareError(f"Invalid thumbprint (expected {algorithm.upper()} {expected_len} hex chars): {tp!r}")
         return ":".join(raw[i : i + 2] for i in range(0, expected_len, 2))
+
     @staticmethod
     def compute_server_thumbprint(host: str, port: int = 443, timeout: float = 10.0, algorithm: str = "sha1") -> str:
         ctx = ssl.create_default_context()
@@ -1504,6 +1828,7 @@ class VMwareClient:
         else:
             raise VMwareError(f"Unsupported thumbprint algorithm: {algorithm}")
         return ":".join(h[i : i + 2] for i in range(0, len(h), 2))
+
     def _vpx_uri(self, *, datacenter: str, compute: str, no_verify: bool) -> str:
         """
         vpx://user@host/<dc>/<compute>?no_verify=1
@@ -1515,6 +1840,7 @@ class VMwareClient:
         compute_norm = (compute or "").strip().lstrip("/")
         compute_enc = quote(compute_norm, safe="/-_.")
         return f"vpx://{user_enc}@{host}/{dc_enc}/{compute_enc}{q}"
+
     def _write_password_file(self, base_dir: Path) -> Path:
         pw = (self.password or "").strip()
         if not pw:
@@ -1530,6 +1856,7 @@ class VMwareClient:
         except Exception:
             pass
         return pwfile
+
     def _build_virt_v2v_cmd(self, opt: V2VExportOptions, *, password_file: Path) -> List[str]:
         if not opt.vm_name:
             raise VMwareError("V2VExportOptions.vm_name is required")
@@ -1551,7 +1878,9 @@ class VMwareClient:
         if resolved_dc != (opt.datacenter or "").strip():
             self.logger.info("Resolved datacenter override for %s: %r -> %r", opt.vm_name, opt.datacenter, resolved_dc)
         if resolved_compute != (opt.compute or "").strip():
-            self.logger.info("Resolved compute resource for %s: %r -> %r", opt.vm_name, opt.compute, resolved_compute)
+            self.logger.info(
+                "Resolved compute resource for %s: %r -> %r", opt.vm_name, opt.compute, resolved_compute
+            )
         transport = (opt.transport or "").strip().lower()
         if transport not in ("vddk", "ssh"):
             raise VMwareError(f"Unsupported virt-v2v transport: {transport!r} (expected 'vddk' or 'ssh')")
@@ -1576,7 +1905,10 @@ class VMwareClient:
                 )
             argv += ["-io", f"vddk-libdir={str(vddk_dir)}"]
             if opt.vddk_thumbprint:
-                argv += ["-io", f"vddk-thumbprint={self._normalize_thumbprint(opt.vddk_thumbprint, opt.vddk_thumbprint_algorithm)}"]
+                argv += [
+                    "-io",
+                    f"vddk-thumbprint={self._normalize_thumbprint(opt.vddk_thumbprint, opt.vddk_thumbprint_algorithm)}",
+                ]
             if opt.vddk_snapshot_moref:
                 argv += ["-io", f"vddk-snapshot={opt.vddk_snapshot_moref}"]
             if opt.vddk_transports:
@@ -1586,6 +1918,7 @@ class VMwareClient:
         argv += ["-o", "local", "-os", str(opt.output_dir), "-of", opt.output_format]
         argv += list(opt.extra_args)
         return argv
+
     def _run_logged_subprocess(self, argv: Sequence[str], *, env: Optional[Dict[str, str]] = None) -> int:
         # NOTE: never print secrets; argv should not contain passwords (we use -ip file)
         self.logger.info("Running: %s", " ".join(shlex.quote(a) for a in argv))
@@ -1599,13 +1932,15 @@ class VMwareClient:
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
+
         # Best-effort: make pipes non-blocking (posix)
         if SELECT_AVAILABLE:
             try:
-                os.set_blocking(proc.stdout.fileno(), False) # type: ignore[attr-defined]
-                os.set_blocking(proc.stderr.fileno(), False) # type: ignore[attr-defined]
+                os.set_blocking(proc.stdout.fileno(), False)  # type: ignore[attr-defined]
+                os.set_blocking(proc.stderr.fileno(), False)  # type: ignore[attr-defined]
             except Exception:
                 pass
+
         def _pump_available() -> List[str]:
             """Read whatever is immediately available from stdout/stderr (non-blocking)."""
             lines: List[str] = []
@@ -1621,12 +1956,12 @@ class VMwareClient:
             rlist = []
             try:
                 rlist = [proc.stdout, proc.stderr]
-                ready, _, _ = select.select(rlist, [], [], 0.20) # type: ignore[union-attr]
+                ready, _, _ = select.select(rlist, [], [], 0.20)  # type: ignore[union-attr]
             except Exception:
                 ready = rlist
             for s in ready:
                 try:
-                    chunk = s.read() # type: ignore[assignment]
+                    chunk = s.read()  # type: ignore[assignment]
                 except Exception:
                     chunk = ""
                 if not chunk:
@@ -1635,21 +1970,27 @@ class VMwareClient:
                 for ln in chunk.splitlines():
                     lines.append(ln.rstrip("\n"))
             return lines
+
         # Spinner progress: only when interactive-ish and rich exists
         use_rich = bool(
             RICH_AVAILABLE
             and self._rich_console is not None
             and hasattr(self._rich_console, "is_terminal")
-            and self._rich_console.is_terminal # type: ignore[attr-defined]
+            and self._rich_console.is_terminal  # type: ignore[attr-defined]
         )
         last_line = ""
-        emitted = 0
-        if use_rich and Progress is not None and SpinnerColumn is not None and TextColumn is not None and TimeElapsedColumn is not None:
+        if (
+            use_rich
+            and Progress is not None
+            and SpinnerColumn is not None
+            and TextColumn is not None
+            and TimeElapsedColumn is not None
+        ):
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 TimeElapsedColumn(),
-                console=self._rich_console, # type: ignore[arg-type]
+                console=self._rich_console,  # type: ignore[arg-type]
                 transient=True,
             ) as progress:
                 task_id = progress.add_task("virt-v2v running…", total=None)
@@ -1659,7 +2000,6 @@ class VMwareClient:
                         last_line = ln.strip()
                         if last_line:
                             self.logger.info("%s", last_line)
-                            emitted += 1
                         # Update progress text with last meaningful line (truncate to keep UI sane)
                         if last_line:
                             show = last_line
@@ -1676,11 +2016,11 @@ class VMwareClient:
                                 last_line = ln.strip()
                                 if last_line:
                                     self.logger.info("%s", last_line)
-                                    emitted += 1
                         break
                 rc = int(proc.wait())
                 progress.update(task_id, description=f"virt-v2v finished (rc={rc})")
                 return rc
+
         # Fallback: original behavior (no fancy UI)
         while True:
             out_line = proc.stdout.readline()
@@ -1692,6 +2032,7 @@ class VMwareClient:
             if (not out_line) and (not err_line) and (proc.poll() is not None):
                 break
         return int(proc.wait())
+
     def v2v_export_vm(self, opt: V2VExportOptions) -> Path:
         if shutil.which("virt-v2v") is None:
             raise VMwareError("virt-v2v not found in PATH. Install virt-v2v/libguestfs tooling.")
@@ -1700,7 +2041,12 @@ class VMwareClient:
         # Prefer VDDK transport unless user asked ssh, but keep your knob as-is.
         transport = (opt.transport or "").strip().lower() or "vddk"
         if transport == "vddk" and (not opt.vddk_thumbprint) and (not opt.no_verify):
-            self.logger.info("Computing TLS thumbprint (%s) for %s:%s ...", opt.vddk_thumbprint_algorithm.upper(), self.host, self.port)
+            self.logger.info(
+                "Computing TLS thumbprint (%s) for %s:%s ...",
+                opt.vddk_thumbprint_algorithm.upper(),
+                self.host,
+                self.port,
+            )
             tp = self.compute_server_thumbprint(self.host, self.port, 10.0, opt.vddk_thumbprint_algorithm)
             opt = V2VExportOptions(**{**opt.__dict__, "vddk_thumbprint": tp})
         pwfile = self._write_password_file(opt.output_dir)
@@ -1726,6 +2072,7 @@ class VMwareClient:
                 pass
             except Exception as e:
                 self.logger.warning("Failed to remove password file %s: %s", pwfile, e)
+
     # ---------------------------------------------------------------------
     # ✅ Unified entrypoint (uses knob export_mode) — SYNC
     # "prioritize vddk mode for download":
@@ -1739,7 +2086,8 @@ class VMwareClient:
             vddk_dir = self._resolve_vddk_libdir(opt)
             if VDDK_CLIENT_AVAILABLE and vddk_dir is not None:
                 # If they asked "download" and we can do VDDK safely, do it.
-                # (They can still force folder mode by setting export_mode="download_only" and removing vddk_libdir/env.)
+                # (They can still force folder mode by setting export_mode="download_only"
+                # and removing vddk_libdir/env.)
                 self.logger.info("Download requested; VDDK is available -> prioritizing vddk_download_disk()")
                 return self.vddk_download_disk(V2VExportOptions(**{**opt.__dict__, "export_mode": "vddk_download"}))
             return self.download_only_vm(opt)
